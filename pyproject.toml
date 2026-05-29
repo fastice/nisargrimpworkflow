@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nisargrimpworkflow"
+version = "0.0.1"
+description = "NISAR to GrIMP workflow programs"
+authors = [
+    { name = "Ian Joughin", email = "irj@uw.edu" }
+]
+license = { text = "MIT" }
+readme = "README.md"
+keywords = ["NISAR", "SAR", "InSAR", "GrIMP"]
+requires-python = ">=3.8"
+
+[tool.setuptools]
+packages = ["nisargrimpworkflow"]
+
+[project.urls]
+Homepage = "https://github.com/fastice/nisargrimpworkflow"
+Repository = "https://github.com/fastice/nisargrimpworkflow"
+
+[project.scripts]
+ROFFtoGrimp = "nisargrimpworkflow.ROFFtoGrimp:main"
+RUNWtoGrimp = "nisargrimpworkflow.RUNWtoGrimp:main"
+SetupNISAR = "nisargrimpworkflow.SetupNISAR:main"
