@@ -4,4 +4,4 @@
 @author: ian
 """
 
-__all__ = ['ROFFtoGrimp', 'RUNWtoGrimp', 'SetupNISAR']
+__all__ = ['ROFFtoGrimp', 'RUNWtoGrimp', 'SetupNISAR', 'custom_buildvrtWithOffsets']

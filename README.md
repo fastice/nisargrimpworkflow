@@ -11,6 +11,12 @@ into GrIMP-format offset maps and VRT products.
 **RUNWtoGrimp** — Converts a NISAR RUNW (unwrapped interferogram) HDF5 product
 into GrIMP-format phase, coherence, and ionosphere-correction VRT products.
 
+**SetupNISAR** — Orchestrates per-frame RUNW/ROFF conversion and consolidates
+multi-frame products into a virtual-frame VRT mosaic.
+
+**searchASF** — Search the ASF DAAC for Sentinel-1 IW SLC products within a
+date range and spatial area.
+
 ## Documentation
 
 See `Documents/ROFFtoGrimp.md` and `Documents/RUNWtoGrimp.md` for detailed

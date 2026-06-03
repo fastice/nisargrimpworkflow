@@ -49,7 +49,10 @@ def parseArgs():
                         help='geodat file [geodatNLRxNLA.secondary.geojson]]')
     parser.add_argument('--DEM', type=str, default=None,
                         help='Dem [default for region]')
-    choices = [x for x in sarfunc.defaultRegionDefs(None).regionsDef]
+    choices = [os.path.splitext(f)[0]
+               for f in os.listdir(
+                   os.path.join(os.path.dirname(sarfunc.__file__), 'regions'))
+               if f.endswith('.yaml')]
     parser.add_argument('--region', type=str, choices=choices, default=None,
                         help='region [autodetect greenland or antarctica]')
     parser.add_argument('-regionFile', '--regionFile', type=str,
@@ -102,8 +105,14 @@ def parseArgs():
                         help='Do not apply mask to layer 3 in fast regions')
     parser.add_argument('--mergeOnly', action='store_true', default=False,
                         help='Do not regenerate data, merge only')
+    parser.add_argument('--ompThreads', type=int, default=4,
+                        help='Number of OpenMP threads passed to simoffsets/'
+                        'siminsar [4]')
 
-    choices = [x for x in sarfunc.defaultRegionDefs(None).regionsDef]
+    choices = [os.path.splitext(f)[0]
+               for f in os.listdir(
+                   os.path.join(os.path.dirname(sarfunc.__file__), 'regions'))
+               if f.endswith('.yaml')]
 
     args = parser.parse_args()
     if not os.path.exists(args.ROFF[0]) and 's3' not in args.ROFF[0]:
@@ -127,7 +136,7 @@ def parseArgs():
     #
     for param in ['correlationThresholds', 'region', 'interpThresh',
                   'islandThresh', 'noMask', 'DEM', 'byteOrder', 'regionFile',
-                  'mergeOnly']:
+                  'mergeOnly', 'ompThreads']:
         params[param] = getattr(args, param)
     # Assemble cull params
     params['cullParams'] = {}
@@ -173,7 +182,7 @@ def findGeodat(params, geodat1, geodat2):
     params['geo2'] = geodat2
 
 
-def setupGeodats(params):
+def setupGeodats(params, simDir='workingDir'):
     ''' Create links for geodat files
 
     Parameters
@@ -181,17 +190,21 @@ def setupGeodats(params):
 
       params : dict
         Dictionary with params passed in at the command line.
+      simDir : str, optional
+        Directory (relative to geodat parent) where the symlinks are created.
+        The default is 'workingDir'.
     '''
     for key in ['geo1', 'geo2']:
         geodatFile = os.path.basename(params[key])
         geodatPath = os.path.dirname(params[key])
-        if not os.path.exists(f'{geodatPath}/workingDir/{geodatFile}'):
-            symlink_file(params[key], f'{geodatPath}/workingDir/{geodatFile}')
+        targetDir = f'{geodatPath}/{simDir}'
+        symlink_file(params[key], f'{targetDir}/{geodatFile}',
+                     overwrite=True)
 
 
 def callSim(outputDir, baseName, params,
             includeVel=True, stderr=DEVNULL, stdout=DEVNULL,
-            workingDir='workingDir'):
+            simDir='workingDir', ompThreads=4):
     '''
     Execute a shell command to run the offset simulations.
     includeVel : bool
@@ -205,16 +218,17 @@ def callSim(outputDir, baseName, params,
     else:
         regionArg = f'-region={params["region"]}'
     command = f'simoffsets {regionArg} {byteOrderFlag} '
+    command += f'--ompThreads {ompThreads} '
     if params['DEM'] is not None:
         command += f'-dem={params["DEM"] } '
     if includeVel is False:
         command += '-noVel '
-    command += f'-offsetsDat={outputDir}/{workingDir}/{baseName}.dat '
-    command += f'-azOffsets={outputDir}/{workingDir}/{baseName}.da -syncDat '
+    command += f'-offsetsDat={outputDir}/{simDir}/{baseName}.dat '
+    command += f'-azOffsets={outputDir}/{simDir}/{baseName}.da -syncDat '
     geodat1 = os.path.basename(params["geo1"])
-    command += f'-geodatFile={outputDir}/{workingDir}/{geodat1} '
+    command += f'-geodatFile={outputDir}/{simDir}/{geodat1} '
     geodat2 = os.path.basename(params["geo2"])
-    command += f'-secondGeodatFile={outputDir}/{workingDir}/{geodat2} '
+    command += f'-secondGeodatFile={outputDir}/{simDir}/{geodat2} '
     print(command)
     # , executable='/bin/csh'
     call(command, shell=True, stderr=stderr, stdout=stdout)
@@ -272,7 +286,8 @@ def symlink_file(src_path, dst_path, relative=True, overwrite=False):
 
 
 def simulateOffsets(outputDir, baseName, params,
-                    stderr=DEVNULL, stdout=DEVNULL, workingDir='.'):
+                    stderr=DEVNULL, stdout=DEVNULL, simDir='.',
+                    ompThreads=4):
     '''
     Issue multithreaded shell calls to simulate offsets
 
@@ -288,9 +303,11 @@ def simulateOffsets(outputDir, baseName, params,
         File for stdout output. Use None for stdout. The default is DEVNULL.
     stdout : file pointer, optional
         File for stderr output. Use None for stdout. The default is DEVNULL.
-    workingDir : str, optional
-        The location for all of the intermediate outputs. The default is
-        'workingDir'.
+    simDir : str, optional
+        The subdirectory (relative to outputDir) where simoffsets writes its
+        outputs (dat files, .dr/.da/.vrt). The default is '.'.
+    ompThreads : int, optional
+        Number of OpenMP threads for siminsar. The default is 4.
 
     Returns
     -------
@@ -306,26 +323,54 @@ def simulateOffsets(outputDir, baseName, params,
                                     kwargs={'includeVel': False,
                                             'stderr': stderr,
                                             'stdout': stdout,
-                                            'workingDir': workingDir}))
+                                            'simDir': simDir,
+                                            'ompThreads': ompThreads}))
 
-    # Velocity with mask
+    # Velocity with mask — named .velocity to mirror the .geom convention
     threads.append(threading.Thread(target=callSim,
-                                    args=[outputDir, f'{baseName}', params],
+                                    args=[outputDir, f'{baseName}.velocity',
+                                          params],
                                     kwargs={'includeVel': True,
                                             'stderr': stderr,
                                             'stdout': stdout,
-                                            'workingDir': workingDir}))
+                                            'simDir': simDir,
+                                            'ompThreads': ompThreads}))
     quiet = False
     if stdout == DEVNULL:
         quiet = True
     u.runMyThreads(threads, 2, 'simoffsets', quiet=quiet)
     #
-    offsetFiles = glob.glob(f'{outputDir}/offsets.*')
-    # Add links to working dir
+    offsetFiles = glob.glob(f'{outputDir}/{simDir}/offsets.*')
+    # Add links to workingDir/ so downstream steps (applyMask, etc.) can find
+    # the sim outputs.  overwrite=True refreshes stale links on re-runs.
     for offsetFile in offsetFiles:
         symlink_file(offsetFile,
                      f'{outputDir}/workingDir/{os.path.basename(offsetFile)}',
-                     relative=True, overwrite=False)
+                     relative=True, overwrite=True)
+
+
+def updateSimVrtGeotransforms(vrt_glob, myNISAR):
+    """Replace pixel-coordinate geotransforms in sim VRTs with zeroDoppler/range.
+
+    The C siminsar/simoffsets binaries write hardcoded pixel-coord geotransforms
+    [-0.5, 1, 0, -0.5, 0, 1].  The sim output grid is identical to the NISAR
+    product grid, so the correct geotransform is getGeoTransform(tiff=False).
+
+    Parameters
+    ----------
+    vrt_glob : str
+        Glob pattern matching the VRT files to update, e.g.:
+            '{dir}/offsetSims/*.vrt'    — directory of sim files
+            '{dir}/phaseSim*.vrt'       — basename-prefixed VRTs
+    myNISAR : nisarBaseRangeDopplerHDF subclass
+        Any NISAR object with a getGeoTransform(grimp=True, tiff=False) method.
+    """
+    gt = myNISAR.getGeoTransform(grimp=True, tiff=False)
+    for vrt_path in glob.glob(vrt_glob):
+        ds = gdal.Open(vrt_path, gdal.GA_Update)
+        if ds is not None:
+            ds.SetGeoTransform(gt)
+            ds = None
 
 
 def runCull(outputDir, baseLayerName, boxSize=9, maxA=3, maxR=3, nGood=17,
@@ -887,18 +932,20 @@ def main():
     myROFF.removeOutlierOffsets('correlationSurfacePeak',
                                 thresholds=params['correlationThresholds'])
     #
-    if not os.path.exists(f'{params["outputDir"]}/workingDir'):
-        os.mkdir(f'{params["outputDir"]}/workingDir')
+    for subDir in ['workingDir', 'offsetSims']:
+        if not os.path.exists(f'{params["outputDir"]}/{subDir}'):
+            os.mkdir(f'{params["outputDir"]}/{subDir}')
     #
-    # Write initial dat files for simulations
-    myROFF.writeOffsetsDatFile(f'{params["outputDir"]}/offsets.dat',
-                               geodat1=params['geo1'])
+    # Write initial dat files for simulations into offsetSims/
     myROFF.writeOffsetsDatFile(
-        f'{params["outputDir"]}/offsets.geom.dat',
+        f'{params["outputDir"]}/offsetSims/offsets.velocity.dat',
+        geodat1=params['geo1'])
+    myROFF.writeOffsetsDatFile(
+        f'{params["outputDir"]}/offsetSims/offsets.geom.dat',
         geodat1=params['geo1'])
     #
-    # Setup the the geodats
-    setupGeodats(params)
+    # Setup the geodat symlinks inside offsetSims/
+    setupGeodats(params, simDir='offsetSims')
     #
     # Simulate the offsets
     print(params)
@@ -906,14 +953,17 @@ def main():
     if not params['mergeOnly']:
         simulateOffsets(params["outputDir"], 'offsets', params,
                         stdout=params['stdout'], stderr=params['stderr'],
-                        workingDir='.')
+                        ompThreads=params['ompThreads'],
+                        simDir='offsetSims')
+        updateSimVrtGeotransforms(
+            f'{params["outputDir"]}/offsetSims/*.vrt', myROFF)
         #
         # Apply any mask files
         if not params['noMask']:
-            myROFF.applyMask(f'{params["outputDir"]}/workingDir/offsets.mask.vrt')
+            myROFF.applyMask(f'{params["outputDir"]}/workingDir/offsets.velocity.mask.vrt')
     #
     # Save the offsets to layer files
-    
+
         myROFF.writeData(f'{params["outputDir"]}/workingDir/NISARoffsets',
                          bands=['slantRangeOffset',
                                 'alongTrackOffset',
@@ -940,7 +990,8 @@ def main():
     mergeOffsets(params["outputDir"],
                  baseName='NISARoffsets',
                  byteOrder=params['byteOrder'],
-                 simName='offsets')
+                 simName='offsets',
+                 simDir='offsetSims')
     #
     writeVRTs(myROFF, params["outputDir"], params)
     #

@@ -8,6 +8,8 @@ Created on Wed Mar 11 12:07:17 2026
 import utilities as u
 import argparse
 import nisarhdf
+from nisargrimpworkflow.wrapH5WithVRT import wrapH5sInFrameDir
+from nisargrimpworkflow.processFrameIonosphere import processFrameIonosphere
 import geojson
 import copy
 import glob
@@ -33,35 +35,88 @@ def parseCommandLine():
     Handle command line args
     '''
     parser = argparse.ArgumentParser(
-        description='\n\n\033[1mConvert NISAR H5 products GrimpWorkflow'
-        '\033[0m\n\n',)
-    parser.add_argument('orbit1', type=int, help='Orbit')
+        description='\n\n\033[1mConvert NISAR Level-2 HDF5 products (RUNW, '
+        'ROFF) into the binary flat-file and VRT formats used by the GrIMP '
+        'velocity mosaic pipeline.\033[0m\n\n'
+        'Processes all frames of a single orbit pair found in the current '
+        'working directory, then consolidates the per-frame outputs into a '
+        'single virtual-frame directory using GDAL VRT mosaics.  Must be run '
+        'from the directory containing the <orbit1>_<frame> subdirectories '
+        '(e.g. 12345_010/, 12345_020/, ...).',
+        epilog='Examples:\n'
+               '  # Process all frames for orbit 12345\n'
+               '  SetupNISAR 12345\n\n'
+               '  # Process a subset of frames\n'
+               '  SetupNISAR 12345 --firstFrame 10 --lastFrame 30\n\n'
+               '  # Reprocess everything from scratch\n'
+               '  SetupNISAR 12345 --overWrite\n\n'
+               '  # Reprocess phase products only (keep existing ROFF)\n'
+               '  SetupNISAR 12345 --overWritePhase\n\n'
+               '  # Phase products only, custom virtual frame name\n'
+               '  SetupNISAR 12345 --RUNWOnly --virtualFrame 0001\n\n'
+               '  # Include mixed-mode frames, print all subprocess output\n'
+               '  SetupNISAR 12345 --allowMixedMode --verbose\n',
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('orbit1', type=int,
+                        help='Reference orbit number')
 
     parser.add_argument('--virtualFrame', type=str, default='0000',
-                        help='Virtual Frame [000]')
+                        help='Frame suffix for the consolidated virtual-frame '
+                        'output directory (e.g. 0000 → <orbit1>_0000/) [0000]')
     parser.add_argument('--overWrite', action="store_true",
-                        help='Overwrite if products already exist')
+                        help='Re-run RUNW and ROFF conversion even if output '
+                        'products already exist')
     parser.add_argument('--overWritePhase', action="store_true",
-                        help='Overwrite if phase products already exist')
+                        help='Re-run RUNW (phase) conversion only; leave '
+                        'existing ROFF products untouched')
     parser.add_argument('--firstFrame', type=restrictedFrame, default=0,
-                        help='firstFrame, [all]')
+                        help='Skip frames numbered below this value (0–999) [0]')
     parser.add_argument('--lastFrame', type=restrictedFrame, default=999,
-                        help='lastFrame, [all]')
-
+                        help='Skip frames numbered above this value (0–999) [999]')
     parser.add_argument('--allowMixedMode', action="store_true",
-                        help='Use to include mixed mode frames')
+                        help='Include mixed-mode frames (SLC granule name '
+                        'contains _M_); these are skipped by default')
     parser.add_argument('--RUNWOnly', action="store_true",
-                        help='Work on only RUNW files')
+                        help='Process only RUNW (phase/coherence/ionosphere) '
+                        'products; skip ROFF offset conversion and power images')
     parser.add_argument('--noMask', action='store_true', default=False,
-                        help='Do not apply mask to layer 3 in fast regions')
+                        help='Do not apply the fast-region mask to layer 3 '
+                        'during ROFF offset conversion')
     parser.add_argument('--verbose', action='store_true',
-                        help='Redirect all output to terminal for debugging')
+                        help='Print all subprocess output to the terminal '
+                        '(default: suppressed to keep output readable)')
+    parser.add_argument('--ompThreads', type=int, default=6,
+                        help='Number of OpenMP threads passed to siminsar '
+                        'via ROFFtoGrimp/RUNWtoGrimp [6]')
+    parser.add_argument('--phaseDerivedIonosphere', action='store_true',
+                        help='Use the RUNW phase-derived ionosphere screen '
+                        '(passes --phaseDerivedIonosphere to RUNWtoGrimp). '
+                        'When omitted, estimateIonosphere is run after ROFF '
+                        'to estimate the ionosphere from range offsets.')
+    parser.add_argument('--outputAll', action='store_true',
+                        help='Pass --outputAll to estimateIonosphere: write all '
+                        'intermediate bands (5-band VRT + stem-named TIFs). '
+                        'Default: write only correctedUnwrappedPhase.tif, '
+                        'ionosphereCorrection.tif, ionosphereCorrection.offset.tif '
+                        'each with a single-band VRT sidecar.')
+    parser.add_argument('--phaseThresh', type=float,
+                        default=14 * 3.141592653589793, metavar='RAD',
+                        help='Pass --phaseThresh to estimateIonosphere: mask '
+                        'correctedUnwrappedPhase where '
+                        '|correctedPhase - simPhase| >= RAD radians. '
+                        'Screens regions with likely incorrect unwrapping. '
+                        'Default: 14π rad.')
+    parser.add_argument('--correlationOnly', action='store_true',
+                        help='Extract coherence and geodat files only. '
+                        'Skips ROFF conversion, ionosphere estimation, and '
+                        'virtual-frame assembly.')
     args = parser.parse_args()
     #
     params = {}
     for key in ['overWrite', 'overWritePhase', 'firstFrame', 'lastFrame',
                 'orbit1', 'allowMixedMode', 'virtualFrame', 'noMask',
-                'verbose', 'RUNWOnly']:
+                'verbose', 'RUNWOnly', 'ompThreads', 'phaseDerivedIonosphere',
+                'outputAll', 'phaseThresh', 'correlationOnly']:
         params[key] = getattr(args, key)
     #
     if args.verbose:
@@ -92,7 +147,7 @@ def getSecondaryOrbit(myArgs):
     for frame in myArgs['frames']:
         for product in ['RUNW', 'ROFF']:
             frameDir = f'{myArgs["orbit1"]}_{frame}'
-            files = glob.glob(f'{frameDir}/NISAR*{product}*.h5')
+            files = glob.glob(f'{frameDir}/H5/NISAR*{product}*.h5')
             if len(files) < 1:
                 continue
             myProd = getattr(nisarhdf, f'nisar{product}HDF', None)()
@@ -201,7 +256,7 @@ def getProductH5(product,  frame, myArgs):
     Get product for frame
     '''
     inputDir = myArgs['inputDir']
-    productDir = f'{inputDir}/{myArgs["orbit1"]}_{frame}/NISAR*{product}*h5'
+    productDir = f'{inputDir}/{myArgs["orbit1"]}_{frame}/H5/NISAR*{product}*h5'
     myProduct = glob.glob(productDir)
     if len(myProduct) == 0:
         u.mywarning(f'There are no {product} products in {productDir}')
@@ -229,16 +284,25 @@ def processFrameROFF(frame, myArgs):
     ROFFFile = getProductH5('ROFF', frame, myArgs)
     if ROFFFile is None:
         return
-    outputDir = os.path.dirname(ROFFFile)
+    # Use the frame dir (not the H5 subdir) so that ROFFtoGrimp's intermediate
+    # dirs (workingDir/, offsetSims/), final binaries, and VRTs all land
+    # alongside the RUNW products and geodat files.
+    orbit1 = myArgs['orbit1']
+    outputDir = f'{myArgs["outputDir"]}/{orbit1}_{frame}'
     #
     rangeOffsets = glob.glob(f'{outputDir}/range.offsets')
     #
     if len(rangeOffsets) == 0 or myArgs['overWrite']:
-        # Setup command
+        # Setup command; pass geodats explicitly so ROFFtoGrimp need not
+        # search for them in outputDir (where *.nisar.uw files are absent).
         command = ['ROFFtoGrimp',
-                   '--outputDir',
-                   outputDir,
+                   '--outputDir', outputDir,
+                   '--geodat1', myArgs['geodat1'][-1],
+                   '--geodat2', myArgs['geodat2'][-1],
+                   '--ompThreads', str(myArgs['ompThreads']),
                    ROFFFile]
+        if myArgs.get('regionFile'):
+            command += ['--regionFile', myArgs['regionFile']]
         if myArgs['noMask'] is True:
             command += ['--noMask']
         if myArgs['verbose'] is True:
@@ -269,11 +333,13 @@ def processFrameRUNW(frame, myArgs):
     myRUNW.openHDF(RUNWFile)
     nLooksR = myRUNW.NumberRangeLooks
     nLooksA = myRUNW.NumberAzimuthLooks
+    # Geodats are written by RUNWtoGrimp to the RUNW output dir (frame dir),
+    # not to the H5 subdir where the HDF5 lives.
+    ruNWOutputDir = f'{myArgs["outputDir"]}/{orbit1}_{frame}'
     myArgs['geodat1'].append(
-        f'{os.path.dirname(RUNWFile)}/geodat{nLooksR}x{nLooksA}.geojson')
+        f'{ruNWOutputDir}/geodat{nLooksR}x{nLooksA}.geojson')
     myArgs['geodat2'].append(
-        f'{os.path.dirname(RUNWFile)}/geodat{nLooksR}x{nLooksA}.'
-        'secondary.geojson')
+        f'{ruNWOutputDir}/geodat{nLooksR}x{nLooksA}.secondary.geojson')
     #
     if not myArgs['allowMixedMode']:
         if isMixedMode(myRUNW):
@@ -282,21 +348,32 @@ def processFrameRUNW(frame, myArgs):
     #
     outputDir = f'{myArgs["outputDir"]}/{orbit1}_{frame}'
 
-    files = glob.glob(f'{outputDir}/{orbit1}_{frame}.{orbit2}_{frame}.*x*.vrt')
-    missing = False
-    for key in {'ion.filt', 'uw.interp', '.cor'}:
-        if not any(key in f for f in files):
-            missing = True
-    #
+    geodat = f'{outputDir}/geodat{nLooksR}x{nLooksA}.geojson'
+    if myArgs.get('phaseDerivedIonosphere'):
+        # Full phase+ionosphere run: expect both VRT outputs and the geodat
+        files = glob.glob(
+            f'{outputDir}/{orbit1}_{frame}.{orbit2}_{frame}.*x*.vrt')
+        missing = not os.path.exists(geodat) or not all(
+            any(key in f for f in files) for key in {'ion.filt', 'uw.interp'})
+    else:
+        # Default (--noPhase --noIon): geodat is always written
+        missing = not os.path.exists(geodat)
     if missing or myArgs['overWrite'] or myArgs['overWritePhase']:
-        command = ["RUNWtoGrimp.py",
+        command = ["RUNWtoGrimp",
                    "--frame", str(frame),
                    "--referenceOrbit", str(orbit1),
                    "--secondaryOrbit", str(orbit2),
+                   "--ompThreads", str(myArgs['ompThreads']),
                    "--outputDir", f"./{orbit1}_{frame}",
                    RUNWFile]
+        if myArgs.get('regionFile'):
+            command += ['--regionFile', myArgs['regionFile']]
         if myArgs['verbose'] is True:
             command += ['--verbose']
+        if myArgs.get('phaseDerivedIonosphere'):
+            command += ['--phaseDerivedIonosphere']
+        else:
+            command += ['--noPhase', '--noIon']
         # print(' '.join(command))
         run(command, stderr=myArgs['stderr'], stdout=myArgs['stdout'])
     else:
@@ -486,50 +563,71 @@ def createVirtualFrameRUNW(myArgs):
     orbit = myArgs['orbit1']
     #
     virtualVRTs = {}
-    #
-    for key in ['uw.interp', 'cor', 'ion.filt', 'ion.filt.rangeOffset', 'ion.unfilt.rangeOffset']:
+
+    # Build velSim and maskVel reference mosaics from per-frame simPhase outputs.
+    # These anchor the correctedUnwrappedPhase DC biases to the simulated velocity phase.
+    velSimFiles = [f for frame in myArgs['frames']
+                   for f in glob.glob(f'{orbit}_{frame}/simPhase/velSim.vrt')]
+    maskVelFiles = [f for frame in myArgs['frames']
+                    for f in glob.glob(f'{orbit}_{frame}/simPhase/maskVel.vrt')]
+    velSimVrt  = f'{frameDir}/velSim.vrt'
+    maskVelVrt = f'{frameDir}/maskVel.vrt'
+    if velSimFiles:
+        print(f'Building {velSimVrt}')
+        run(['custom_buildvrtWithOffsets', '--overWrite', velSimVrt] + velSimFiles)
+    if maskVelFiles:
+        print(f'Building {maskVelVrt}')
+        run(['custom_buildvrtWithOffsets', '--overWrite', maskVelVrt] + maskVelFiles)
+
+    # (glob suffix, use --offsets, label, save as ionosphereRangeOffsetCorrection)
+    products = [
+        ('*.correctedUnwrappedPhase.vrt',    True,  'correctedUnwrappedPhase',    False),
+        ('*.cor.vrt',                         False, 'cor',                         False),
+        ('*.ionosphereCorrection.vrt',        True,  'ionosphereCorrection',        False),
+        ('*.ionosphereCorrection.offset.vrt', True,  'ionosphereCorrection.offset', True),
+    ]
+    for globPattern, useOffsets, label, isIonoRangeOffset in products:
         # Find files
         myFiles = []
         for frame in myArgs['frames']:
-            # print(frame, f'{orbit}_{frame}/*.{key}.vrt')
-            myFile = glob.glob(f'{orbit}_{frame}/*.{key}.vrt')
-            # print(f'{orbit}_{frame}/*.{key}.vrt' )
-            # print(myFile)
+            myFile = glob.glob(f'{orbit}_{frame}/{globPattern}')
             if len(myFile) == 1:
                 myFiles += myFile
             else:
                 u.mywarning(f'more than one or missing vrt {myFile}'
-                            f'\n\tfor {orbit}_{frame}/*.{key}.vrt')
+                            f'\n\tfor {orbit}_{frame}/{globPattern}')
         # Create virtual raster
-        #print(myFiles)
-        #u.myerror('stop')
-        command = ['custom_buildvrtWithOffsets.py']
-        if key in ['uw.interp', 'ion.filt', 'ion.filt.rangeOffset', 'ion.unfilt.rangeOffset']:
+        command = ['custom_buildvrtWithOffsets']
+        if useOffsets:
             command.append('--offsets')
+        if label == 'correctedUnwrappedPhase':
+            if os.path.exists(velSimVrt):
+                command += ['--referencePhase', velSimVrt]
+            if os.path.exists(maskVelVrt):
+                command += ['--mask', maskVelVrt]
         # Virtual product name — use first frame (myFiles[0] belongs to frames[0])
         virtualProduct = os.path.basename(
             myFiles[0].replace(f'_{myArgs["frames"][0]}.', f'_{virtualFrame}.'))
-        virtualVRTs[key] = f'{frameDir}/{virtualProduct}'
+        virtualVRTs[label] = f'{frameDir}/{virtualProduct}'
         #
-        # This selection the ionospher correction to go in the metadata of the range offset file since that is the one that will be used in geocoding and we want to make sure the correction is applied in geocoding
-        if key == 'ion.filt.rangeOffset':
+        # The ionosphere correction on the offset grid goes into range-offset metadata
+        # so the geocoder knows to apply the correction.
+        if isIonoRangeOffset:
             myArgs['ionosphereRangeOffsetCorrection'] = virtualProduct
-        failFile = f'{virtualVRTs[key]}.fail'
+        failFile = f'{virtualVRTs[label]}.fail'
         if os.path.exists(failFile):
             os.remove(failFile)
         # Force a new final file
         command.append('--overWrite')
         command.append(f'{frameDir}/{virtualProduct}')
         command += myFiles
-        # print(command)
         print(f'Building {frameDir}/{virtualProduct}')
         run(command)
-        if not os.path.exists(virtualVRTs[key]):
+        if not os.path.exists(virtualVRTs[label]):
             open(failFile, 'w').close()
-        #u.myerror('stop')
     # Now create geodats
-    mergedGeodat(myArgs['geodat1'],  virtualVRTs['uw.interp'])
-    mergedGeodat(myArgs['geodat2'],  virtualVRTs['uw.interp'])
+    mergedGeodat(myArgs['geodat1'], virtualVRTs['correctedUnwrappedPhase'])
+    mergedGeodat(myArgs['geodat2'], virtualVRTs['correctedUnwrappedPhase'])
 
 
 def createVirtualFrameROFF(myArgs):
@@ -551,13 +649,13 @@ def createVirtualFrameROFF(myArgs):
     frameDir = f'{myArgs["outputDir"]}/{orbit}_{virtualFrame}'
     #
     files = ["azimuth.offsets.vrt",
-             "offsets.geom.ll.vrt",
-             "offsets.geom.mask.vrt",
-             "offsets.geom.vrt",
-             "offsets.ll.vrt",
-             "offsets.mask.vrt",
+             "offsetSims/offsets.geom.ll.vrt",
+             "offsetSims/offsets.geom.mask.vrt",
+             "offsetSims/offsets.geom.vrt",
+             "offsetSims/offsets.velocity.ll.vrt",
+             "offsetSims/offsets.velocity.mask.vrt",
              "offsets.range-azimuth.vrt",
-             "offsets.vrt",
+             "offsetSims/offsets.velocity.vrt",
              "range.offsets.vrt"]
     #
     virtualVRTs = {}
@@ -575,7 +673,7 @@ def createVirtualFrameROFF(myArgs):
                 u.mywarning(f'more than one or missing vrt {myFile}'
                           f'\n\tfor {orbit}_{frame}/{myFileType}')
         # Create virtual raster
-        command = ['custom_buildvrtWithOffsets.py']
+        command = ['custom_buildvrtWithOffsets']
         # Virtual product name — use first frame (myFiles[0] belongs to frames[0])
         virtualProduct = os.path.basename(
             myFiles[0].replace(f'_{myArgs["frames"][0]}.', f'_{virtualFrame}.'))
@@ -637,8 +735,8 @@ def processFramePow(frame, myArgs):
         u.myerror(f'To many pow files {powFiles}')    
     
 def createVirtualFramePower(myArgs):
-    print(myArgs["geodatpow"])
-    print(myArgs['pow'])
+    if not myArgs['pow']:
+        return
     orbit = myArgs['orbit1']
     virtualFrame = myArgs["virtualFrame"]
     frameDir = f'{myArgs["outputDir"]}/{orbit}_{virtualFrame}'
@@ -671,6 +769,15 @@ def main():
     myArgs = parseCommandLine()
     for key in myArgs:
         print(key, ':', myArgs[key])
+    # Read optional regionFile from ../project.yaml
+    myArgs['regionFile'] = None
+    projectYaml = '../project.yaml'
+    if os.path.exists(projectYaml):
+        with open(projectYaml) as _fp:
+            _proj = yaml.safe_load(_fp) or {}
+        myArgs['regionFile'] = _proj.get('regionFile', None)
+        if myArgs['regionFile']:
+            print(f'regionFile from {projectYaml}: {myArgs["regionFile"]}')
     # Get list of frames
     myArgs['frames'] = getFrames(myArgs)
     print('Frames: ', myArgs['frames'])
@@ -689,15 +796,21 @@ def main():
     # Process frames
     #
     for frame in myArgs['frames']:
+        # Wrap all H5 files in the frame directory with VRT
+        wrapH5sInFrameDir(myArgs['orbit1'], frame, verbose=myArgs['verbose'])
         if haveData:
             print(f'Processing Frame {frame}...')
             print('\tRUNW....')
-            mixedMode = processFrameRUNW(frame, myArgs)  
-            if not mixedMode and not myArgs['RUNWOnly']:
+            mixedMode = processFrameRUNW(frame, myArgs)
+            if not mixedMode and not myArgs['RUNWOnly'] and not myArgs.get('correlationOnly'):
                 print('\tROFF....')
                 processFrameROFF(frame, myArgs)
+                if not myArgs.get('phaseDerivedIonosphere'):
+                    print('\tIonosphere (estimateIonosphere)....')
+                    processFrameIonosphere(frame, myArgs, simDir='simPhase')
         # Need to add check for power mixed mode
         processFramePow(frame, myArgs)
+        
     #
     virtualFrame = myArgs["virtualFrame"]
     frameDir = f'{myArgs["outputDir"]}/{myArgs["orbit1"]}_{virtualFrame}'
@@ -707,15 +820,16 @@ def main():
         os.mkdir(frameDir)
     
     # Create the virtual frame
-    if haveData:
+    if haveData and not myArgs.get('correlationOnly'):
         # Copy sensor YAML into frameDir if bandwidth is present and file missing
         copy_sensor_yaml(myArgs, frameDir)
         createVirtualFrameRUNW(myArgs)
         writePairInfo(myArgs)
+        #u.myerror('stop debug')  # DEBUG: exit after first frame
         if not myArgs['RUNWOnly']:
             createVirtualFrameROFF(myArgs)
     # Create a virtual frame if .pow images exist
-    if not myArgs['RUNWOnly']:
+    if not myArgs['RUNWOnly'] and not myArgs.get('correlationOnly'):
         createVirtualFramePower(myArgs)
 
 

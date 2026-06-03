@@ -13,6 +13,7 @@ import sarfunc
 from subprocess import call, DEVNULL
 import sys
 import numpy as np
+from nisargrimpworkflow.ROFFtoGrimp import updateSimVrtGeotransforms
 
 
 def parseArgs():
@@ -43,15 +44,34 @@ def parseArgs():
                         help='Create and apply mask')
     parser.add_argument('--simPhase', action='store_true',
                         help='Simulate phase')
-    choices = [x for x in sarfunc.defaultRegionDefs(None).regionsDef]
+    choices = [os.path.splitext(f)[0]
+               for f in os.listdir(
+                   os.path.join(os.path.dirname(sarfunc.__file__), 'regions'))
+               if f.endswith('.yaml')]
     parser.add_argument('--region', type=str, choices=choices, default=None,
                         help='region [autodetect greenland or antarctica]')
+    parser.add_argument('--regionFile', type=str, default=None,
+                        help='YAML file with region-specific paths (velMap, DEM, '
+                        'mask etc.). Overrides --region.')
     parser.add_argument('--verbose', action='store_true',
                         help='Redirect all output to terminal for debugging')
     parser.add_argument('--interpThresh', type=int, default=20,
                         help='Maximum size hole to interpolate [20]')
     parser.add_argument('--islandThresh', type=int, default=20,
                         help='Maximum size isolated area to discard [20]')
+    parser.add_argument('--ompThreads', type=int, default=4,
+                        help='Number of OpenMP threads for siminsar [4]')
+    parser.add_argument('--phaseDerivedIonosphere', action='store_true',
+                        help='Write ionosphere layers (.ion, .ion.filt, and '
+                        'range-correction VRTs). When omitted all ionosphere '
+                        'outputs are skipped.')
+    parser.add_argument('--noPhase', action='store_true',
+                        help='Suppress unwrapped-phase output (.uw, '
+                        '.uw.interp, .uw.interp.vrt)')
+    parser.add_argument('--noIon', action='store_true',
+                        help='Suppress ionosphere output (.ion, .ion.filt, '
+                        'and range-correction VRTs). Ignored when '
+                        '--phaseDerivedIonosphere is not set.')
     args = parser.parse_args()
     #
     print('...', args.RUNW[0])
@@ -61,7 +81,9 @@ def parseArgs():
     params = {}
     for param in ['outputDir', 'referenceXML', 'secondaryXML',
                   'referenceOrbit', 'secondaryOrbit', 'frame', 'region',
-                  'simMask', 'simPhase', 'interpThresh', 'islandThresh']:
+                  'regionFile', 'simMask', 'simPhase', 'interpThresh',
+                  'islandThresh', 'ompThreads', 'phaseDerivedIonosphere',
+                  'noPhase', 'noIon']:
         params[param] = getattr(args, param)
     # Set ouput
     if args.verbose:
@@ -71,7 +93,7 @@ def parseArgs():
     return args.RUNW[0], params
 
 
-def simPhase(geodat, params, dT, outputDir='.'):
+def simPhase(geodat, params, dT, outputDir='.', ompThreads=4):
     '''
     Simulate phse
 
@@ -82,6 +104,8 @@ def simPhase(geodat, params, dT, outputDir='.'):
         Input params.
     outputDir : str, optional
         Path for output. The default is '.'.
+    ompThreads : int, optional
+        Number of OpenMP threads for siminsar. The default is 4.
 
     Returns
     -------
@@ -91,11 +115,13 @@ def simPhase(geodat, params, dT, outputDir='.'):
     print(f'Simphase {params["simPhase"]}')
     if not params['simPhase']:
         return
-    regionDef = sarfunc.defaultRegionDefs(params['region'])
+    regionDef = sarfunc.defaultRegionDefs(params.get('region'),
+                                          regionFile=params.get('regionFile'))
     #
     output = f'{outputDir}/phaseSim'
     # run command
-    args = f"-velocity -dT {dT} {regionDef.dem()} {regionDef.velMap()}" \
+    args = f"-ompThreads {ompThreads} -velocity -dT {dT} " \
+        f"{regionDef.dem()} {regionDef.velMap()}" \
         f" {outputDir}/{geodat} {output}"
     #
     command = 'siminsar'
@@ -103,35 +129,32 @@ def simPhase(geodat, params, dT, outputDir='.'):
     return True
 
 
-def runInterp(outputDir, inputFile, outputFile, nr, na, ratThresh=1,
+def runInterp(outputDir, inputVRT, outputFile, ratThresh=1,
               thresh=20, islandThresh=20,
               stderr=DEVNULL, stdout=DEVNULL, workingDir='workingDir'):
     '''
-    Shell call to run interpolator
-   ----------
+    Shell call to run interpolator, reading geometry from a VRT.
+
+    Parameters
+    ----------
     outputDir : str
         The product directory for final products.
-    inputFile : str
-        Filename to be interpolated
+    inputVRT : str
+        Basename of the VRT file for the image to be interpolated.  intfloat
+        reads dimensions and georeferencing from the VRT; the matching binary
+        is referenced inside it.
     outputFile : str
-        Filename to be interpolated
-    nr : int
-        Number of range samples
-    na : int
-        Number of azimuth samples
-    ratThresh : int, optional
+        Basename of the binary output file (written via stdout redirect).
+    ratThresh : float, optional
         Allows larger skinny holes, best left at default. The default is 1.
     thresh : int, optional
         Fill only holes with area <=thresh. The default is 20.
     islandThresh : int, optional
         Remove isolated areas <= islandThresh pixels. The default is 20.
     stderr : file pointer, optional
-        File for stdout output. Use None for stdout. The default is DEVNULL.
+        File for stderr output. Use None for terminal. The default is DEVNULL.
     stdout : file pointer, optional
-        File for stderr output. Use None for stdout. The default is DEVNULL.
-    layers : list, optional
-        The layers to include. Only special cases need to use this. The
-        default is [1, 2, 3].
+        File for stdout output. Use None for terminal. The default is DEVNULL.
     workingDir : str, optional
         The location for all of the intermediate outputs. The default is
         'workingDir'.
@@ -141,14 +164,12 @@ def runInterp(outputDir, inputFile, outputFile, nr, na, ratThresh=1,
     None.
 
     '''
-    command = f'intfloat -wdist -nr {nr} -na {na} -thresh {thresh} ' \
-        f'-islandThresh {islandThresh} {outputDir}/{inputFile} ' \
-        f' > {outputDir}/{outputFile}'
+    command = (f'intfloat -wdist -inputVRT {outputDir}/{inputVRT} '
+               f'-thresh {thresh} -islandThresh {islandThresh} '
+               f'> {outputDir}/{outputFile}')
     print(command)
-    #
     # Run command
-    # executable='/bin/csh',
-    call(command, shell=True,  stderr=stderr, stdout=stdout)
+    call(command, shell=True, stderr=stderr, stdout=stdout)
 
 
 def writePairInfo(myRUNW, outputDir):
@@ -178,7 +199,9 @@ def writePairInfo(myRUNW, outputDir):
 # --- Usage ---
 
 
-def interpPhase(outputDir, myRUNW, ratThresh=1, thresh=20,
+def interpPhase(outputDir, myRUNW, phaseDerivedIonosphere=False,
+                noPhase=False, noIon=False,
+                ratThresh=1, thresh=20,
                 islandThresh=20, stderr=DEVNULL, stdout=DEVNULL,
                 workingDir='workingDir'):
     '''
@@ -188,20 +211,27 @@ def interpPhase(outputDir, myRUNW, ratThresh=1, thresh=20,
     ----------
     outputDir : str
         The product directory for final products.
-    baseName : str
-        Root name for offsets (e.g., offsets for offsets.layer1.cull.interp.da)
     myRUNW : nisarRUNW
         Unwrapped phase instance.
-    ratThresh : int, optional
+    phaseDerivedIonosphere : bool, optional
+        Write ionosphere layers (.ion, .ion.filt, range-correction VRTs).
+        The default is False.
+    noPhase : bool, optional
+        Suppress unwrapped-phase output (.uw, .uw.interp, .uw.interp.vrt).
+        The default is False.
+    noIon : bool, optional
+        Suppress ionosphere output (.ion, .ion.filt, range-correction VRTs).
+        Ignored when phaseDerivedIonosphere is False. The default is False.
+    ratThresh : float, optional
         Allows larger skinny holes, best left at default. The default is 1.
     thresh : int, optional
         Fill only holes with area <=thresh. The default is 20.
     islandThresh : int, optional
         Remove isolated areas <= islandThresh pixels. The default is 20.
     stderr : file pointer, optional
-        File for stdout output. Use None for stdout. The default is DEVNULL.
+        File for stderr output. Use None for terminal. The default is DEVNULL.
     stdout : file pointer, optional
-        File for stderr output. Use None for stdout. The default is DEVNULL.
+        File for stdout output. Use None for terminal. The default is DEVNULL.
     workingDir : str, optional
         The location for all of the intermediate outputs. The default is
         'workingDir'.
@@ -224,77 +254,114 @@ def interpPhase(outputDir, myRUNW, ratThresh=1, thresh=20,
         f'{myRUNW.NumberRangeLooks}x{myRUNW.NumberAzimuthLooks}.nisar.uw'
     ionosphereFile = phaseFile.replace('.uw', '.ion')
     ionosphereCleanedFile = phaseFile.replace('.uw', '.ion.filt')
-    # Save the masked version
-    if hasattr(myRUNW, 'maskedUnwrappedPhase'):
-        myRUNW.writeData(phaseFile, ['maskedUnwrappedPhase'], grimp=True,
-                         tiff=False, byteOrder='MSB', noSuffix=True)
-    else:
-        myRUNW.writeData(phaseFile, 'unwrappedPhase',
-                         grimp=True, byteOrder='MSB', noSuffix=True)
-    #
-    myRUNW.writeData(ionosphereFile, ['ionospherePhaseScreen'], grimp=True,
-                     tiff=False, byteOrder='MSB', noSuffix=True)
-    #
     corrFile = phaseFile.replace('.uw', '.cor')
+    #
+    # Assemble metadata and geotransform up-front (needed before runInterp
+    # so we can write the VRT that intfloat reads for geometry)
+    myRUNW.assembleMeta()
+    meta = myRUNW.meta.copy()
+    meta['ByteOrder'] = 'MSB'
+    myGT = myRUNW.getGeoTransform(grimp=True, tiff=False)
+    # Radians to meters for ionosphere offset correction
+    radiansToMeters = -0.5 * myRUNW.Wavelength / (2.0 * np.pi)
+    radiansToPixels = radiansToMeters / myRUNW.SLCRangePixelSize
+    #
+    # --- Unwrapped phase ---
+    if not noPhase:
+        # Save the masked binary
+        if hasattr(myRUNW, 'maskedUnwrappedPhase'):
+            myRUNW.writeData(phaseFile, ['maskedUnwrappedPhase'], grimp=True,
+                             tiff=False, byteOrder='MSB', noSuffix=True)
+        else:
+            myRUNW.writeData(phaseFile, 'unwrappedPhase',
+                             grimp=True, byteOrder='MSB', noSuffix=True)
+        # Write VRT wrapper for the raw phase binary so intfloat can read
+        # dimensions and georeferencing without -nr/-na flags
+        uwVrt = os.path.basename(phaseFile) + '.vrt'
+        meta['bands'] = ['unwrappedPhase']
+        nisarhdf.writeMultiBandVrt(
+            f'{outputDir}/{uwVrt}',
+            myRUNW.MLRangeSize, myRUNW.MLAzimuthSize,
+            [os.path.basename(phaseFile)], ['unwrappedPhase'],
+            geoTransform=myGT, tiff=False, metaData=meta,
+            byteOrder=meta['ByteOrder'], scales=[None])
+    #
+    # --- Ionosphere phase screen ---
+    if phaseDerivedIonosphere and not noIon:
+        myRUNW.writeData(ionosphereFile, ['ionospherePhaseScreen'], grimp=True,
+                         tiff=False, byteOrder='MSB', noSuffix=True)
+    #
+    # Coherence is always written
     myRUNW.writeData(corrFile, ['coherenceMagnitude'], grimp=True,
                      tiff=False, byteOrder='MSB', noSuffix=True)
-    # save geodats
+    # Save geodats
     myRUNW.writeGeodatGeojson(filename=geodat1, path=outputDir,
                               secondary=False)
     myRUNW.writeGeodatGeojson(filename=geodat2, path=outputDir,
                               secondary=True)
-    # Radians to meters for offset correction
-    radiansToMeters = -0.5 * myRUNW.Wavelength/(2.0*np.pi)
-    radiansToPixels = radiansToMeters / myRUNW.SLCRangePixelSize
-    # Run the interpolation
-    outputFile = os.path.basename(phaseFile).replace('nisar.uw',
-                                                     'nisar.uw.interp')
-    runInterp(outputDir, os.path.basename(phaseFile), outputFile,
-              myRUNW.MLRangeSize, myRUNW.MLAzimuthSize, **kwargs)
-    # runInterp(outputDir, os.path.basename(ionosphereFile),
-    #          outputFile.replace('.uw', '.ion'),
-    #          myRUNW.MLRangeSize, myRUNW.MLAzimuthSize, **kwargs)
     #
-    # Write the correponding vrt
-    myRUNW.assembleMeta()
-    meta = myRUNW.meta.copy()
-   
-    meta['ByteOrder'] = 'MSB'
-    interpFile = phaseFile+'.interp'
+    # --- Interpolation (intfloat reads VRT, writes binary to stdout) ---
+    interpBasename = os.path.basename(phaseFile).replace('nisar.uw',
+                                                         'nisar.uw.interp')
+    if not noPhase:
+        runInterp(outputDir, uwVrt, interpBasename, **kwargs)
+    # runInterp(outputDir, os.path.basename(ionosphereFile) + '.vrt',
+    #           interpBasename.replace('.uw', '.ion'), **kwargs)
+    #
+    # --- VRT wrappers for interp and ionosphere outputs ---
+    interpFile = phaseFile + '.interp'
     rangeCorrectionFile = \
         os.path.basename(ionosphereCleanedFile.replace('.ion.filt',
                                                        '.ion.filt.rangeOffset.vrt'))
     rangeCorrectionFileUnfiltered = \
         os.path.basename(ionosphereFile.replace('.ion',
-                                                 '.ion.unfilt.rangeOffset.vrt'))
+                                                '.ion.unfilt.rangeOffset.vrt'))
     outputPhase = os.path.basename(f'{interpFile}.vrt')
-    scales = [None, radiansToPixels, radiansToPixels]
-    for inputFile, outputFile, description, scale in \
-        zip([interpFile, ionosphereCleanedFile, ionosphereFile],
-            [outputPhase, rangeCorrectionFile, rangeCorrectionFileUnfiltered],
-            ['unwrappedPhase', 'rangeOffsetCorrection', 'RangeOffsetCorrection'],
-            scales):
-        # print(inputFile, outputFile)s
-        meta['bands'] = [description]
-        myGT = myRUNW.getGeoTransform(grimp=True, tiff=False)
-        nisarhdf.writeMultiBandVrt(f'{outputDir}/{outputFile}',
+    #
+    # Re-apply the connected-component=0 mask to the interpolated binary.
+    # intfloat may have filled some cc=0 holes; those pixels should remain noData.
+    if not noPhase and hasattr(myRUNW, 'connectedComponents'):
+        arr = np.fromfile(interpFile, dtype='>f4').reshape(
+            myRUNW.MLAzimuthSize, myRUNW.MLRangeSize)
+        arr[myRUNW.connectedComponents < 1] = -2.0e9
+        u.writeImage(interpFile, arr, '>f4')
+    #
+    vrtInputs, vrtOutputs, vrtDescriptions, scales, noDataValues = \
+        [], [], [], [], []
+    if not noPhase:
+        vrtInputs.append(interpFile)
+        vrtOutputs.append(outputPhase)
+        vrtDescriptions.append('Phase')
+        scales.append(None)
+        noDataValues.append(-2.0e9)
+    if phaseDerivedIonosphere and not noIon:
+        vrtInputs += [ionosphereCleanedFile, ionosphereFile]
+        vrtOutputs += [rangeCorrectionFile, rangeCorrectionFileUnfiltered]
+        vrtDescriptions += ['rangeOffsetCorrection', 'RangeOffsetCorrection']
+        scales += [radiansToPixels, radiansToPixels]
+        noDataValues += [-2.0e9, -2.0e9]
+    for inF, outF, desc, scale, noData in \
+            zip(vrtInputs, vrtOutputs, vrtDescriptions, scales, noDataValues):
+        meta['bands'] = [desc]
+        nisarhdf.writeMultiBandVrt(f'{outputDir}/{outF}',
                                    myRUNW.MLRangeSize,
                                    myRUNW.MLAzimuthSize,
-                                   [inputFile],
-                                   [description],
+                                   [inF], [desc],
                                    geoTransform=myGT,
                                    tiff=False, metaData=meta,
                                    byteOrder=meta['ByteOrder'],
+                                   noDataValue=noData,
                                    scales=[scale])
     writePairInfo(myRUNW, outputDir)
     #
-    if hasattr(myRUNW, 'ionosphereCleaned'):
+    if phaseDerivedIonosphere and not noIon \
+            and hasattr(myRUNW, 'ionosphereCleaned'):
         myRUNW.writeData(ionosphereCleanedFile, ['ionosphereCleaned'],
                          grimp=True,
                          tiff=False, byteOrder='MSB', noSuffix=True)
 
 
-def simIceMask(geodat, params, outputDir='.'):
+def simIceMask(geodat, params, outputDir='.', ompThreads=4):
     '''
     Sim ice mask that can be used to retain phase only in ice covered areas
     Parameters
@@ -305,6 +372,8 @@ def simIceMask(geodat, params, outputDir='.'):
         Input params.
     outputDir : str, optional
         Path for output. The default is '.'.
+    ompThreads : int, optional
+        Number of OpenMP threads for siminsar. The default is 4.
 
     Returns
     -------
@@ -312,12 +381,14 @@ def simIceMask(geodat, params, outputDir='.'):
 
     '''
     # Get the region definition, which contains mask, dem and other info.
-    regionDef = sarfunc.defaultRegionDefs(params['region'])
+    regionDef = sarfunc.defaultRegionDefs(params.get('region'),
+                                          regionFile=params.get('regionFile'))
     if not params['simMask'] or regionDef.icemask() is None:
         return False
     maskFile = f"{outputDir}/icemask"
     # run command
-    args = f"-mask {regionDef.dem()} {regionDef.icemask()} {geodat} {maskFile}"
+    args = f"-ompThreads {ompThreads} -mask {regionDef.dem()} " \
+        f"{regionDef.icemask()} {geodat} {maskFile}"
     command = 'siminsar'
     u.callMyProg(command, myArgs=args.split(), screen=True)
     return True
@@ -340,6 +411,9 @@ def resolveRegion(myRUNW, params):
     None.
 
     '''
+    # regionFile provides all paths; no need to resolve a named region
+    if params.get('regionFile') is not None:
+        return
     if params['region'] is not None:
         return
     if myRUNW.epsg == 3031:
@@ -379,7 +453,8 @@ def main():
                    secondaryOrbit=params['secondaryOrbit'],
                    frame=params['frame'])
     #
-    myRUNW.cleanIonosphere()
+    if params['phaseDerivedIonosphere']:
+        myRUNW.cleanIonosphere()
     #
     resolveRegion(myRUNW, params)
     #
@@ -390,18 +465,28 @@ def main():
 
     #
     # Apply ice mask if one exists, which removes coastal rocky areas
-    if simIceMask(geodat, params, outputDir=params['outputDir']):
+    if simIceMask(geodat, params, outputDir=params['outputDir'],
+                  ompThreads=params['ompThreads']):
+        updateSimVrtGeotransforms(
+            f'{params["outputDir"]}/icemask*.vrt', myRUNW)
         myRUNW.applyMask(f"{params['outputDir']}/icemask")
     # Simulate the phase
     # print(params)
-    simPhase(geodat, params, myRUNW.dT, outputDir=params['outputDir'])
+    simPhase(geodat, params, myRUNW.dT, outputDir=params['outputDir'],
+             ompThreads=params['ompThreads'])
+    updateSimVrtGeotransforms(
+        f'{params["outputDir"]}/phaseSim*.vrt', myRUNW)
 
     #
     if not os.path.exists(f'{params["outputDir"]}/{workingDir}'):
         os.mkdir(f'{params["outputDir"]}/{workingDir}')
     #
     # Interpolate and save the result as final version
-    interpPhase(params['outputDir'], myRUNW, ratThresh=1,
+    interpPhase(params['outputDir'], myRUNW,
+                phaseDerivedIonosphere=params['phaseDerivedIonosphere'],
+                noPhase=params['noPhase'],
+                noIon=params['noIon'],
+                ratThresh=1,
                 thresh=params['interpThresh'],
                 islandThresh=params['islandThresh'], stderr=params['stderr'],
                 stdout=params['stdout'], workingDir=workingDir)
