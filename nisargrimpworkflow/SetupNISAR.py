@@ -8,6 +8,7 @@ Created on Wed Mar 11 12:07:17 2026
 import utilities as u
 import argparse
 import nisarhdf
+import time
 from nisargrimpworkflow.wrapH5WithVRT import wrapH5sInFrameDir
 from nisargrimpworkflow.processFrameIonosphere import processFrameIonosphere
 import geojson
@@ -55,14 +56,17 @@ def parseCommandLine():
                '  # Phase products only, custom virtual frame name\n'
                '  SetupNISAR 12345 --RUNWOnly --virtualFrame 0001\n\n'
                '  # Include mixed-mode frames, print all subprocess output\n'
-               '  SetupNISAR 12345 --allowMixedMode --verbose\n',
+               '  SetupNISAR 12345 --allowMixedMode --verbose\n'
+               '\nPart of the nisargrimpworkflow package.',
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('orbit1', type=int,
                         help='Reference orbit number')
 
-    parser.add_argument('--virtualFrame', type=str, default='0000',
+    parser.add_argument('--virtualFrame', type=str, default=None,
                         help='Frame suffix for the consolidated virtual-frame '
-                        'output directory (e.g. 0000 → <orbit1>_0000/) [0000]')
+                        'output directory (e.g. 0000 → <orbit1>_0000/). '
+                        'When omitted, the number is assigned automatically '
+                        'based on frame content and reference orbits.')
     parser.add_argument('--overWrite', action="store_true",
                         help='Re-run RUNW and ROFF conversion even if output '
                         'products already exist')
@@ -110,14 +114,27 @@ def parseCommandLine():
                         help='Extract coherence and geodat files only. '
                         'Skips ROFF conversion, ionosphere estimation, and '
                         'virtual-frame assembly.')
+    parser.add_argument('--corrOnly', action='store_true',
+                        help='Extract .cor files per real frame and assemble '
+                        'only the correlation virtual frame. Skips ROFF '
+                        'conversion, ionosphere estimation, and power images.')
+    parser.add_argument('--noGlobalFillIono', action='store_true',
+                        help='Disable full-swath ionosphere gap fill; use '
+                        'per-frame fill only (default: global fill is on)')
+    parser.add_argument('--retainIntermediateIono', action='store_true',
+                        help='Keep per-frame unfilled and per-frame filled '
+                        'offset iono files after global fill (useful for '
+                        'debugging or comparison)')
     args = parser.parse_args()
     #
     params = {}
     for key in ['overWrite', 'overWritePhase', 'firstFrame', 'lastFrame',
                 'orbit1', 'allowMixedMode', 'virtualFrame', 'noMask',
                 'verbose', 'RUNWOnly', 'ompThreads', 'phaseDerivedIonosphere',
-                'outputAll', 'phaseThresh', 'correlationOnly']:
+                'outputAll', 'phaseThresh', 'correlationOnly', 'corrOnly',
+                'retainIntermediateIono']:
         params[key] = getattr(args, key)
+    params['globalFillIono'] = not args.noGlobalFillIono and bool(args.phaseDerivedIonosphere)
     #
     if args.verbose:
         params['stdout'], params['stderr'] = None, None
@@ -125,6 +142,119 @@ def parseCommandLine():
         params['stdout'], params['stderr'] = DEVNULL, DEVNULL
     #
     return params
+
+
+def splitFrameGroups(frames):
+    '''
+    Split a sorted list of frame numbers into contiguous groups.
+    A group is a run of consecutive integers (no gaps).
+    Returns a list of lists, e.g. [61,62,63,71,72,73] -> [[61,62,63],[71,72,73]].
+    '''
+    if not frames:
+        return []
+    groups = []
+    currentGroup = [frames[0]]
+    for f in frames[1:]:
+        if f == currentGroup[-1] + 1:
+            currentGroup.append(f)
+        else:
+            groups.append(currentGroup)
+            currentGroup = [f]
+    groups.append(currentGroup)
+    return groups
+
+
+def writeFramesList(frameDir, frames):
+    '''Write the frame numbers that make up this virtual frame to frames.txt
+    so future orbits can use it as a reference for splitting.'''
+    with open(f'{frameDir}/frames.txt', 'w') as fp:
+        print(' '.join(str(f) for f in sorted(frames)), file=fp)
+
+
+def readReferenceFrameSets(orbit1, cwd='.'):
+    '''
+    Scan cwd for *_0???/frames.txt files from other orbits.
+    Returns {vfStr: set_of_frame_numbers} (union across all reference orbits).
+    '''
+    refSets = {}
+    for framesFile in sorted(glob.glob(os.path.join(cwd, '*_0???', 'frames.txt'))):
+        dirName = os.path.basename(os.path.dirname(framesFile))
+        parts = dirName.rsplit('_', 1)
+        if len(parts) != 2:
+            continue
+        try:
+            refOrbit = int(parts[0])
+            vf = parts[1]
+        except ValueError:
+            continue
+        if refOrbit == orbit1:
+            continue
+        with open(framesFile) as fp:
+            frames = {int(x) for x in fp.read().split() if x.strip().isdigit()}
+        if frames:
+            refSets.setdefault(vf, set()).update(frames)
+    return refSets
+
+
+def assignVirtualFrameNumbers(groups, orbit1, cwd='.'):
+    '''
+    Assign a 4-digit virtual frame number to each naturally-detected group.
+
+    Numbering scheme:
+      N*10        – group N, canonical (new area, or matches/extends a reference group)
+      N*10 + K    – group N, Kth fragment (proper subset of reference group N, K≥1)
+
+    Rules applied per group:
+      • Overlaps a reference VF and frames ⊇ reference frames → canonical N*10
+      • Overlaps a reference VF and frames ⊂ reference frames → fragment N*10+K
+      • No reference overlap → new canonical group M*10, M above all reference groups
+
+    Returns list of (groupFrames, virtualFrameStr) pairs.
+    '''
+    refSets = readReferenceFrameSets(orbit1, cwd)
+    # Canonical numbers (multiples of 10) that already appear in references
+    refCanonicals = {(int(vf) // 10) for vf in refSets}
+    nextNewGroup = max(refCanonicals) + 1 if refCanonicals else 0
+
+    assignedNums = set()   # tracks numbers chosen during this run
+
+    assignments = []
+    for group in groups:
+        groupSet = set(group)
+
+        # Find the reference VF with the greatest frame overlap
+        bestRefVF, bestOverlap = None, 0
+        for vf, refFrames in refSets.items():
+            overlap = len(groupSet & refFrames)
+            if overlap > bestOverlap:
+                bestOverlap, bestRefVF = overlap, vf
+
+        if bestRefVF is None:
+            # No reference match → new geographic group
+            while nextNewGroup * 10 in assignedNums:
+                nextNewGroup += 1
+            vfNum = nextNewGroup * 10
+            nextNewGroup += 1
+        else:
+            baseGroup = int(bestRefVF) // 10
+            refFrames = refSets[bestRefVF]
+            if groupSet >= refFrames:
+                # Matches or extends reference → canonical
+                vfNum = baseGroup * 10
+            else:
+                # Proper subset → fragment
+                k = 1
+                while baseGroup * 10 + k in assignedNums:
+                    k += 1
+                vfNum = baseGroup * 10 + k
+
+        assignedNums.add(vfNum)
+        assignments.append((group, f'{vfNum:04d}'))
+
+    if assignments:
+        print('Virtual frame assignments: '
+              + ', '.join(f'{vf}={g}' for g, vf in assignments))
+    return assignments
 
 
 def getFrames(myArgs):
@@ -586,6 +716,15 @@ def createVirtualFrameRUNW(myArgs):
         ('*.ionosphereCorrection.vrt',        True,  'ionosphereCorrection',        False),
         ('*.ionosphereCorrection.offset.vrt', True,  'ionosphereCorrection.offset', True),
     ]
+    if myArgs.get('globalFillIono'):
+        # Global fill replaces the per-frame filled offset; skip building the
+        # assembled offset VRT (its per-frame TIFs will be deleted), and add
+        # the unfilled iono for the global-fill assembly step instead.
+        products = [(g, o, l, r) for g, o, l, r in products
+                    if l != 'ionosphereCorrection.offset']
+        products.append(
+            ('*.ionosphereCorrectionUnfilled.vrt', True,
+             'ionosphereCorrectionUnfilled', False))
     for globPattern, useOffsets, label, isIonoRangeOffset in products:
         # Find files
         myFiles = []
@@ -596,6 +735,10 @@ def createVirtualFrameRUNW(myArgs):
             else:
                 u.mywarning(f'more than one or missing vrt {myFile}'
                             f'\n\tfor {orbit}_{frame}/{globPattern}')
+        if not myFiles:
+            u.mywarning(f'createVirtualFrameRUNW: no input VRTs found for '
+                        f'{label}, skipping')
+            continue
         # Create virtual raster
         command = ['custom_buildvrtWithOffsets']
         if useOffsets:
@@ -625,6 +768,14 @@ def createVirtualFrameRUNW(myArgs):
         run(command)
         if not os.path.exists(virtualVRTs[label]):
             open(failFile, 'w').close()
+    # Create fixed-name symlink so tieScript process_phase_yaml() can locate
+    # the unwrapped phase regardless of NISAR product naming conventions.
+    if 'correctedUnwrappedPhase' in virtualVRTs:
+        phase_link = f'{frameDir}/phase.uw.vrt'
+        target = os.path.basename(virtualVRTs['correctedUnwrappedPhase'])
+        if os.path.lexists(phase_link):
+            os.remove(phase_link)
+        os.symlink(target, phase_link)
     # Now create geodats
     mergedGeodat(myArgs['geodat1'], virtualVRTs['correctedUnwrappedPhase'])
     mergedGeodat(myArgs['geodat2'], virtualVRTs['correctedUnwrappedPhase'])
@@ -672,6 +823,10 @@ def createVirtualFrameROFF(myArgs):
             else:
                 u.mywarning(f'more than one or missing vrt {myFile}'
                           f'\n\tfor {orbit}_{frame}/{myFileType}')
+        if not myFiles:
+            u.mywarning(f'createVirtualFrameROFF: no input VRTs found for '
+                        f'{myFileType}, skipping')
+            continue
         # Create virtual raster
         command = ['custom_buildvrtWithOffsets']
         # Virtual product name — use first frame (myFiles[0] belongs to frames[0])
@@ -701,7 +856,204 @@ def createVirtualFrameROFF(myArgs):
         ds.SetMetadataItem("ionosphereRangeOffsetCorrection",
                        myArgs['ionosphereRangeOffsetCorrection'])
         ds = None  # flush and close
-  
+
+
+def _readIonosphereParams(myArgs):
+    """Return (wavelength, slpSpacing) from the first available RUNW HDF5."""
+    orbit = myArgs['orbit1']
+    for frame in myArgs['frames']:
+        frameDir = f'{orbit}_{frame}'
+        h5Files = (glob.glob(f'{frameDir}/H5/NISAR*RUNW*.h5') or
+                   glob.glob(f'{frameDir}/NISAR*RUNW*.h5'))
+        if not h5Files:
+            continue
+        try:
+            runw = nisarhdf.nisarRUNWHDF()
+            runw.openHDF(h5Files[0], frame=frame)
+            return float(runw.Wavelength), float(runw.SLCRangePixelSize)
+        except Exception as e:
+            u.mywarning(f'_readIonosphereParams: could not read {h5Files[0]}: {e}')
+    return None, None
+
+
+def globalFillIonosphere(myArgs, sigmaAz=100.0, sigmaRng=30.0):
+    """Globally fill the assembled virtual-frame unfilled iono, re-partition back
+    into per-frame tiles (in per-frame dirs), and build a plain geometry VRT.
+
+    Unless --retainIntermediateIono is set, removes the per-frame unfilled and
+    per-frame filled offset iono files, leaving only the globalFill products.
+    """
+    from nisargrimpworkflow.estimateIonosphere import (fill_and_smooth_iono,
+                                                       write_geotiff,
+                                                       write_output_vrt)
+    orbit = myArgs['orbit1']
+    virtualFrame = myArgs['virtualFrame']
+    frameDir = f'{myArgs["outputDir"]}/{orbit}_{virtualFrame}'
+
+    # --- locate assembled unfilled iono VRT ---
+    unfilledVrts = glob.glob(f'{frameDir}/*.ionosphereCorrectionUnfilled.vrt')
+    if not unfilledVrts:
+        u.mywarning('globalFillIonosphere: no unfilled iono VRT found, skipping')
+        return
+    unfilledVrt = unfilledVrts[0]
+
+    # --- read consistent (bias-corrected) unfilled iono on full-swath RUNW grid ---
+    ds = gdal.Open(unfilledVrt)
+    band = ds.GetRasterBand(1)
+    nodata = band.GetNoDataValue()
+    arr = band.ReadAsArray().astype(np.float64)
+    fullGt = ds.GetGeoTransform()
+    fullProj = ds.GetProjection()
+    ds = None
+
+    valid = np.isfinite(arr)
+    if nodata is not None:
+        valid &= (arr != nodata)
+    arr[~valid] = np.nan
+
+    if not valid.any():
+        u.mywarning('globalFillIonosphere: no valid pixels, skipping')
+        return
+
+    # --- global fill on full swath ---
+    print('globalFillIonosphere: running pyramid fill on full-swath unfilled iono...')
+    filled = fill_and_smooth_iono(arr.astype(np.float32), valid,
+                                  sigma=(sigmaAz, sigmaRng))
+
+    # Hold the globally-filled raster in a GDAL MEM dataset — no temp file needed.
+    nrows, ncols = filled.shape
+    memDs = gdal.GetDriverByName('MEM').Create('', ncols, nrows, 1, gdal.GDT_Float32)
+    memDs.SetGeoTransform(fullGt)
+    memDs.SetProjection(fullProj)
+    memDs.GetRasterBand(1).WriteArray(filled)
+    memDs.GetRasterBand(1).SetNoDataValue(float('nan'))
+
+    # --- wavelength and slpSpacing for radians → SLC pixels conversion ---
+    wavelength, slpSpacing = _readIonosphereParams(myArgs)
+    if wavelength is None or slpSpacing is None:
+        u.mywarning('globalFillIonosphere: could not read wavelength/slpSpacing, skipping')
+        return
+    scale = -wavelength / (4.0 * np.pi * slpSpacing)
+
+    # --- re-partition: warp to each frame's offset grid, write per-frame tiles ---
+    perFrameOffsetVrts = []
+    for frame in myArgs['frames']:
+        frameRoffVrts = glob.glob(f'{orbit}_{frame}/range.offsets.vrt')
+        if not frameRoffVrts:
+            u.mywarning(f'globalFillIonosphere: no range.offsets.vrt for {orbit}_{frame}')
+            continue
+
+        roffDs = gdal.Open(frameRoffVrts[0])
+        roffGt = roffDs.GetGeoTransform()
+        roffProj = roffDs.GetProjection()
+        roffNcols = roffDs.RasterXSize
+        roffNrows = roffDs.RasterYSize
+        roffDs = None
+
+        # Derive output name from the per-frame ionosphereCorrection.offset.vrt
+        existingOffVrts = glob.glob(f'{orbit}_{frame}/*.ionosphereCorrection.offset.vrt')
+        if not existingOffVrts:
+            u.mywarning(f'globalFillIonosphere: no offset vrt for {orbit}_{frame}')
+            continue
+        perFrameOffsetTif = existingOffVrts[0].replace(
+            '.ionosphereCorrection.offset.vrt',
+            '.ionosphereCorrection.globalFill.offset.tif')
+        perFrameOffsetVrt = perFrameOffsetTif.replace('.tif', '.vrt')
+
+        # Warp filled iono (radians, full-swath RUNW grid) to frame's offset grid
+        warpOpts = gdal.WarpOptions(
+            format='GTiff',
+            outputBounds=(roffGt[0],
+                          roffGt[3] + roffNrows * roffGt[5],
+                          roffGt[0] + roffNcols * roffGt[1],
+                          roffGt[3]),
+            width=roffNcols, height=roffNrows,
+            dstSRS=roffProj,
+            resampleAlg='bilinear',
+            srcNodata=float('nan'), dstNodata=-2.0e9,
+            creationOptions=['COMPRESS=LZW'])
+        gdal.Warp(perFrameOffsetTif, memDs, options=warpOpts)
+
+        # Apply radians → SLC pixels scale in-place
+        ds = gdal.Open(perFrameOffsetTif, gdal.GA_Update)
+        if ds is not None:
+            arr2 = ds.GetRasterBand(1).ReadAsArray()
+            mask2 = arr2 != -2.0e9
+            arr2[mask2] *= scale
+            ds.GetRasterBand(1).WriteArray(arr2)
+            ds.GetRasterBand(1).SetNoDataValue(-2.0e9)
+            ds.FlushCache()
+            ds = None
+
+        write_output_vrt(perFrameOffsetVrt, [perFrameOffsetTif],
+                         ['ionosphereCorrection'], roffGt)
+        perFrameOffsetVrts.append(perFrameOffsetVrt)
+        print(f'globalFillIonosphere: wrote {perFrameOffsetVrt}')
+
+    if not perFrameOffsetVrts:
+        u.mywarning('globalFillIonosphere: no per-frame tiles written, skipping VRT assembly')
+        return
+
+    # --- build plain geometry VRT in virtual-frame dir (no --offsets: biases baked in) ---
+    virtualProduct = os.path.basename(perFrameOffsetVrts[0]).replace(
+        f'_{myArgs["frames"][0]}.', f'_{virtualFrame}.')
+    globalFillOffsetVrt = f'{frameDir}/{virtualProduct}'
+    run(['custom_buildvrtWithOffsets', '--overWrite',
+         globalFillOffsetVrt] + perFrameOffsetVrts,
+        stdout=myArgs.get('stdout', DEVNULL),
+        stderr=myArgs.get('stderr', DEVNULL))
+
+    # --- stamp metadata on virtual-frame range.offsets.vrt ---
+    roffVrt = f'{frameDir}/range.offsets.vrt'
+    myArgs['ionosphereRangeOffsetCorrection'] = virtualProduct
+    ds = gdal.Open(roffVrt, gdal.GA_Update)
+    if ds is not None:
+        ds.SetMetadataItem('ionosphereRangeOffsetCorrection', virtualProduct)
+        ds = None
+    print(f'globalFillIonosphere: virtual frame VRT → {globalFillOffsetVrt}')
+
+    # --- clean up superseded and intermediate files (unless --retainIntermediateIono) ---
+    if not myArgs.get('retainIntermediateIono'):
+        for frame in myArgs['frames']:
+            for pattern in ['*.ionosphereCorrectionUnfilled.tif',
+                            '*.ionosphereCorrectionUnfilled.vrt',
+                            '*.ionosphereCorrection.offset.tif']:
+                for f in glob.glob(f'{orbit}_{frame}/{pattern}'):
+                    os.remove(f)
+
+
+def createVirtualFrameCorr(myArgs):
+    '''Assemble per-frame .cor.vrt files into a single virtual-frame correlation mosaic.'''
+    orbit = myArgs['orbit1']
+    virtualFrame = myArgs['virtualFrame']
+    frameDir = f'{myArgs["outputDir"]}/{orbit}_{virtualFrame}'
+    myFiles = []
+    for frame in myArgs['frames']:
+        myFile = glob.glob(f'{orbit}_{frame}/*.cor.vrt')
+        if len(myFile) == 1:
+            myFiles += myFile
+        else:
+            u.mywarning(f'more than one or missing .cor.vrt for '
+                        f'{orbit}_{frame}: {myFile}')
+    if not myFiles:
+        u.mywarning('createVirtualFrameCorr: no .cor.vrt files found')
+        return
+    virtualProduct = os.path.basename(
+        myFiles[0].replace(f'_{myArgs["frames"][0]}.', f'_{virtualFrame}.'))
+    vrtFile = f'{frameDir}/{virtualProduct}'
+    failFile = f'{vrtFile}.fail'
+    if os.path.exists(failFile):
+        os.remove(failFile)
+    command = ['custom_buildvrtWithOffsets', '--overWrite', vrtFile] + myFiles
+    print(f'Building cor {frameDir}/{virtualProduct}')
+    run(command)
+    if not os.path.exists(vrtFile):
+        open(failFile, 'w').close()
+        return
+    mergedGeodat(myArgs['geodat1'], vrtFile)
+    mergedGeodat(myArgs['geodat2'], vrtFile)
+
+
 def processFramePow(frame, myArgs):
     '''
     check
@@ -793,44 +1145,93 @@ def main():
         print('orbit2:', myArgs['orbit2'])
     # Move bandwidth-based YAML copy to helper (will run after frameDir exists)
     #
-    # Process frames
+    # Process frames, recording per-frame geodat/pow so groups can be assembled
+    # independently when there are gaps in the frame sequence.
     #
+    perFrameGeodat = {}   # frame -> (geodat1, geodat2)
+    perFramePow    = {}   # frame -> (pow, geodatpow)
+    t0 = time.time()
     for frame in myArgs['frames']:
         # Wrap all H5 files in the frame directory with VRT
         wrapH5sInFrameDir(myArgs['orbit1'], frame, verbose=myArgs['verbose'])
         if haveData:
             print(f'Processing Frame {frame}...')
-            print('\tRUNW....')
+            t_step = time.time()
+            print('\tRUNW....', end=' ', flush=True)
+            n1_before = len(myArgs['geodat1'])
             mixedMode = processFrameRUNW(frame, myArgs)
-            if not mixedMode and not myArgs['RUNWOnly'] and not myArgs.get('correlationOnly'):
-                print('\tROFF....')
+            if len(myArgs['geodat1']) > n1_before:
+                perFrameGeodat[frame] = (myArgs['geodat1'][-1], myArgs['geodat2'][-1])
+            dt = time.time() - t_step
+            print(f'{dt:.1f}s  (total {time.time()-t0:.1f}s)')
+            if not mixedMode and not myArgs['RUNWOnly'] \
+                    and not myArgs.get('correlationOnly') \
+                    and not myArgs.get('corrOnly'):
+                t_step = time.time()
+                print('\tROFF....', end=' ', flush=True)
                 processFrameROFF(frame, myArgs)
+                dt = time.time() - t_step
+                print(f'{dt:.1f}s  (total {time.time()-t0:.1f}s)')
                 if not myArgs.get('phaseDerivedIonosphere'):
-                    print('\tIonosphere (estimateIonosphere)....')
+                    t_step = time.time()
+                    print('\tIonosphere (estimateIonosphere)....', end=' ', flush=True)
                     processFrameIonosphere(frame, myArgs, simDir='simPhase')
+                    dt = time.time() - t_step
+                    print(f'{dt:.1f}s  (total {time.time()-t0:.1f}s)')
         # Need to add check for power mixed mode
-        processFramePow(frame, myArgs)
-        
-    #
-    virtualFrame = myArgs["virtualFrame"]
-    frameDir = f'{myArgs["outputDir"]}/{myArgs["orbit1"]}_{virtualFrame}'
-    #print(frameDir)
-    #u.myerror('stop')
-    if not os.path.exists(frameDir):
-        os.mkdir(frameDir)
-    
-    # Create the virtual frame
-    if haveData and not myArgs.get('correlationOnly'):
-        # Copy sensor YAML into frameDir if bandwidth is present and file missing
-        copy_sensor_yaml(myArgs, frameDir)
-        createVirtualFrameRUNW(myArgs)
-        writePairInfo(myArgs)
-        #u.myerror('stop debug')  # DEBUG: exit after first frame
-        if not myArgs['RUNWOnly']:
-            createVirtualFrameROFF(myArgs)
-    # Create a virtual frame if .pow images exist
-    if not myArgs['RUNWOnly'] and not myArgs.get('correlationOnly'):
-        createVirtualFramePower(myArgs)
+        if not myArgs.get('corrOnly'):
+            np_before = len(myArgs['pow'])
+            processFramePow(frame, myArgs)
+            if len(myArgs['pow']) > np_before:
+                perFramePow[frame] = (myArgs['pow'][-1], myArgs['geodatpow'][-1])
+
+    # Split frames into contiguous groups; each gap creates a new virtual frame.
+    allFrames = myArgs['frames']
+    groups = splitFrameGroups(allFrames)
+    if len(groups) > 1:
+        print(f'Frame break(s) detected — {len(groups)} virtual frames will be created')
+    if myArgs['virtualFrame'] is not None:
+        # Explicit override: assign sequentially from the given base number.
+        baseVF = int(myArgs['virtualFrame'])
+        groupAssignments = [(g, f'{baseVF + i:04d}') for i, g in enumerate(groups)]
+    else:
+        groupAssignments = assignVirtualFrameNumbers(groups, myArgs['orbit1'])
+
+    for groupFrames, virtualFrame in groupAssignments:
+        print(f'Virtual frame {virtualFrame}: frames {groupFrames}')
+        myArgs['virtualFrame'] = virtualFrame
+        myArgs['frames']      = groupFrames
+        myArgs['geodat1']     = [perFrameGeodat[f][0] for f in groupFrames if f in perFrameGeodat]
+        myArgs['geodat2']     = [perFrameGeodat[f][1] for f in groupFrames if f in perFrameGeodat]
+        myArgs['pow']         = [perFramePow[f][0]    for f in groupFrames if f in perFramePow]
+        myArgs['geodatpow']   = [perFramePow[f][1]    for f in groupFrames if f in perFramePow]
+
+        frameDir = f'{myArgs["outputDir"]}/{myArgs["orbit1"]}_{virtualFrame}'
+        if not os.path.exists(frameDir):
+            os.mkdir(frameDir)
+        writeFramesList(frameDir, groupFrames)
+
+        # Create the virtual frame
+        if haveData:
+            if myArgs.get('corrOnly'):
+                copy_sensor_yaml(myArgs, frameDir)
+                createVirtualFrameCorr(myArgs)
+                writePairInfo(myArgs)
+            elif not myArgs.get('correlationOnly'):
+                copy_sensor_yaml(myArgs, frameDir)
+                createVirtualFrameRUNW(myArgs)
+                writePairInfo(myArgs)
+                if not myArgs['RUNWOnly']:
+                    createVirtualFrameROFF(myArgs)
+                    if myArgs.get('globalFillIono'):
+                        t_step = time.time()
+                        print('\tGlobal iono fill....', end=' ', flush=True)
+                        globalFillIonosphere(myArgs)
+                        print(f'{time.time()-t_step:.1f}s  (total {time.time()-t0:.1f}s)')
+        # Create a virtual frame if .pow images exist
+        if not myArgs['RUNWOnly'] and not myArgs.get('correlationOnly') \
+                and not myArgs.get('corrOnly'):
+            createVirtualFramePower(myArgs)
 
 
 if __name__ == "__main__":

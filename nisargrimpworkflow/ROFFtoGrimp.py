@@ -35,7 +35,8 @@ def parseArgs():
     '''
     parser = argparse.ArgumentParser(
         description='\n\n\033[1mConvert ROFF to GrIMP formatted offsets '
-        '\033[0m\n\n',)
+        '\033[0m\n\n',
+        epilog='Part of the nisargrimpworkflow package.')
     # default values
     boxSize = 7
     maxA, maxR = 3., 3.

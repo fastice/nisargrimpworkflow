@@ -22,7 +22,8 @@ def parseArgs():
     '''
     parser = argparse.ArgumentParser(
         description='\n\n\033[1mConvert RUNW to GrIMP formatted products '
-        ' \033[0m\n\n',)
+        ' \033[0m\n\n',
+        epilog='Part of the nisargrimpworkflow package.')
 
     parser.add_argument('RUNW', type=str, nargs=1,
                         help='RUNW hdf file to convert')

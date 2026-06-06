@@ -57,7 +57,8 @@ def parseArgs():
                '      unfiled/\n'
                '        NISAR_L1_PR_RUNW_....h5  (symlink, duplicate)\n'
                '        log\n'
-               '    track-71/...\n',
+               '    track-71/...\n'
+               '\nPart of the nisargrimpworkflow package.',
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('inputPath', type=str, nargs=1,
                         help='Root directory with RUNW/, ROFF/, RIFG/, RSLC/ '
@@ -93,12 +94,17 @@ def parseArgs():
                         help='Print per-file detail: filenames, orbit info, '
                         'already-filed and unfiled messages. Without this flag '
                         'a progress bar is shown and only totals are reported')
+    parser.add_argument('--ignoreMissingROFF', action='store_true', default=False,
+                        help='Leave RUNW products in their orbit_frame/H5/ '
+                        'directory even when no companion ROFF is present. '
+                        'Without this flag, lone RUNWs are moved to '
+                        'track-{N}/unfiled/')
 
     args = parser.parse_args()
     #
     params = {}
     for param in ['firstOrbit', 'lastOrbit', 'outputPath', 'inputPath',
-                  'reFile', 'verbose']:
+                  'reFile', 'verbose', 'ignoreMissingROFF']:
         params[param] = getattr(args, param)
         if 'Path' in param:
             if params[param] == '.':
@@ -548,7 +554,7 @@ def main():
                 continue
             runwLinks = glob.glob(f'{orbitFrameDir}/H5/*_RUNW_*.h5')
             roffLinks = glob.glob(f'{orbitFrameDir}/H5/*_ROFF_*.h5')
-            if runwLinks and not roffLinks:
+            if runwLinks and not roffLinks and not params['ignoreMissingROFF']:
                 for link in runwLinks:
                     reason = (f'missing companion ROFF file '
                               f'(moved from {entry}/)')

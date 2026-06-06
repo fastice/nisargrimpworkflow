@@ -51,7 +51,7 @@ def resampleToGrid(srcData, srcGt, dstGt, dstShape, method='linear'):
 
 
 def getOverlapStats(file1, file2, yOffset1=0.0, yOffset2=0.0,
-                    maskData=None, maskGt=None):
+                    maskData=None, maskGt=None, verbose=False):
     """Median difference (f1 - f2) in georeferenced overlap.
 
     yOffset1/yOffset2 are midnight-wrap corrections (seconds) applied to Y origins.
@@ -95,8 +95,9 @@ def getOverlapStats(file1, file2, yOffset1=0.0, yOffset2=0.0,
     pw = int(round((inter[1] - inter[0]) / gt1[1]))
     ph = int(round((inter[3] - inter[2]) / abs(gt1[5])))
 
-    print(f"  overlap({f1},{f2}): inter y=[{inter[2]:.2f},{inter[3]:.2f}] "
-          f"px1=({x1},{y1}) px2=({x2},{y2}) pw={pw} ph={ph}")
+    if verbose:
+        print(f"  overlap({f1},{f2}): inter y=[{inter[2]:.2f},{inter[3]:.2f}] "
+              f"px1=({x1},{y1}) px2=({x2},{y2}) pw={pw} ph={ph}")
 
     try:
         arr1 = ds1.GetRasterBand(1).ReadAsArray(x1, y1, pw, ph).astype(np.float32)
@@ -114,7 +115,8 @@ def getOverlapStats(file1, file2, yOffset1=0.0, yOffset2=0.0,
             valid = valid & maskOnOverlap
 
         nValid = int(np.sum(valid))
-        print(f"  overlap({f1},{f2}): {nValid} valid pixels")
+        if verbose:
+            print(f"  overlap({f1},{f2}): {nValid} valid pixels")
         if nValid < 100:
             return None
 
@@ -203,7 +205,7 @@ def writeSummary(outputVrt, files, offsetsDict, overlapResults, refStats):
 
 
 def buildVrt(outputVrt, inputPattern, overWrite, offsets,
-             referenceVrt=None, maskVrt=None):
+             referenceVrt=None, maskVrt=None, verbose=False):
 
     files = []
     if isinstance(inputPattern, list):
@@ -303,7 +305,8 @@ def buildVrt(outputVrt, inputPattern, overWrite, offsets,
             result = getOverlapStats(files[i], files[i + 1],
                                      yOffset1=yOffsets[i],
                                      yOffset2=yOffsets[i + 1],
-                                     maskData=maskData, maskGt=maskGt)
+                                     maskData=maskData, maskGt=maskGt,
+                                     verbose=verbose)
             overlapResults[i] = result
             if result is not None:
                 row = [0] * n
@@ -415,7 +418,8 @@ def main():
     parser = argparse.ArgumentParser(
         description='Build a mosaic VRT from multiple single-frame VRTs, '
                     'optionally solving inter-frame DC offsets via overlap '
-                    'statistics and/or a reference phase.')
+                    'statistics and/or a reference phase.',
+        epilog='Part of the nisargrimpworkflow package.')
     parser.add_argument('output', help='Output VRT path')
     parser.add_argument('inputs', nargs='+',
                         help='Input VRT/TIF files (or glob patterns)')
@@ -429,9 +433,12 @@ def main():
     parser.add_argument('--mask', default=None, metavar='FILE',
                         help='Mask file (GeoTIFF/VRT); masked pixels excluded '
                              'from bias estimation')
+    parser.add_argument('--verbose', action='store_true',
+                        help='Print per-overlap detail lines')
     args = parser.parse_args()
     buildVrt(args.output, args.inputs, args.overWrite, args.offsets,
-             referenceVrt=args.referencePhase, maskVrt=args.mask)
+             referenceVrt=args.referencePhase, maskVrt=args.mask,
+             verbose=args.verbose)
 
 
 if __name__ == '__main__':

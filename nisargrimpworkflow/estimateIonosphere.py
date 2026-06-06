@@ -6,18 +6,28 @@ Estimate ionospheric correction from NISAR RUNW phase and independent range
 offsets (VRT).
 
 Physics:
-    phase − offset_phase = 2 × iono
-    (phase delay vs. group delay have opposite signs for ionosphere)
-    → iono  = smooth((phase − offset_phase) / 2)
+    phase + offset_phase = 2 × iono
+    (phase delay vs. group delay have opposite signs for ionosphere;
+     offset_phase = −4π/λ × offset_m, so it carries the opposite sign
+     from the range-offset group delay, making the sum equal 2×iono)
+    → iono  = smooth((phase + offset_phase) / 2)
 
 Steps:
   1. Load RUNW (unwrapped phase + connected components).
   2. Load range offsets from VRT; resample to RUNW grid via geotransforms.
   3. Convert offsets to phase:  offset_phase = −4π/λ × offset_m.
-  4. Estimate smooth iono from (phase − offset_phase) / 2.
+  4. Estimate smooth iono from (phase + offset_phase) / 2.
   5. Write two GeoTIFFs + assembled multi-band VRT with named bands:
        Band 1  ionosphereCorrection  (radians)
        Band 2  unwrappedPhase        (radians)
+     Also writes *.ionosphereCorrection.offset.tif/.vrt on the native ROFF
+     grid in SLC pixels (same units as range.offsets).
+
+VRT metadata linkage:
+    SetupNISAR.py stamps the key ionosphereRangeOffsetCorrection = <basename>
+    on range.offsets.vrt after this script runs.  rparams and mosaic3d read
+    that key when they open range.offsets.vrt and use it to locate and load
+    the offset-grid correction file (*.ionosphereCorrection.offset.vrt).
 
 Usage:
     estimateIonosphere.py RUNW.h5 offsets.vrt output.vrt [options]
@@ -386,7 +396,8 @@ def write_output_vrt(vrt_path, band_files, band_names, gt):
 def parse_args():
     p = argparse.ArgumentParser(
         description='Estimate ionospheric correction from NISAR RUNW phase '
-                    'and independent range offsets (VRT).')
+                    'and independent range offsets (VRT).',
+        epilog='Part of the nisargrimpworkflow package.')
     p.add_argument('runw', help='NISAR RUNW HDF5 file')
     p.add_argument('offset_vrt',
                    help='Range offset VRT (band 1, metres, geographic coords)')
@@ -663,12 +674,21 @@ def main():
     else:
         write_output_vrt(stem + '.ionosphereCorrection.vrt',
                          [iono_tif], ['ionosphereCorrection'], gt)
+        # Unfilled iono for virtual-frame global-fill assembly (SetupNISAR globalFillIonosphere)
+        iono_unfilled_tif = stem + '.ionosphereCorrectionUnfilled.tif'
+        iono_unfilled_vrt = stem + '.ionosphereCorrectionUnfilled.vrt'
+        iono_unfilled_out = iono_unfilled.copy()
+        iono_unfilled_out[~np.isfinite(iono_unfilled_out)] = -2.0e9
+        write_geotiff(iono_unfilled_tif, iono_unfilled_out, gt, nodata=-2.0e9)
+        write_output_vrt(iono_unfilled_vrt, [iono_unfilled_tif],
+                         ['ionosphereCorrectionUnfilled'], gt)
 
-    # Ionosphere correction regridded to the offset VRT grid, in metres
-    print("\nRegridding iono correction to offset grid (metres)...")
-    iono_offset_m = resample_runw_to_vrt(iono, runw, vrt_gt, offset_m.shape)
-    iono_offset_m *= wavelength / (4.0 * np.pi)
-    write_geotiff(offset_iono_tif, iono_offset_m, vrt_gt, nodata=-2.0e9)
+    # Ionosphere correction regridded to the offset VRT grid, in SLC pixels
+    # (range.offsets is in SLC pixels; C geocoder applies this correction directly)
+    print("\nRegridding iono correction to offset grid (SLC pixels)...")
+    iono_offset_pix = resample_runw_to_vrt(iono, runw, vrt_gt, offset_m.shape)
+    iono_offset_pix *= -wavelength / (4.0 * np.pi * slp_spacing)
+    write_geotiff(offset_iono_tif, iono_offset_pix, vrt_gt, nodata=-2.0e9)
 
     if args.outputAll:
         write_output_vrt(stem + '.offset.vrt',
