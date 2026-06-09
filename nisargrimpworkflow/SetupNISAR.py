@@ -216,11 +216,34 @@ def assignVirtualFrameNumbers(groups, orbit1, cwd='.'):
     refCanonicals = {(int(vf) // 10) for vf in refSets}
     nextNewGroup = max(refCanonicals) + 1 if refCanonicals else 0
 
+    # Read existing virtual frames for THIS orbit so re-runs reuse the same numbers.
+    selfSets = {}
+    for framesFile in sorted(glob.glob(os.path.join(cwd, f'{orbit1}_0???', 'frames.txt'))):
+        dirName = os.path.basename(os.path.dirname(framesFile))
+        vf = dirName.rsplit('_', 1)[1]
+        with open(framesFile) as fp:
+            existingFrames = {int(x) for x in fp.read().split() if x.strip().isdigit()}
+        if existingFrames:
+            selfSets[vf] = existingFrames
+
     assignedNums = set()   # tracks numbers chosen during this run
 
     assignments = []
     for group in groups:
         groupSet = set(group)
+
+        # On re-runs, prefer reusing this orbit's own existing VF numbers over
+        # cross-orbit fragment assignment.  Pick the existing VF with the most
+        # frame overlap (must not already be taken by an earlier group this run).
+        bestSelfVF, bestSelfOverlap = None, 0
+        for vf, existingFrames in selfSets.items():
+            overlap = len(groupSet & existingFrames)
+            if overlap > bestSelfOverlap and int(vf) not in assignedNums:
+                bestSelfOverlap, bestSelfVF = overlap, vf
+        if bestSelfVF is not None:
+            assignedNums.add(int(bestSelfVF))
+            assignments.append((group, bestSelfVF))
+            continue
 
         # Find the reference VF with the greatest frame overlap
         bestRefVF, bestOverlap = None, 0
@@ -628,15 +651,22 @@ def mergedGeodat(geodatFiles, vrtFile):
     # fTime, lTime = image.y.min().item(), image.y.max().item()
     # print('Time', fTime, lTime)
     #
-    # Load godats
+    # Read VRT geotransform to derive accurate range fields
+    vrtDs = gdal.Open(vrtFile)
+    gt = vrtDs.GetGeoTransform()
+    vrtDs = None
+    x0, pixelWidth = gt[0], gt[1]
+    mlNearRange = x0 + 0.5 * pixelWidth
+    mlFarRange = x0 + (nr - 0.5) * pixelWidth
+    mlCenterRange = x0 + (nr / 2.0) * pixelWidth
+    #
+    # Load geodats
     geodats = {}
     lastFrame = None
-    nrs = []
     for geoFile in geodatFiles:
         orbit, frame = geoFile.split('/')[-2].split('_')
         with open(geoFile) as fp:
             geodats[frame] = geojson.load(fp)
-        nrs.append(geodats[frame]['properties']['MLRangeSize'])
         lastFrame = frame
     # Create the merged geodat as a copy of the first
     geodatMerged = copy.deepcopy(geodats[f'{firstFrame}'])
@@ -645,12 +675,12 @@ def mergedGeodat(geodatFiles, vrtFile):
     # Merge the corner coords
     geodatMerged['geometry']['coordinates'][0] = \
         mergeCorners(geodats[f'{firstFrame}'], geodats[f'{lastFrame}'])
-    #
+    # Set size and range fields from actual VRT dimensions
     geodatMerged['properties']['MLAzimuthSize'] = na
-    # Assumes all files to be merged have the same number of range lines
-    if len(set(nrs)) != 1:
-        print(geodatMerged['properties']['MLRangeSize'], nrs)
-        print('Warning RANGE SIZE INCONSISTENCY')
+    geodatMerged['properties']['MLRangeSize'] = nr
+    geodatMerged['properties']['MLNearRange'] = mlNearRange
+    geodatMerged['properties']['MLFarRange'] = mlFarRange
+    geodatMerged['properties']['MLCenterRange'] = mlCenterRange
     # Return result
     geojsonString = nisarhdf.formatGeojson(geojson.dumps(geodatMerged))
     # Remove existing file to avoid problems with links
@@ -1213,11 +1243,11 @@ def main():
 
         # Create the virtual frame
         if haveData:
-            if myArgs.get('corrOnly'):
+            if myArgs.get('corrOnly') or myArgs.get('correlationOnly'):
                 copy_sensor_yaml(myArgs, frameDir)
                 createVirtualFrameCorr(myArgs)
                 writePairInfo(myArgs)
-            elif not myArgs.get('correlationOnly'):
+            else:
                 copy_sensor_yaml(myArgs, frameDir)
                 createVirtualFrameRUNW(myArgs)
                 writePairInfo(myArgs)
