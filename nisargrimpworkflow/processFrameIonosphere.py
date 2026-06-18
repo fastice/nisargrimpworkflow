@@ -69,14 +69,20 @@ def processFrameIonosphere(frame, myArgs, simDir='simPhase'):
     stem = f'{orbit1}_{frame}.{orbit2}_{frame}.{nLooksR}x{nLooksA}.nisar'
     outputVRT = f'{stem}.vrt'
 
-    # Skip if output already exists and neither overwrite flag is set
+    # Skip if output already exists and neither overwrite flag is set -- unless variable
+    # smoothing is newly requested and wasn't produced by an earlier (pre-smoothing) run
+    # (mirrors the same check inside run_vel_sim() for velSim.smr).
     if myArgs.get('outputAll'):
         skip_path = os.path.join(frameDir, outputVRT)
     else:
         skip_path = os.path.join(frameDir, stem + '.ionosphereCorrection.vrt')
+    smrMissing = (myArgs.get('minTol') is not None
+                 and not myArgs.get('noVariableSmoothing')
+                 and not os.path.exists(os.path.join(frameDir, simDir, 'velSim.smr.vrt')))
     if (os.path.exists(skip_path)
             and not myArgs.get('overWrite')
-            and not myArgs.get('overWritePhase')):
+            and not myArgs.get('overWritePhase')
+            and not smrMissing):
         print(f'  estimateIonosphere: {os.path.basename(skip_path)} exists — skipping')
         return
 
@@ -106,6 +112,11 @@ def processFrameIonosphere(frame, myArgs, simDir='simPhase'):
                           'H5/offsetSims/offsets.geom.vrt',
                           'offsets.geom.vrt'])
 
+    # Ice/rock/water mask for --sepIceRock (0=water, 1=rock, 2=ice)
+    iceRockMaskVRT = _find_file(frameDir,
+                                ['offsetSims/offsets.geom.mask.vrt',
+                                 'H5/offsetSims/offsets.geom.mask.vrt'])
+
     command = [_PYTHON, '-m', 'nisargrimpworkflow.estimateIonosphere',
                RUNWFile,
                offsetVRT,
@@ -117,8 +128,18 @@ def processFrameIonosphere(frame, myArgs, simDir='simPhase'):
         command += ['--offset-geometry', geomVRT]
     if myArgs.get('regionFile'):
         command += ['--regionFile', myArgs['regionFile']]
+    if myArgs.get('verticalCorrection'):
+        command += ['--verticalCorrection', myArgs['verticalCorrection']]
     if myArgs.get('overWrite'):
         command += ['--overWrite']
+    if myArgs.get('minTol') is not None:
+        command += ['--minTol', str(myArgs['minTol']),
+                    '--percentSpeed', str(myArgs['percentSpeed']),
+                    '--maxTol', str(myArgs['maxTol']),
+                    '--maxSmoothRadius', str(myArgs['maxSmoothRadius']),
+                    '--smoothNIter', str(myArgs['smoothNIter'])]
+        if myArgs.get('noVariableSmoothing'):
+            command += ['--noVariableSmoothing']
     if myArgs.get('noInterp'):
         command += ['--noInterp']
     if myArgs.get('interpThresh') is not None:
@@ -127,8 +148,25 @@ def processFrameIonosphere(frame, myArgs, simDir='simPhase'):
         command += ['--islandThresh', str(myArgs['islandThresh'])]
     if myArgs.get('phaseThresh') is not None:
         command += ['--phaseThresh', str(myArgs['phaseThresh'])]
+    if myArgs.get('sigmaAz') is not None:
+        command += ['--sigma-az', str(myArgs['sigmaAz'])]
+    if myArgs.get('sigmaRg') is not None:
+        command += ['--sigma-rg', str(myArgs['sigmaRg'])]
+    if myArgs.get('noPhaseThreshPass'):
+        command += ['--noPhaseThreshPass']
+    if myArgs.get('sepIceRock'):
+        command += ['--sepIceRock']
+        if myArgs.get('iceRockMask'):
+            command += ['--iceRockMask', myArgs['iceRockMask']]
+        elif iceRockMaskVRT is not None:
+            command += ['--iceRockMask', iceRockMaskVRT]
+        else:
+            print(f'  Warning: --sepIceRock set but no offsets.geom.mask.vrt found '
+                  f'under {frameDir}; rock pre-seeding will be skipped.')
     if myArgs.get('outputAll'):
         command += ['--outputAll']
+    if myArgs.get('debugIono'):
+        command += ['--debugIono']
     if myArgs.get('verbose'):
         command += ['--verbose']
 

@@ -7,12 +7,14 @@ Created on Thu Sep 12 10:34:37 2024
 """
 import argparse
 import os
+import time
 import utilities as u
 import nisarhdf
 import sarfunc
 from subprocess import call, DEVNULL
 import sys
 import numpy as np
+import yaml
 from nisargrimpworkflow.ROFFtoGrimp import updateSimVrtGeotransforms
 
 
@@ -54,6 +56,10 @@ def parseArgs():
     parser.add_argument('--regionFile', type=str, default=None,
                         help='YAML file with region-specific paths (velMap, DEM, '
                         'mask etc.). Overrides --region.')
+    parser.add_argument('--verticalCorrection', type=str, default=None,
+                        help='xyDEM grid (m/yr) of submergence/emergence '
+                        'rate; passed to siminsar -verticalCorrection '
+                        '[None]')
     parser.add_argument('--verbose', action='store_true',
                         help='Redirect all output to terminal for debugging')
     parser.add_argument('--interpThresh', type=int, default=20,
@@ -73,7 +79,38 @@ def parseArgs():
                         help='Suppress ionosphere output (.ion, .ion.filt, '
                         'and range-correction VRTs). Ignored when '
                         '--phaseDerivedIonosphere is not set.')
+    parser.add_argument('--minTol', type=float, default=None,
+                        help='Variable smoothing-radius map (additional pass on top of '
+                        'the fixed -thresh/-islandThresh interpolation): m/yr floor for '
+                        'the adaptive tolerance clip(percentSpeed/100*speed, minTol, '
+                        'maxTol). Required together with --percentSpeed/--maxTol to '
+                        'enable the map [None]')
+    parser.add_argument('--percentSpeed', type=float, default=None,
+                        help='Variable smoothing-radius map: percent of local speed (e.g. '
+                        '1 = 1%%) used in the adaptive tolerance. Required together with '
+                        '--minTol/--maxTol [None]')
+    parser.add_argument('--maxTol', type=float, default=None,
+                        help='Variable smoothing-radius map: m/yr ceiling for the '
+                        'adaptive tolerance. Required together with --minTol/'
+                        '--percentSpeed [None]')
+    parser.add_argument('--maxSmoothRadius', type=int, default=50,
+                        help='Variable smoothing-radius map: sweep cap in single-look '
+                        'pixels, clamped to <= 255 (byte output) [50]')
+    parser.add_argument('--smoothNIter', type=int, default=3,
+                        help='Variable smoothing-radius map: repeated box-filter passes '
+                        'per sweep step (Gaussian-ish) [3]')
+    parser.add_argument('--noVariableSmoothing', action='store_true', default=False,
+                        help='Disable the variable smoothing-radius map even if '
+                        '--minTol/--percentSpeed/--maxTol (or project.yaml) supply values')
     args = parser.parse_args()
+    smoothFlags = [args.minTol is not None, args.percentSpeed is not None,
+                  args.maxTol is not None]
+    if any(smoothFlags) and not all(smoothFlags):
+        u.myerror('RUNWtoGrimp: --minTol/--percentSpeed/--maxTol must be given together')
+    if args.maxSmoothRadius > 255:
+        print(f'WARNING: --maxSmoothRadius {args.maxSmoothRadius} exceeds byte range, '
+              'clamping to 255')
+        args.maxSmoothRadius = 255
     #
     print('...', args.RUNW[0])
     if not os.path.exists(args.RUNW[0]) and 's3' not in args.RUNW[0]:
@@ -84,7 +121,9 @@ def parseArgs():
                   'referenceOrbit', 'secondaryOrbit', 'frame', 'region',
                   'regionFile', 'simMask', 'simPhase', 'interpThresh',
                   'islandThresh', 'ompThreads', 'phaseDerivedIonosphere',
-                  'noPhase', 'noIon']:
+                  'noPhase', 'noIon', 'verticalCorrection',
+                  'minTol', 'percentSpeed', 'maxTol', 'maxSmoothRadius',
+                  'smoothNIter', 'noVariableSmoothing']:
         params[param] = getattr(args, param)
     # Set ouput
     if args.verbose:
@@ -124,6 +163,12 @@ def simPhase(geodat, params, dT, outputDir='.', ompThreads=4):
     args = f"-ompThreads {ompThreads} -velocity -dT {dT} " \
         f"{regionDef.dem()} {regionDef.velMap()}" \
         f" {outputDir}/{geodat} {output}"
+    if params.get('verticalCorrection') is not None:
+        args += f" -verticalCorrection {params['verticalCorrection']}"
+    if params.get('minTol') is not None and not params.get('noVariableSmoothing'):
+        args += f" -minTol {params['minTol']} -percentSpeed {params['percentSpeed']} " \
+            f"-maxTol {params['maxTol']} -maxSmoothRadius {params['maxSmoothRadius']} " \
+            f"-smoothNIter {params['smoothNIter']}"
     #
     command = 'siminsar'
     u.callMyProg(command, myArgs=args.split(), screen=True)
@@ -204,7 +249,9 @@ def interpPhase(outputDir, myRUNW, phaseDerivedIonosphere=False,
                 noPhase=False, noIon=False,
                 ratThresh=1, thresh=20,
                 islandThresh=20, stderr=DEVNULL, stdout=DEVNULL,
-                workingDir='workingDir'):
+                workingDir='workingDir', minTol=None, percentSpeed=None,
+                maxTol=None, maxSmoothRadius=50, smoothNIter=3,
+                noVariableSmoothing=False):
     '''
     Call intfloat to do minor hole filling interpolation on phase
 
@@ -236,6 +283,12 @@ def interpPhase(outputDir, myRUNW, phaseDerivedIonosphere=False,
     workingDir : str, optional
         The location for all of the intermediate outputs. The default is
         'workingDir'.
+    minTol, percentSpeed, maxTol, maxSmoothRadius, smoothNIter, noVariableSmoothing :
+        Variable smoothing-radius map, applied to the interpolated phase as an additional
+        pass on top of the fixed thresh/islandThresh interpolation above. See simPhase's
+        siminsar -minTol/-percentSpeed/-maxTol for the tolerance formula. Requires
+        simPhase() to have been run with the same minTol/percentSpeed/maxTol so that
+        phaseSim.smr.vrt exists.
 
     Returns
     -------
@@ -327,6 +380,27 @@ def interpPhase(outputDir, myRUNW, phaseDerivedIonosphere=False,
         arr[myRUNW.connectedComponents < 1] = -2.0e9
         u.writeImage(interpFile, arr, '>f4')
     #
+    # Variable smoothing-radius map (--minTol/--percentSpeed/--maxTol): an additional
+    # smoothing pass on top of the fixed thresh/islandThresh interpolation above, applied
+    # in place to the final interpolated phase before it's wrapped into outputPhase's VRT.
+    if not noPhase and minTol is not None and not noVariableSmoothing:
+        radiusMap = f'{outputDir}/phaseSim.smr.vrt'
+        if not os.path.exists(radiusMap):
+            print(f'WARNING: variable smoothing requested but {radiusMap} not found; '
+                  'skipping (was simPhase run with the same --minTol/--percentSpeed/'
+                  '--maxTol?)')
+        else:
+            print('Applying variable smoothing-radius map...')
+            pixRatio = myRUNW.SLCAzimuthPixelSize / myRUNW.SLCRangePixelSize
+            tmpFile = f'{interpFile}.vsmooth'
+            command = f'filterfloat -nr {myRUNW.MLRangeSize} -na {myRUNW.MLAzimuthSize} ' \
+                f'-radiusMap {radiusMap} -pixRatio {pixRatio} ' \
+                f'-nIterations {smoothNIter} -minValue -2.0e9 ' \
+                f'< {interpFile} > {tmpFile}'
+            print(command)
+            call(command, shell=True, stderr=stderr, stdout=stdout)
+            os.replace(tmpFile, interpFile)
+    #
     vrtInputs, vrtOutputs, vrtDescriptions, scales, noDataValues = \
         [], [], [], [], []
     if not noPhase:
@@ -395,6 +469,21 @@ def simIceMask(geodat, params, outputDir='.', ompThreads=4):
     return True
 
 
+def _epsgFromProjectYaml(projectYaml='../project.yaml'):
+    """Return EPSG from the project.yaml region file, or None if unavailable."""
+    if not os.path.exists(projectYaml):
+        return None
+    try:
+        with open(projectYaml) as fp:
+            proj = yaml.safe_load(fp) or {}
+        regionPath = proj.get('regionFile') or proj.get('region')
+        if regionPath and os.path.isfile(str(regionPath)):
+            return sarfunc.defaultRegionDefs(None, regionFile=str(regionPath)).epsg()
+    except Exception:
+        pass
+    return None
+
+
 def resolveRegion(myRUNW, params):
     '''
     If region not defined, then determine from epsg (greenland or
@@ -417,10 +506,13 @@ def resolveRegion(myRUNW, params):
         return
     if params['region'] is not None:
         return
-    if myRUNW.epsg == 3031:
+    # Prefer the EPSG declared in the project.yaml region file over the EPSG
+    # embedded in the HDF5, which can be wrong for frames with atypical coverage.
+    epsg = _epsgFromProjectYaml() or myRUNW.epsg
+    if epsg == 3031:
         params['region'] = 'antarctica'
         return
-    elif myRUNW.epsg == 3413:
+    elif epsg == 3413:
         params['region'] = 'greenland'
         return
     #
@@ -444,6 +536,7 @@ def main():
     if params['outputDir'] is None:
         params['outputDir'] = RUNWPath
     print(params)
+    t0 = time.perf_counter()
     # Instantiate RUNW class
     myRUNW = nisarhdf.nisarRUNWHDF(referenceOrbitXML=params['referenceXML'],
                                    secondaryOrbitXML=params['secondaryXML'])
@@ -453,9 +546,14 @@ def main():
                    referenceOrbit=params['referenceOrbit'],
                    secondaryOrbit=params['secondaryOrbit'],
                    frame=params['frame'])
+    t1 = time.perf_counter()
+    print(f'[timing] openHDF: {t1 - t0:.1f}s')
     #
     if params['phaseDerivedIonosphere']:
         myRUNW.cleanIonosphere()
+        t2 = time.perf_counter()
+        print(f'[timing] cleanIonosphere: {t2 - t1:.1f}s')
+        t1 = t2
     #
     resolveRegion(myRUNW, params)
     #
@@ -463,6 +561,9 @@ def main():
         f'geodat{myRUNW.NumberRangeLooks}x{myRUNW.NumberAzimuthLooks}.geojson'
     # Remove all but the largest connected component.
     myRUNW.maskPhase(largest=True)
+    t2 = time.perf_counter()
+    print(f'[timing] maskPhase: {t2 - t1:.1f}s')
+    t1 = t2
 
     #
     # Apply ice mask if one exists, which removes coastal rocky areas
@@ -471,12 +572,18 @@ def main():
         updateSimVrtGeotransforms(
             f'{params["outputDir"]}/icemask*.vrt', myRUNW)
         myRUNW.applyMask(f"{params['outputDir']}/icemask")
+    t2 = time.perf_counter()
+    print(f'[timing] simIceMask+applyMask: {t2 - t1:.1f}s')
+    t1 = t2
     # Simulate the phase
     # print(params)
     simPhase(geodat, params, myRUNW.dT, outputDir=params['outputDir'],
              ompThreads=params['ompThreads'])
     updateSimVrtGeotransforms(
         f'{params["outputDir"]}/phaseSim*.vrt', myRUNW)
+    t2 = time.perf_counter()
+    print(f'[timing] simPhase: {t2 - t1:.1f}s')
+    t1 = t2
 
     #
     if not os.path.exists(f'{params["outputDir"]}/{workingDir}'):
@@ -490,7 +597,14 @@ def main():
                 ratThresh=1,
                 thresh=params['interpThresh'],
                 islandThresh=params['islandThresh'], stderr=params['stderr'],
-                stdout=params['stdout'], workingDir=workingDir)
+                stdout=params['stdout'], workingDir=workingDir,
+                minTol=params['minTol'], percentSpeed=params['percentSpeed'],
+                maxTol=params['maxTol'], maxSmoothRadius=params['maxSmoothRadius'],
+                smoothNIter=params['smoothNIter'],
+                noVariableSmoothing=params['noVariableSmoothing'])
+    t2 = time.perf_counter()
+    print(f'[timing] interpPhase: {t2 - t1:.1f}s')
+    print(f'[timing] total: {t2 - t0:.1f}s')
     #
 
 

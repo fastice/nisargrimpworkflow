@@ -8,6 +8,7 @@ Created on Thu Sep 12 10:34:37 2024
 import argparse
 import os
 import utilities as u
+from utilities import geodatrxa
 import nisarhdf
 import glob
 from subprocess import call, DEVNULL
@@ -18,6 +19,7 @@ import rioxarray
 import warnings
 import sarfunc
 import sys
+import yaml
 from pathlib import Path
 
 
@@ -59,6 +61,10 @@ def parseArgs():
     parser.add_argument('-regionFile', '--regionFile', type=str,
                         default=None, help='Yaml file with locations of '
                         'velMap, DEM etc for simulating offsests [None]')
+    parser.add_argument('--verticalCorrection', type=str, default=None,
+                        help='xyDEM grid (m/yr) of submergence/emergence '
+                        'rate; passed to simoffsets -verticalCorrection '
+                        '[None]')
     parser.add_argument('--correlationThresholds', type=float, nargs=3,
                         default=[0.07, 0.05, 0.025],
                         help='Correlation thresholds for discarding bad'
@@ -109,6 +115,27 @@ def parseArgs():
     parser.add_argument('--ompThreads', type=int, default=4,
                         help='Number of OpenMP threads passed to simoffsets/'
                         'siminsar [4]')
+    parser.add_argument('--minTol', type=float, default=None,
+                        help='Variable smoothing-radius map (additional pass on top of '
+                        '--sr/--sa): m/yr floor for the adaptive tolerance '
+                        'clip(percentSpeed/100*speed, minTol, maxTol). Required together '
+                        'with --percentSpeed/--maxTol to enable the map [None]')
+    parser.add_argument('--percentSpeed', type=float, default=None,
+                        help='Variable smoothing-radius map: percent of local speed (e.g. '
+                        '1 = 1%%) used in the adaptive tolerance. Required together with '
+                        '--minTol/--maxTol [None]')
+    parser.add_argument('--maxTol', type=float, default=None,
+                        help='Variable smoothing-radius map: m/yr ceiling for the adaptive '
+                        'tolerance. Required together with --minTol/--percentSpeed [None]')
+    parser.add_argument('--maxSmoothRadius', type=int, default=50,
+                        help='Variable smoothing-radius map: sweep cap in single-look '
+                        'pixels, clamped to <= 255 (byte output) [50]')
+    parser.add_argument('--smoothNIter', type=int, default=3,
+                        help='Variable smoothing-radius map: repeated box-filter passes '
+                        'per sweep step (Gaussian-ish) [3]')
+    parser.add_argument('--noVariableSmoothing', action='store_true', default=False,
+                        help='Disable the variable smoothing-radius map even if '
+                        '--minTol/--percentSpeed/--maxTol (or project.yaml) supply values')
 
     choices = [os.path.splitext(f)[0]
                for f in os.listdir(
@@ -116,6 +143,14 @@ def parseArgs():
                if f.endswith('.yaml')]
 
     args = parser.parse_args()
+    smoothFlags = [args.minTol is not None, args.percentSpeed is not None,
+                  args.maxTol is not None]
+    if any(smoothFlags) and not all(smoothFlags):
+        u.myerror('ROFFtoGrimp: --minTol/--percentSpeed/--maxTol must be given together')
+    if args.maxSmoothRadius > 255:
+        print(f'WARNING: --maxSmoothRadius {args.maxSmoothRadius} exceeds byte range, '
+              'clamping to 255')
+        args.maxSmoothRadius = 255
     if not os.path.exists(args.ROFF[0]) and 's3' not in args.ROFF[0]:
         u.myerror(f'ROFF file {args.ROFF[0]} does not exist')
     ROFFPath = os.path.dirname(args.ROFF[0])
@@ -137,7 +172,9 @@ def parseArgs():
     #
     for param in ['correlationThresholds', 'region', 'interpThresh',
                   'islandThresh', 'noMask', 'DEM', 'byteOrder', 'regionFile',
-                  'mergeOnly', 'ompThreads']:
+                  'mergeOnly', 'ompThreads', 'verticalCorrection',
+                  'minTol', 'percentSpeed', 'maxTol', 'maxSmoothRadius',
+                  'smoothNIter', 'noVariableSmoothing']:
         params[param] = getattr(args, param)
     # Assemble cull params
     params['cullParams'] = {}
@@ -205,12 +242,21 @@ def setupGeodats(params, simDir='workingDir'):
 
 def callSim(outputDir, baseName, params,
             includeVel=True, stderr=DEVNULL, stdout=DEVNULL,
-            simDir='workingDir', ompThreads=4):
+            simDir='workingDir', ompThreads=4, iceRockWaterMask=False, tiff=False,
+            smoothParams=None):
     '''
     Execute a shell command to run the offset simulations.
     includeVel : bool
         InlcudeVel : use velocity for the offset simulations. The default is
         True
+    tiff : bool
+        If True, pass --tiff to simoffsets so siminsar writes lat/lon as
+        GeoTIFF and offsets are written as .dr.tif/.da.tif. Default False.
+    smoothParams : dict or None
+        If given, {'minTol', 'percentSpeed', 'maxTol', 'maxSmoothRadius', 'smoothNIter'}
+        passed through to simoffsets to produce a variable smoothing-radius map (.smr.tif).
+        Only meaningful (and only ever passed by simulateOffsets) for the velocity-included
+        simulation, since the map is speed-based.
     See simulateOffsets for other paremeter definitions.
     '''
     byteOrderFlag = {'MSB': '', 'LSB': '-LSB'}[params['byteOrder']]
@@ -224,6 +270,18 @@ def callSim(outputDir, baseName, params,
         command += f'-dem={params["DEM"] } '
     if includeVel is False:
         command += '-noVel '
+    if iceRockWaterMask:
+        command += '--iceRockWaterMask '
+    if tiff:
+        command += '--tiff '
+    if params.get('verticalCorrection') is not None:
+        command += f'--verticalCorrection {params["verticalCorrection"]} '
+    if smoothParams is not None:
+        command += f'--minTol {smoothParams["minTol"]} ' \
+            f'--percentSpeed {smoothParams["percentSpeed"]} ' \
+            f'--maxTol {smoothParams["maxTol"]} ' \
+            f'--maxSmoothRadius {smoothParams["maxSmoothRadius"]} ' \
+            f'--smoothNIter {smoothParams["smoothNIter"]} '
     command += f'-offsetsDat={outputDir}/{simDir}/{baseName}.dat '
     command += f'-azOffsets={outputDir}/{simDir}/{baseName}.da -syncDat '
     geodat1 = os.path.basename(params["geo1"])
@@ -288,7 +346,7 @@ def symlink_file(src_path, dst_path, relative=True, overwrite=False):
 
 def simulateOffsets(outputDir, baseName, params,
                     stderr=DEVNULL, stdout=DEVNULL, simDir='.',
-                    ompThreads=4):
+                    ompThreads=4, tiff=False):
     '''
     Issue multithreaded shell calls to simulate offsets
 
@@ -309,6 +367,10 @@ def simulateOffsets(outputDir, baseName, params,
         outputs (dat files, .dr/.da/.vrt). The default is '.'.
     ompThreads : int, optional
         Number of OpenMP threads for siminsar. The default is 4.
+    tiff : bool, optional
+        If True, pass --tiff to simoffsets (lat/lon and offsets as GeoTIFF).
+        Use only in nisargrimpworkflow; do NOT enable in mosaicworkflow.
+        The default is False.
 
     Returns
     -------
@@ -322,11 +384,20 @@ def simulateOffsets(outputDir, baseName, params,
                                     args=[outputDir, f'{baseName}.geom',
                                           params],
                                     kwargs={'includeVel': False,
+                                            'iceRockWaterMask': True,
                                             'stderr': stderr,
                                             'stdout': stdout,
                                             'simDir': simDir,
-                                            'ompThreads': ompThreads}))
+                                            'ompThreads': ompThreads,
+                                            'tiff': tiff}))
 
+    # Variable smoothing-radius map is speed-based, so only ever passed to the
+    # velocity-included simulation below, never to the .geom one.
+    smoothParams = None
+    if params.get('minTol') is not None and not params.get('noVariableSmoothing'):
+        smoothParams = {k: params[k] for k in
+                        ['minTol', 'percentSpeed', 'maxTol', 'maxSmoothRadius',
+                         'smoothNIter']}
     # Velocity with mask — named .velocity to mirror the .geom convention
     threads.append(threading.Thread(target=callSim,
                                     args=[outputDir, f'{baseName}.velocity',
@@ -335,7 +406,9 @@ def simulateOffsets(outputDir, baseName, params,
                                             'stderr': stderr,
                                             'stdout': stdout,
                                             'simDir': simDir,
-                                            'ompThreads': ompThreads}))
+                                            'ompThreads': ompThreads,
+                                            'tiff': tiff,
+                                            'smoothParams': smoothParams}))
     quiet = False
     if stdout == DEVNULL:
         quiet = True
@@ -351,11 +424,14 @@ def simulateOffsets(outputDir, baseName, params,
 
 
 def updateSimVrtGeotransforms(vrt_glob, myNISAR):
-    """Replace pixel-coordinate geotransforms in sim VRTs with zeroDoppler/range.
+    """Replace pixel-coordinate geotransforms in sim VRTs (and tifs) with
+    zeroDoppler/range coordinates.
 
     The C siminsar/simoffsets binaries write hardcoded pixel-coord geotransforms
     [-0.5, 1, 0, -0.5, 0, 1].  The sim output grid is identical to the NISAR
     product grid, so the correct geotransform is getGeoTransform(tiff=False).
+    When --tiff is used, companion .tif files are also updated so that
+    coordinate-based VRT alignment remains consistent.
 
     Parameters
     ----------
@@ -369,6 +445,12 @@ def updateSimVrtGeotransforms(vrt_glob, myNISAR):
     gt = myNISAR.getGeoTransform(grimp=True, tiff=False)
     for vrt_path in glob.glob(vrt_glob):
         ds = gdal.Open(vrt_path, gdal.GA_Update)
+        if ds is not None:
+            ds.SetGeoTransform(gt)
+            ds = None
+    tif_glob = vrt_glob.replace('*.vrt', '*.tif')
+    for tif_path in glob.glob(tif_glob):
+        ds = gdal.Open(tif_path, gdal.GA_Update)
         if ds is not None:
             ds.SetGeoTransform(gt)
             ds = None
@@ -809,13 +891,87 @@ def mergeOffsets(outputDir, baseName='NISARoffsets', layers=[1, 2, 3],
         # Use grimp noData value
         for x in [rgMean, azMean, rgSigmaMean, azSigmaMean]:
             x[~validMean] = noData
-    # Save data
-    filenames = ['range.offsets', 'azimuth.offsets',
-                 'range.offsets.sr', 'azimuth.offsets.sa']
+    # Save data. range.offsets/azimuth.offsets are written to a .slow-suffixed file and
+    # range.offsets/azimuth.offsets is left as a symlink to it, so a future process can
+    # merge in offsets from a separate ("fast") run and write the merged result directly
+    # to range.offsets/azimuth.offsets (replacing the symlink with a real file) without
+    # disturbing range.offsets.vrt or anything downstream, which only ever reference
+    # range.offsets/azimuth.offsets by name and follow the symlink transparently. The
+    # sigma sidecars (.sr/.sa) are written directly, unchanged.
     dataType = {'LSB': 'f4', 'MSB': '>f4'}[byteOrder]
-    for filename, var in zip(filenames,
-                             [rgMean, azMean, rgSigmaMean, azSigmaMean]):
+    for filename, var in zip(['range.offsets', 'azimuth.offsets'], [rgMean, azMean]):
+        slowFile = f'{outputDir}/{filename}.slow'
+        u.writeImage(slowFile, var, dataType)
+        symlink_file(slowFile, f'{outputDir}/{filename}', relative=True, overwrite=True)
+    for filename, var in zip(['range.offsets.sr', 'azimuth.offsets.sa'],
+                             [rgSigmaMean, azSigmaMean]):
         u.writeImage(f'{outputDir}/{filename}', var, dataType)
+
+
+def applyVariableSmoothing(outputDir, params, nr, na, simDir='offsetSims',
+                           simName='offsets', stderr=DEVNULL, stdout=DEVNULL):
+    '''
+    Apply the variable smoothing-radius map (.smr.tif, produced alongside
+    {simName}.velocity by simoffsets when --minTol/--percentSpeed/--maxTol are set) to the
+    final merged range.offsets/azimuth.offsets, in place. This is an additional smoothing
+    pass layered on top of cullst's fixed -sr/-sa smoothing, which is left untouched.
+
+    Parameters
+    ----------
+    outputDir : str
+        The product directory for final products (where range.offsets/azimuth.offsets live).
+    params : dict
+        Dictionary with params passed in at the command line (geo1, byteOrder, smoothNIter).
+    nr, na : int
+        Range/azimuth size of range.offsets/azimuth.offsets (myROFF.OffsetRangeSize/
+        OffsetAzimuthSize).
+    simDir, simName : str, optional
+        Where simoffsets wrote {simName}.velocity.smr.tif. Defaults match main()'s call to
+        simulateOffsets().
+
+    Returns
+    -------
+    None.
+    '''
+    radiusMap = f'{outputDir}/{simDir}/{simName}.velocity.smr.tif'
+    if not os.path.exists(radiusMap):
+        print(f'WARNING: variable smoothing requested but {radiusMap} not found; skipping')
+        return
+    print('Applying variable smoothing-radius map...')
+    geo = geodatrxa(file=params['geo1'], echo=False)
+    slpR, slpA = geo.singleLookResolution()
+    pixRatio = slpA / slpR
+    byteOrderFlag = {'MSB': '', 'LSB': '-LSB'}[params['byteOrder']]
+    for filename in ['range.offsets', 'azimuth.offsets']:
+        inFile = f'{outputDir}/{filename}'
+        # inFile is a symlink to {filename}.slow (mergeOffsets() writes the merged data
+        # there). Resolve it so the smoothed result replaces the real file the symlink
+        # points to, rather than os.replace() clobbering the symlink itself with a plain
+        # file and silently breaking the .slow indirection.
+        realInFile = os.path.realpath(inFile)
+        tmpFile = f'{realInFile}.vsmooth'
+        command = f'filterfloat -nr {nr} -na {na} {byteOrderFlag} ' \
+            f'-radiusMap {radiusMap} -pixRatio {pixRatio} ' \
+            f'-nIterations {params["smoothNIter"]} -minValue -2.0e9 ' \
+            f'< {realInFile} > {tmpFile}'
+        print(command)
+        call(command, shell=True, stderr=stderr, stdout=stdout)
+        os.replace(tmpFile, realInFile)
+
+
+def _epsgFromProjectYaml(projectYaml='../project.yaml'):
+    """Return EPSG from the project.yaml region file, or None if unavailable."""
+    if not os.path.exists(projectYaml):
+        return None
+    try:
+        with open(projectYaml) as fp:
+            proj = yaml.safe_load(fp) or {}
+        regionPath = proj.get('regionFile') or proj.get('region')
+        if regionPath and os.path.isfile(str(regionPath)):
+            return sarfunc.defaultRegionDefs(None, regionFile=str(regionPath)).epsg()
+    except Exception:
+        pass
+    return None
 
 
 def resolveRegion(myROFF, params):
@@ -837,10 +993,13 @@ def resolveRegion(myROFF, params):
     '''
     if params['region'] is not None:
         return
-    if myROFF.epsg == 3031:
+    # Prefer the EPSG declared in the project.yaml region file over the EPSG
+    # embedded in the HDF5, which can be wrong for frames with atypical coverage.
+    epsg = _epsgFromProjectYaml() or myROFF.epsg
+    if epsg == 3031:
         params['region'] = 'antarctica'
         return
-    elif myROFF.epsg == 3413:
+    elif epsg == 3413:
         params['region'] = 'greenland'
         return
     #
@@ -955,7 +1114,8 @@ def main():
         simulateOffsets(params["outputDir"], 'offsets', params,
                         stdout=params['stdout'], stderr=params['stderr'],
                         ompThreads=params['ompThreads'],
-                        simDir='offsetSims')
+                        simDir='offsetSims',
+                        tiff=True)
         updateSimVrtGeotransforms(
             f'{params["outputDir"]}/offsetSims/*.vrt', myROFF)
         #
@@ -993,6 +1153,12 @@ def main():
                  byteOrder=params['byteOrder'],
                  simName='offsets',
                  simDir='offsetSims')
+    #
+    if params.get('minTol') is not None and not params.get('noVariableSmoothing'):
+        applyVariableSmoothing(params["outputDir"], params,
+                               myROFF.OffsetRangeSize, myROFF.OffsetAzimuthSize,
+                               simDir='offsetSims', simName='offsets',
+                               stderr=params['stderr'], stdout=params['stdout'])
     #
     writeVRTs(myROFF, params["outputDir"], params)
     #

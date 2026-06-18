@@ -49,6 +49,35 @@ The corrected phase is then:
 
 $$\phi_\mathrm{corrected} = \phi_\mathrm{obs} - \Delta\phi_\mathrm{ion}$$
 
+### Sign convention and applied corrections
+
+All corrections are defined so that they are **added** to the measured quantity to remove the ionospheric error.
+
+**Phase correction** (radians, on the RUNW grid):
+
+$$\Delta\phi_\mathrm{correction} = -\Delta\phi_\mathrm{ion}
+\qquad\Rightarrow\qquad
+\phi_\mathrm{corrected} = \phi_\mathrm{obs} + \Delta\phi_\mathrm{correction}$$
+
+**Range-offset correction** (SLC pixels, on the offset-VRT grid):
+
+$$\Delta R_\mathrm{correction} = \frac{\lambda}{4\pi\,\Delta_\mathrm{slp}}\,\Delta\phi_\mathrm{ion}
+\qquad\Rightarrow\qquad
+\delta R_\mathrm{corrected} = \delta R_\mathrm{obs} + \Delta R_\mathrm{correction}$$
+
+where Δ_slp is the SLC range pixel spacing in metres.
+
+**Concrete sign example (ΔTEC > 0):**
+
+| Quantity | Sign | Physical meaning |
+|---|---|---|
+| Δφ_ion | **negative** | iono shortens phase path; observed phase too negative |
+| Δφ_correction = −Δφ_ion | **positive** | adds positive value → restores phase toward truth |
+| ΔR_ion (group delay) | **positive** | iono inflates apparent range; observed offset too large |
+| ΔR_correction = (λ/4π·Δslp)·Δφ_ion | **negative** | adds negative value → reduces inflated range offset |
+
+The opposite signs of the two corrections reflect the physics: because iono shifts phase and group delay in opposite directions, the phase correction and the range correction must also have opposite signs — but both are added, not subtracted.
+
 ### Geometry removal
 
 Before combining with the interferometric phase, the geometric contribution to the range offsets (from topography, orbital geometry, and look angle) is subtracted. `simoffsets` produces two simulated offset fields — one geometry-only (`offsets.geom`) and one including a velocity component (`offsets.velocity`). The residual
@@ -101,8 +130,16 @@ estimateIonosphere.py RUNW offsets.vrt output.vrt [options]
 | `--interpThresh N` | 20 | Maximum hole area (pixels) that `intfloat` will fill. |
 | `--islandThresh N` | 20 | Maximum isolated-island area (pixels) that `intfloat` removes after filling. |
 | `--phaseThresh RAD` | 14π | Mask `correctedUnwrappedPhase` where \|correctedPhase − simPhase\| ≥ RAD radians; screens regions of likely incorrect unwrapping. Masked pixels are written as −2×10⁹. |
+| `--noPhaseThreshPass` | off | Disable the second-pass iono re-estimation (see below). By default, after Pass 1 converges a second pass re-estimates iono using the phase-residual mask instead of the velocity mask. |
 | `--outputAll` | off | Write all 5 intermediate bands to a multi-band VRT (`ionosphereCorrection`, `correctedUnwrappedPhase`, `ionosphereCorrectionUnfilled`, `offsetPhase`, `unwrappedPhase`). Default: write only the 3 standard outputs as separate single-band VRTs. |
+| `--debugIono` | off | Write extra diagnostic outputs to a `debug/` subdirectory alongside the main output: ambiguity-corrected unwrapped phase (`*.ambiguityCorrectedUnwrappedPhase.vrt`) and iono-corrected range offsets (`range.offsets.corrected.vrt`) in SLC pixel units. |
 | `--verbose` | off | Print progress messages to stdout. |
+| `--minTol M/YR` | None | Variable smoothing-radius map: m/yr floor for the adaptive tolerance `clip(percentSpeed/100*speed, minTol, maxTol)`, applied to `correctedUnwrappedPhase` as an additional pass on top of `intfloat` hole-filling. Required together with `--percentSpeed`/`--maxTol` to enable the map. |
+| `--percentSpeed PCT` | None | Percent of local speed (e.g. `1` = 1%) used in the adaptive tolerance. Required together with `--minTol`/`--maxTol`. |
+| `--maxTol M/YR` | None | m/yr ceiling for the adaptive tolerance. Required together with `--minTol`/`--percentSpeed`. |
+| `--maxSmoothRadius N` | 50 | Sweep cap, single-look pixels, clamped to ≤ 255 (byte output). |
+| `--smoothNIter N` | 3 | Repeated box-filter passes per sweep step (Gaussian-ish), used both by `run_vel_sim()`'s `siminsar` sweep and the `filterfloat` apply step. |
+| `--noVariableSmoothing` | off | Disable the variable smoothing-radius map even if `--minTol`/`--percentSpeed`/`--maxTol` (or `project.yaml`) supply values. |
 
 ---
 
@@ -116,6 +153,10 @@ apply_runw_mask()          — zero pixels excluded by the interferogram mask
 
 run_vel_sim()              — siminsar: generate velSim.vrt (radians, RUNW grid)
                              skipped if velSim already exists and --overWrite not set
+                             [if --minTol/--percentSpeed/--maxTol] also generates
+                             velSim.smr(.vrt), a per-pixel smoothing-radius map; the
+                             siminsar call (and this skip check) is re-run if the radius
+                             map was requested but is missing from a prior run
 
 run_mask_vel()             — siminsar: generate maskVel.vrt (velocity threshold mask)
                              skipped if maskVel.vrt already exists
@@ -150,13 +191,49 @@ for pass in 1..MAX_PASSES:
                            — subtract n × 2π from each CC of original phase;
                              update phase for next pass
 
+[if --phaseThresh set]
+thresh_mask = |phase_out − vel_sim − bias| ≥ phaseThresh
+phase_out[thresh_mask] = NaN
+
+[Pass 2 — unless --noPhaseThreshPass]
+pass2_mask = ~thresh_mask & finite(phase_out) & (cc ≠ 0)
+  — pixels whose corrected phase already agreed with vel_sim (residual < phaseThresh)
+  — more principled than velocity mask: includes fast areas with correct ambiguity,
+    excludes only pixels with clear phase anomalies
+  — circularity is limited: vel_sim is independent; iono is constrained smooth
+for pass in 1..MAX_PASSES:
+    estimate_and_correct(phase_from_pass1, pass2_mask)
+    ambiguity_table() / apply_ambiguity_correction()
+    if all n == 0: break
+thresh_mask2 = |phase_out2 − vel_sim − bias| ≥ phaseThresh
+phase_out2[thresh_mask2] = NaN
+→ replace iono, phase_out, iono_unfilled, thresh_mask with Pass 2 results
+
+[unless --noInterp]
+run_intfloat()             — intfloat hole-fills correctedUnwrappedPhase into a temp
+                             file (not in place); cc=0/phaseThresh pixels re-masked to -2e9
+[if --minTol/--percentSpeed/--maxTol and velSim.smr.vrt exists]
+filterfloat -radiusMap     — additional variable-radius smoothing pass: reads the temp
+                             interpolated file + velSim.smr.vrt, writes final
+                             correctedUnwrappedPhase.tif/.vrt
+[else]                     — temp file renamed directly to correctedUnwrappedPhase.tif/.vrt
+
 write_geotiff() × 5        — ionosphereCorrection, correctedUnwrappedPhase,
                              ionosphereCorrectionUnfilled, offsetPhase, unwrappedPhase
 write_output_vrt()         — 5-band named VRT on RUNW grid
 
-resample_runw_to_vrt()     — regrid iono correction to offset VRT grid (metres)
+[if --debugIono]
+write_geotiff() + write_output_vrt()
+                           — debug/: ambiguityCorrectedUnwrappedPhase.vrt
+
+resample_runw_to_vrt()     — regrid iono correction to offset VRT grid (SLC pixels)
 write_geotiff() + write_output_vrt()
                            — single-band offset-grid VRT (ionosphereCorrection.offset.vrt)
+
+[if --debugIono]
+corrected = offset_slp − iono_offset_pix
+write_geotiff() + write_output_vrt()
+                           — debug/range.offsets.corrected.vrt (SLC pixels)
 ```
 
 ---
@@ -179,7 +256,16 @@ All outputs are written relative to the stem of the `output` argument (e.g. `out
 
 | File | Band | Units | Description |
 |------|------|-------|-------------|
-| `<stem>.offset.vrt` | 1 `ionosphereCorrection` | m | Ionosphere correction regridded to the offset VRT coordinate system, in metres (for direct comparison with range offsets). |
+| `<stem>.offset.vrt` | 1 `ionosphereCorrection` | SLC px | Range-offset correction ΔR_correction = (λ/4π·Δslp)·Δφ_ion, regridded to the offset VRT grid in SLC pixel units. **Add** to the measured range offset (also in SLC pixels) to remove the ionospheric error. Sign is negative for ΔTEC > 0. |
+
+### Debug outputs (`--debugIono` only)
+
+Written to `debug/` alongside the main output directory.
+
+| File | Band | Units | Description |
+|------|------|-------|-------------|
+| `debug/<stem>.ambiguityCorrectedUnwrappedPhase.vrt` | 1 | rad | Unwrapped phase after ambiguity correction only (before iono subtraction); useful for diagnosing how much the ambiguity loop changed the phase. |
+| `debug/range.offsets.corrected.vrt` | 1 `RangeOffsetsCorrected` | SLC px | Raw range offsets minus the iono correction (`offset_slp − iono_offset_pix`); NaN/−2×10⁹ where either the measurement or the correction is missing. |
 
 ---
 
@@ -340,6 +426,70 @@ The output VRT is written to
 Simulation outputs (`velSim`, `maskVel`) are written to `simDir` inside
 `frameDir` (default `simPhase/`). The frame is skipped if the output VRT
 already exists and neither `--overWrite` nor `--overWritePhase` is set.
+
+---
+
+## Global fill (`globalFillIonosphere`)
+
+After per-frame `estimateIonosphere` produces sparse offset corrections (NaN where there
+is no phase/offset overlap), `SetupNISAR.globalFillIonosphere()` assembles them across
+all frames into a virtual-frame composite and fills globally to avoid frame-boundary
+discontinuities caused by independent per-frame fills.
+
+### Ice-free pre-fill
+
+Before the pyramid fill, ice-free pixels (exposed rock, ocean) are pre-seeded with a
+direct ionospheric range-offset estimate derived from geometry alone:
+
+```
+fill_value = offsets.geom [Band 1, SLC pixels] − range.offsets [Band 1, SLC pixels]
+```
+
+In ice-free areas the measured range offset contains only geometric (satellite geometry
++ topography) range change plus ionospheric range shift.  Subtracting the purely
+geometric simulation removes the geometric part, leaving the iono estimate.  This is
+the only direct iono measurement available in ice-free regions (no phase exists there).
+
+The fill is applied only where all three conditions hold:
+
+1. The ice mask (`offsetSims/offsets.geom.mask.vrt`) is **0** (not ice — rock or ocean).
+2. The measured offset (`range.offsets.vrt` Band 1) is valid (not NaN / nodata).
+3. The sparse iono correction is currently NaN (no phase-based estimate exists there).
+
+The mask is produced by `simoffsets` using `IceRock90m.tif` via the `--iceRockWaterMask`
+flag (passed automatically by `ROFFtoGrimp` for the `offsets.geom` simulation).
+Mask values: **0 = water, 1 = rock, 2 = ice**.  Before seeding, rock pixels
+(`mask == 1`) are morphologically eroded with a 5×5 kernel to pull back from
+ice/water boundaries where sea-ice motion or other edge artefacts may be present.
+
+If `offsets.geom.mask.vrt` is absent for all frames, a bold-blue warning is printed
+and the pre-fill step is skipped.
+
+Sign convention (consistent with existing corrections):
+```
+fill_value = geom − measured   [SLC pixels]
+```
+Negative for positive ΔTEC (measured range > geometric range).  Consumers **add** the
+correction, same as the phase-derived correction.
+
+### Pyramid fill and smoothing
+
+After the optional ice-free pre-fill, `fill_and_smooth_iono()` performs a multi-scale
+pyramid fill (progressively coarser levels, nearest-neighbour seeding from valid pixels)
+followed by Gaussian smoothing (σ_az = 10 px, σ_rg = 30 px) across the full swath.
+This blends the ice-covered phase-derived estimates and the ice-free pre-fill values
+into a single continuous surface.
+
+### Output (per frame, after re-partitioning)
+
+| File | Description |
+|------|-------------|
+| `*.ionosphereCorrection.globalFill.offset.tif` | Per-frame tile on ROFF grid |
+| `*.ionosphereCorrection.globalFill.offset.vrt` | Per-frame VRT wrapper |
+| `{virtualFrame}/*.ionosphereCorrection.globalFill.offset.vrt` | Virtual-frame mosaic |
+
+**Called from:** `SetupNISAR.globalFillIonosphere(myArgs)` immediately after
+`createVirtualFrameROFF`.
 
 ---
 

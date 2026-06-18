@@ -86,7 +86,7 @@ writeVRTs()              — write azimuth.offsets.vrt, range.offsets.vrt,
 Simulates range and azimuth offset fields from a velocity map and DEM. Called twice in parallel threads:
 
 ```
-simoffsets -region=REGION [-LSB] [-dem=DEM] [-noVel]
+simoffsets -region=REGION [-LSB] [--tiff] [-dem=DEM] [-noVel]
     -offsetsDat=outputDir/offsets[.geom].dat
     -azOffsets=outputDir/offsets[.geom].da -syncDat
     -geodatFile=workingDir/geodat1
@@ -94,6 +94,8 @@ simoffsets -region=REGION [-LSB] [-dem=DEM] [-noVel]
 ```
 
 The geometry-only call (with `-noVel`) produces the static offset baseline (`offsets.geom.*`). The full call (with velocity) produces `offsets.*`, which includes glacier motion.
+
+`--tiff` is passed automatically by the NISAR workflow (`tiff=True` in `simulateOffsets`). When set, `simoffsets` passes `-tiff` to `siminsar`, which writes latitude/longitude as GeoTIFF files (`.lat.tif`, `.lon.tif`) plus a `.ll.vrt` wrapper instead of binary flat files. The offset arrays themselves (`.dr`, `.da`) are also written as GeoTIFF (`.dr.tif`, `.da.tif`) and a two-band VRT is generated from them. `offsets.readLatlon()` automatically prefers the `.ll.vrt` path, so downstream processing is unaffected.
 
 ### `cullst`
 
@@ -127,8 +129,9 @@ Intermediate files in `outputDir/workingDir/`:
 | `NISARoffsets.layer{1,2,3}.cull.{dr,da}` | Culled offset binaries |
 | `NISARoffsets.layer{1,2,3}.cull.interp.{dr,da,sr,sa}` | Hole-filled offset/sigma binaries |
 | `NISARoffsets.layer{1,2,3}.cull.interp.vrt` | Four-band VRT per layer |
-| `offsets.{dr,da,sr,sa,vrt}` | Simulated offsets with velocity |
-| `offsets.geom.{dr,da,vrt}` | Geometry-only simulated offsets |
+| `offsets.{dr.tif,da.tif,vrt}` | Simulated offsets with velocity (GeoTIFF + VRT; NISAR workflow always uses `--tiff`) |
+| `offsets.geom.{dr.tif,da.tif,vrt}` | Geometry-only simulated offsets (GeoTIFF + VRT) |
+| `offsets.{geom.,velocity.}{lat.tif,lon.tif,ll.vrt,mask}` | lat/lon GeoTIFFs + VRT wrapper and binary mask written by `siminsar -tiff` |
 
 ---
 
@@ -152,8 +155,9 @@ No-data pixels use fill value `−2×10⁹`.
 | `findGeodat(params, geodat1, geodat2)` | Auto-detect geodat filenames from `*.nisar.uw` files in the output directory. |
 | `setupGeodats(params)` | Create symlinks to geodat files inside `workingDir/`. |
 | `resolveRegion(myROFF, params)` | Determine region (`greenland`/`antarctica`) from ROFF EPSG code. |
-| `simulateOffsets(outputDir, baseName, params, ...)` | Spawn two `simoffsets` threads (geometry-only and full velocity). |
-| `callSim(outputDir, baseName, params, ...)` | Build and execute a single `simoffsets` shell command. |
+| `simulateOffsets(outputDir, baseName, params, ..., tiff=False)` | Spawn two `simoffsets` threads (geometry-only and full velocity). Always called with `tiff=True` in the NISAR workflow. |
+| `callSim(outputDir, baseName, params, ..., tiff=False)` | Build and execute a single `simoffsets` shell command; appends `--tiff` when `tiff=True`. |
+| `updateSimVrtGeotransforms(vrt_glob, myNISAR)` | Replace pixel-coord geotransforms in sim VRTs (and matching `.tif` files) with the NISAR SLC grid geotransform. |
 | `cullst(outputDir, baseName, ...)` | Spawn one `cullst` thread per layer. |
 | `runCull(outputDir, baseLayerName, ...)` | Build and execute a single `cullst` shell command. |
 | `interpOffsets(outputDir, baseName, ...)` | Spawn one `intfloat` thread per layer × component; write per-layer VRTs. |

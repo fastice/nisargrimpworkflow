@@ -20,9 +20,11 @@ import os
 import shutil
 import yaml
 from scipy.interpolate import interp1d
+from scipy.ndimage import binary_erosion
 import sys
 import importlib.resources
-from osgeo import gdal
+from osgeo import gdal, osr
+import sarfunc
 
 def restrictedFrame(x):
     x = int(x)
@@ -39,11 +41,10 @@ def parseCommandLine():
         description='\n\n\033[1mConvert NISAR Level-2 HDF5 products (RUNW, '
         'ROFF) into the binary flat-file and VRT formats used by the GrIMP '
         'velocity mosaic pipeline.\033[0m\n\n'
-        'Processes all frames of a single orbit pair found in the current '
-        'working directory, then consolidates the per-frame outputs into a '
-        'single virtual-frame directory using GDAL VRT mosaics.  Must be run '
-        'from the directory containing the <orbit1>_<frame> subdirectories '
-        '(e.g. 12345_010/, 12345_020/, ...).',
+        'Processes all frames of a single orbit pair and consolidates the '
+        'per-frame outputs into a single virtual-frame directory using GDAL '
+        'VRT mosaics.  Must be run from the track-<N> directory that contains '
+        'the <orbit1>_<frame> subdirectories (e.g. 12345_010/, 12345_020/, ...).',
         epilog='Examples:\n'
                '  # Process all frames for orbit 12345\n'
                '  SetupNISAR 12345\n\n'
@@ -110,6 +111,27 @@ def parseCommandLine():
                         '|correctedPhase - simPhase| >= RAD radians. '
                         'Screens regions with likely incorrect unwrapping. '
                         'Default: 14π rad.')
+    parser.add_argument('--noPhaseThreshPass', action='store_true', default=False,
+                        help='Pass --noPhaseThreshPass to estimateIonosphere: '
+                        'disable the second-pass iono re-estimation that uses '
+                        'the phase-residual mask instead of the velocity mask.')
+    parser.add_argument('--sepIceRock', action='store_true', default=False,
+                        help='Pass --sepIceRock to estimateIonosphere — restrict the '
+                        'per-frame (phase+offset_phase)/2 estimate to ice pixels. '
+                        'In globalFillIonosphere(), the excluded rock pixels '
+                        '(offset_phase only, an absolute "actual vs simulated '
+                        'offset" reference) are used once, at the virtual-frame '
+                        'level, to anchor the otherwise-floating ice-derived '
+                        'ionosphere field via a single additive constant. '
+                        'Enables global fill on its own (combine with '
+                        '--noGlobalFillIono to disable the rock-anchoring step). '
+                        'Mask auto-detected from offsetSims/offsets.geom.mask.vrt.')
+    parser.add_argument('--sigmaAz', type=float, default=None, metavar='PX',
+                        help='Azimuth Gaussian sigma for iono smoothing, in RUNW pixels '
+                        '(passed to estimateIonosphere --sigma-az). Default: 10 px.')
+    parser.add_argument('--sigmaRg', type=float, default=None, metavar='PX',
+                        help='Range Gaussian sigma for iono smoothing, in RUNW pixels '
+                        '(passed to estimateIonosphere --sigma-rg). Default: 30 px.')
     parser.add_argument('--correlationOnly', action='store_true',
                         help='Extract coherence and geodat files only. '
                         'Skips ROFF conversion, ionosphere estimation, and '
@@ -125,16 +147,48 @@ def parseCommandLine():
                         help='Keep per-frame unfilled and per-frame filled '
                         'offset iono files after global fill (useful for '
                         'debugging or comparison)')
+    parser.add_argument('--debugIono', action='store_true',
+                        help='Rename all ionosphere intermediates with "debug" '
+                        'in their filenames and build two extra virtual-frame '
+                        'VRTs: (1) assembled unfilled iono across all frames, '
+                        '(2) assembled per-frame-filled (pre-global-fill) offset '
+                        'correction.  Files named *.debug.* can be found and '
+                        'deleted as a group after inspection.')
+    parser.add_argument('--clean', action='store_true',
+                        help='Remove all computed output files for this orbit -- '
+                        'everything --overWrite would replace (workingDir/, offsetSims/, '
+                        'simPhase/, range/azimuth offsets, phase/ionosphere products, '
+                        'pairinfo, geodats, *.vrt.stats) -- plus mislabeled files (frame '
+                        'directories whose name does not match the expected real-frame '
+                        'or virtual-frame pattern, e.g. from a past failed run) and '
+                        'stale temp files left by an interrupted run (*.tmp*, *.vsmooth). '
+                        'debug/ directories are emptied (not removed; see --cleanDebug). '
+                        'Builds and prints the full list, then prompts for confirmation '
+                        'unless --noPrompt is set. Exits immediately afterward without '
+                        'any further processing.')
+    parser.add_argument('--cleanDebug', action='store_true',
+                        help='Empty the contents of every debug/ directory for this '
+                        'orbit (real-frame and virtual-frame), leaving the empty '
+                        'directory itself in place. Same print/prompt-unless-noPrompt '
+                        'flow as --clean, and also exits immediately afterward. Can be '
+                        'combined with --clean (redundant but harmless, since --clean '
+                        'already empties debug/ too).')
+    parser.add_argument('-noPrompt', '--noPrompt', action='store_true',
+                        help='Skip the confirmation prompt for --clean/--cleanDebug')
     args = parser.parse_args()
     #
     params = {}
     for key in ['overWrite', 'overWritePhase', 'firstFrame', 'lastFrame',
                 'orbit1', 'allowMixedMode', 'virtualFrame', 'noMask',
                 'verbose', 'RUNWOnly', 'ompThreads', 'phaseDerivedIonosphere',
-                'outputAll', 'phaseThresh', 'correlationOnly', 'corrOnly',
-                'retainIntermediateIono']:
+                'outputAll', 'phaseThresh', 'noPhaseThreshPass', 'sepIceRock',
+                'sigmaAz', 'sigmaRg',
+                'correlationOnly', 'corrOnly',
+                'retainIntermediateIono', 'debugIono',
+                'clean', 'cleanDebug', 'noPrompt']:
         params[key] = getattr(args, key)
-    params['globalFillIono'] = not args.noGlobalFillIono and bool(args.phaseDerivedIonosphere)
+    params['globalFillIono'] = not args.noGlobalFillIono and (
+        bool(args.phaseDerivedIonosphere) or bool(args.debugIono) or bool(args.sepIceRock))
     #
     if args.verbose:
         params['stdout'], params['stderr'] = None, None
@@ -293,6 +347,140 @@ def getFrames(myArgs):
             if myArgs['firstFrame'] <= x <= myArgs['lastFrame']]
 
 
+# Per-frame-directory computed outputs that --clean/--cleanDebug operate on.
+_CLEAN_DIR_PATTERNS = ['workingDir', 'offsetSims', 'simPhase']
+_CLEAN_FILE_PATTERNS = [
+    'range.offsets*', 'azimuth.offsets*', 'offsets.range-azimuth.vrt',
+    '*.nisar.cor*', '*.correctedUnwrappedPhase*', '*.ionosphereCorrection*',
+    '*.unwrappedPhase.tif', '*.offsetPhase.tif', '*.uw*', '*.ion*',
+    '*.pairinfo', 'geodat*.geojson', '*.vrt.stats',
+    # Virtual-frame-level merges of per-real-frame simPhase/offsetSims outputs, written
+    # directly at the virtual-frame directory root by custom_buildvrtWithOffsets (not
+    # inside a subdirectory, unlike the real-frame versions already caught above via
+    # the offsetSims/simPhase rmtree).
+    'velSim*', 'maskVel*', 'offsets.geom*', 'offsets.velocity*',
+    'frames.txt',
+]
+_STALE_PATTERNS = ['*.tmp*', '*interp.tmp*', '*.vsmooth']
+_CLEAN_BUCKET_LABELS = {'normal': 'normally processed', 'mislabeled': 'mislabeled',
+                        'stale': 'stale', 'debug': 'debug'}
+
+
+def cleanFrames(myArgs, debugOnly=False):
+    '''
+    Build (but do not remove) the list of computed-output files/directories for this
+    orbit, categorized into buckets for --clean / --cleanDebug.
+
+    Frame directories are discovered by globbing {orbit1}_* directly rather than via
+    getFrames(), so directories with unexpected/bad frame numbers (e.g. left over from a
+    failed run) are caught too -- that's the whole point of --clean. "Well-formed" means
+    matching one of the three real-frame patterns getFrames() itself uses (_?? / _1?? /
+    _2??) or the four-digit leading-zero virtual-frame pattern used elsewhere in this
+    file and in readReferenceFrameSets() (_0???); anything else is "mislabeled".
+
+    Parameters
+    ----------
+    myArgs : dict
+        Must contain 'orbit1'.
+    debugOnly : bool, optional
+        If True (set when --cleanDebug is given without --clean), only the 'debug'
+        bucket is populated -- nothing else is touched. Default False.
+
+    Returns
+    -------
+    dict
+        {'normal': [...], 'mislabeled': [...], 'stale': [...], 'debug': [...]}
+        Directories appear as single entries (removed wholesale); debug/ contents are
+        listed individually (debug/ itself is never included -- it's emptied, not removed).
+    '''
+    orbit1 = myArgs['orbit1']
+    wellFormedDirs = set(
+        glob.glob(f'{orbit1}_??') + glob.glob(f'{orbit1}_1??') +
+        glob.glob(f'{orbit1}_2??') + glob.glob(f'{orbit1}_0???'))
+    allDirs = sorted(glob.glob(f'{orbit1}_*'))
+
+    buckets = {'normal': [], 'mislabeled': [], 'stale': [], 'debug': []}
+
+    for d in allDirs:
+        bucket = 'normal' if d in wellFormedDirs else 'mislabeled'
+
+        debugDir = os.path.join(d, 'debug')
+        if os.path.isdir(debugDir):
+            buckets['debug'] += sorted(glob.glob(os.path.join(debugDir, '*')))
+
+        if debugOnly:
+            continue
+
+        staleMatches = set()
+        for pat in _STALE_PATTERNS:
+            staleMatches.update(glob.glob(os.path.join(d, pat)))
+            staleMatches.update(glob.glob(os.path.join(d, '*', pat)))
+        buckets['stale'] += sorted(staleMatches)
+
+        for sub in _CLEAN_DIR_PATTERNS:
+            p = os.path.join(d, sub)
+            if os.path.isdir(p):
+                buckets[bucket].append(p)
+
+        for pat in _CLEAN_FILE_PATTERNS:
+            for f in glob.glob(os.path.join(d, pat)):
+                if f not in staleMatches:
+                    buckets[bucket].append(f)
+
+    return buckets
+
+
+def _removePath(path):
+    if os.path.islink(path) or os.path.isfile(path):
+        os.remove(path)
+    elif os.path.isdir(path):
+        shutil.rmtree(path)
+
+
+def confirmAndRemove(buckets, noPrompt):
+    '''
+    Print the counts (by category) built by cleanFrames(), prompt for confirmation
+    (unless noPrompt) with [y/n/l] -- 'l' prints the full categorized list and
+    re-prompts -- then remove everything on 'y'. Aborts via u.myerror on 'n'.
+    '''
+    order = ['normal', 'mislabeled', 'stale', 'debug']
+    allItems = []
+    for key in order:
+        allItems += buckets.get(key, [])
+
+    if not allItems:
+        print('\nNothing to clean.')
+        return
+
+    counts = [(key, len(buckets[key])) for key in order if buckets.get(key)]
+    parts = [f'{n} {_CLEAN_BUCKET_LABELS[key]} files' for key, n in counts]
+    msg = 'Removing ' + ', '.join(parts[:-1]) + (
+        f', and {parts[-1]}' if len(parts) > 1 else parts[0])
+
+    def printFullList():
+        for key in order:
+            items = buckets.get(key, [])
+            if not items:
+                continue
+            print(f'\n{_CLEAN_BUCKET_LABELS[key].capitalize()} ({len(items)}):')
+            for item in items:
+                print(f'  {item}')
+
+    if not noPrompt:
+        while True:
+            ans = input(f'\n\033[1m{msg} [y/n/l]\033[0m\n')
+            if ans.lower() == 'y':
+                break
+            if ans.lower() == 'n':
+                u.myerror('User prompted abort')
+            if ans.lower() == 'l':
+                printFullList()
+
+    for item in allItems:
+        _removePath(item)
+    print(f'\nRemoved {len(allItems)} items.')
+
+
 def getSecondaryOrbit(myArgs):
     '''
     Get first and second orbits
@@ -420,6 +608,26 @@ def getProductH5(product,  frame, myArgs):
     return myProduct[0]
 
 
+def variableSmoothingArgs(myArgs):
+    '''
+    Build the --minTol/--percentSpeed/--maxTol/--maxSmoothRadius/--smoothNIter/
+    --noVariableSmoothing CLI args to pass through to ROFFtoGrimp/RUNWtoGrimp, from values
+    already resolved (project.yaml or CLI) into myArgs by main(). Returns [] when the
+    feature isn't configured (minTol is None) -- same opt-in convention as ROFFtoGrimp/
+    RUNWtoGrimp themselves.
+    '''
+    if myArgs.get('minTol') is None:
+        return []
+    args = ['--minTol', str(myArgs['minTol']),
+           '--percentSpeed', str(myArgs['percentSpeed']),
+           '--maxTol', str(myArgs['maxTol']),
+           '--maxSmoothRadius', str(myArgs['maxSmoothRadius']),
+           '--smoothNIter', str(myArgs['smoothNIter'])]
+    if myArgs.get('noVariableSmoothing'):
+        args += ['--noVariableSmoothing']
+    return args
+
+
 def processFrameROFF(frame, myArgs):
     '''
     Run programs to unpack RUNW and ROFF files into GrIMP formats.
@@ -456,6 +664,9 @@ def processFrameROFF(frame, myArgs):
                    ROFFFile]
         if myArgs.get('regionFile'):
             command += ['--regionFile', myArgs['regionFile']]
+        if myArgs.get('verticalCorrection'):
+            command += ['--verticalCorrection', myArgs['verticalCorrection']]
+        command += variableSmoothingArgs(myArgs)
         if myArgs['noMask'] is True:
             command += ['--noMask']
         if myArgs['verbose'] is True:
@@ -489,10 +700,6 @@ def processFrameRUNW(frame, myArgs):
     # Geodats are written by RUNWtoGrimp to the RUNW output dir (frame dir),
     # not to the H5 subdir where the HDF5 lives.
     ruNWOutputDir = f'{myArgs["outputDir"]}/{orbit1}_{frame}'
-    myArgs['geodat1'].append(
-        f'{ruNWOutputDir}/geodat{nLooksR}x{nLooksA}.geojson')
-    myArgs['geodat2'].append(
-        f'{ruNWOutputDir}/geodat{nLooksR}x{nLooksA}.secondary.geojson')
     #
     if not myArgs['allowMixedMode']:
         if isMixedMode(myRUNW):
@@ -521,16 +728,35 @@ def processFrameRUNW(frame, myArgs):
                    RUNWFile]
         if myArgs.get('regionFile'):
             command += ['--regionFile', myArgs['regionFile']]
+        if myArgs.get('verticalCorrection'):
+            command += ['--verticalCorrection', myArgs['verticalCorrection']]
+        command += variableSmoothingArgs(myArgs)
         if myArgs['verbose'] is True:
             command += ['--verbose']
         if myArgs.get('phaseDerivedIonosphere'):
             command += ['--phaseDerivedIonosphere']
+            # Phase output is only produced in this branch (the other branch passes
+            # --noPhase), so only here is there anything for the variable smoothing-radius
+            # map to smooth -- and only here does RUNWtoGrimp need --simPhase to actually
+            # run siminsar and produce phaseSim.smr.vrt for it.
+            if myArgs.get('minTol') is not None and not myArgs.get('noVariableSmoothing'):
+                command += ['--simPhase']
         else:
             command += ['--noPhase', '--noIon']
         # print(' '.join(command))
         run(command, stderr=myArgs['stderr'], stdout=myArgs['stdout'])
     else:
         print(f'skipping {orbit1}_{frame} since products exist')
+    # RUNWtoGrimp can exit early (e.g. unresolvable region/epsg) without
+    # producing the geodat; only record this frame as usable — and let
+    # ROFF/ionosphere run for it — if it actually wrote one.
+    if not os.path.exists(geodat):
+        print(f'RUNWtoGrimp produced no geodat for {orbit1}_{frame} — skipping frame')
+        return True
+    myArgs['geodat1'].append(
+        f'{ruNWOutputDir}/geodat{nLooksR}x{nLooksA}.geojson')
+    myArgs['geodat2'].append(
+        f'{ruNWOutputDir}/geodat{nLooksR}x{nLooksA}.secondary.geojson')
     return False
 
 
@@ -747,14 +973,17 @@ def createVirtualFrameRUNW(myArgs):
         ('*.ionosphereCorrection.offset.vrt', True,  'ionosphereCorrection.offset', True),
     ]
     if myArgs.get('globalFillIono'):
-        # Global fill replaces the per-frame filled offset; skip building the
-        # assembled offset VRT (its per-frame TIFs will be deleted), and add
-        # the unfilled iono for the global-fill assembly step instead.
+        # Global fill replaces both the per-frame-filled phase and offset VRTs;
+        # skip assembling them here and add the sparse unfilled versions so
+        # globalFillIonosphere can do a single full-swath fill pass on each.
         products = [(g, o, l, r) for g, o, l, r in products
-                    if l != 'ionosphereCorrection.offset']
+                    if l not in ('ionosphereCorrection', 'ionosphereCorrection.offset')]
         products.append(
             ('*.ionosphereCorrectionUnfilled.vrt', True,
              'ionosphereCorrectionUnfilled', False))
+        products.append(
+            ('*.ionosphereCorrectionUnfilled.offset.vrt', True,
+             'ionosphereCorrectionUnfilled.offset', False))
     for globPattern, useOffsets, label, isIonoRangeOffset in products:
         # Find files
         myFiles = []
@@ -778,9 +1007,12 @@ def createVirtualFrameRUNW(myArgs):
                 command += ['--referencePhase', velSimVrt]
             if os.path.exists(maskVelVrt):
                 command += ['--mask', maskVelVrt]
-        # Virtual product name — use first frame (myFiles[0] belongs to frames[0])
+        # Virtual product name — derive from the actual source frame in myFiles[0]
+        # (frames[0] may have no output if its processing failed, making myFiles[0]
+        # belong to a later frame whose number won't match the replace pattern)
+        _srcFrame = os.path.dirname(myFiles[0]).split('_')[-1]
         virtualProduct = os.path.basename(
-            myFiles[0].replace(f'_{myArgs["frames"][0]}.', f'_{virtualFrame}.'))
+            myFiles[0].replace(f'_{_srcFrame}.', f'_{virtualFrame}.'))
         virtualVRTs[label] = f'{frameDir}/{virtualProduct}'
         #
         # The ionosphere correction on the offset grid goes into range-offset metadata
@@ -859,9 +1091,10 @@ def createVirtualFrameROFF(myArgs):
             continue
         # Create virtual raster
         command = ['custom_buildvrtWithOffsets']
-        # Virtual product name — use first frame (myFiles[0] belongs to frames[0])
+        # Virtual product name — derive from the actual source frame in myFiles[0]
+        _srcFrame = os.path.dirname(myFiles[0]).split('_')[-1]
         virtualProduct = os.path.basename(
-            myFiles[0].replace(f'_{myArgs["frames"][0]}.', f'_{virtualFrame}.'))
+            myFiles[0].replace(f'_{_srcFrame}.', f'_{virtualFrame}.'))
         #
         vrtFile = f'{frameDir}/{virtualProduct}'
         virtualVRTs[myFileType] = vrtFile
@@ -889,7 +1122,7 @@ def createVirtualFrameROFF(myArgs):
 
 
 def _readIonosphereParams(myArgs):
-    """Return (wavelength, slpSpacing) from the first available RUNW HDF5."""
+    """Return (wavelength, slpSpacing, epsg) from the first available RUNW HDF5."""
     orbit = myArgs['orbit1']
     for frame in myArgs['frames']:
         frameDir = f'{orbit}_{frame}'
@@ -900,18 +1133,20 @@ def _readIonosphereParams(myArgs):
         try:
             runw = nisarhdf.nisarRUNWHDF()
             runw.openHDF(h5Files[0], frame=frame)
-            return float(runw.Wavelength), float(runw.SLCRangePixelSize)
+            return float(runw.Wavelength), float(runw.SLCRangePixelSize), int(runw.epsg)
         except Exception as e:
             u.mywarning(f'_readIonosphereParams: could not read {h5Files[0]}: {e}')
-    return None, None
+    return None, None, None
 
 
-def globalFillIonosphere(myArgs, sigmaAz=100.0, sigmaRng=30.0):
-    """Globally fill the assembled virtual-frame unfilled iono, re-partition back
-    into per-frame tiles (in per-frame dirs), and build a plain geometry VRT.
+def globalFillIonosphere(myArgs, sigmaAz=10.0, sigmaRng=30.0):
+    """Globally fill both the RUNW-grid (radians) and offset-grid (SLC pixels)
+    iono corrections, re-partition back into per-frame tiles, and build
+    plain geometry VRTs.  Avoids frame-boundary discontinuities caused by
+    independent per-frame fills.
 
-    Unless --retainIntermediateIono is set, removes the per-frame unfilled and
-    per-frame filled offset iono files, leaving only the globalFill products.
+    Also writes a phase-derived offset correction (RUNW-fill scaled by
+    λ/(4π·slp)) to per-frame debug/ dirs for quality evaluation.
     """
     from nisargrimpworkflow.estimateIonosphere import (fill_and_smooth_iono,
                                                        write_geotiff,
@@ -920,14 +1155,14 @@ def globalFillIonosphere(myArgs, sigmaAz=100.0, sigmaRng=30.0):
     virtualFrame = myArgs['virtualFrame']
     frameDir = f'{myArgs["outputDir"]}/{orbit}_{virtualFrame}'
 
-    # --- locate assembled unfilled iono VRT ---
-    unfilledVrts = glob.glob(f'{frameDir}/*.ionosphereCorrectionUnfilled.vrt')
+    # --- locate assembled sparse offset-grid iono VRT ---
+    unfilledVrts = glob.glob(f'{frameDir}/*.ionosphereCorrectionUnfilled.offset.vrt')
     if not unfilledVrts:
-        u.mywarning('globalFillIonosphere: no unfilled iono VRT found, skipping')
+        u.mywarning('globalFillIonosphere: no unfilled offset iono VRT found, skipping')
         return
     unfilledVrt = unfilledVrts[0]
 
-    # --- read consistent (bias-corrected) unfilled iono on full-swath RUNW grid ---
+    # --- read sparse offset-grid iono (SLC pixels, DC-corrected across frames) ---
     ds = gdal.Open(unfilledVrt)
     band = ds.GetRasterBand(1)
     nodata = band.GetNoDataValue()
@@ -945,27 +1180,299 @@ def globalFillIonosphere(myArgs, sigmaAz=100.0, sigmaRng=30.0):
         u.mywarning('globalFillIonosphere: no valid pixels, skipping')
         return
 
-    # --- global fill on full swath ---
-    print('globalFillIonosphere: running pyramid fill on full-swath unfilled iono...')
-    filled = fill_and_smooth_iono(arr.astype(np.float32), valid,
-                                  sigma=(sigmaAz, sigmaRng))
+    # --- projection fallback from RUNW HDF ---
+    wavelength, slpSpacing, epsg = _readIonosphereParams(myArgs)
+    if epsg is not None:
+        _sr = osr.SpatialReference()
+        _sr.ImportFromEPSG(epsg)
+        hdfProjWkt = _sr.ExportToWkt()
+    else:
+        hdfProjWkt = ''
+    projWkt = fullProj or hdfProjWkt
 
-    # Hold the globally-filled raster in a GDAL MEM dataset — no temp file needed.
+    # --- global fill on full-swath RUNW grid (radians) ---
+    memRunwDs = None
+    runwProjWkt = ''
+    perFrameRunwVrts = []
+    unfilledRunwVrts = glob.glob(f'{frameDir}/*.ionosphereCorrectionUnfilled.vrt')
+    if unfilledRunwVrts:
+        dsR = gdal.Open(unfilledRunwVrts[0])
+        bandR = dsR.GetRasterBand(1)
+        nodataR = bandR.GetNoDataValue()
+        arrR = bandR.ReadAsArray().astype(np.float64)
+        runwFullGt = dsR.GetGeoTransform()
+        runwFullProj = dsR.GetProjection()
+        dsR = None
+        validR = np.isfinite(arrR)
+        if nodataR is not None:
+            validR &= (arrR != nodataR)
+        arrR[~validR] = np.nan
+        runwProjWkt = runwFullProj or hdfProjWkt
+        if validR.any():
+            print('globalFillIonosphere: running pyramid fill on full-swath RUNW-grid iono...')
+            filledRunw = fill_and_smooth_iono(arrR.astype(np.float32), validR,
+                                              sigma=(sigmaAz, sigmaRng),
+                                              boundary_mode='nearest')
+            nrowsR, ncolsR = filledRunw.shape
+            memRunwDs = gdal.GetDriverByName('MEM').Create(
+                '', ncolsR, nrowsR, 1, gdal.GDT_Float32)
+            memRunwDs.SetGeoTransform(runwFullGt)
+            if runwProjWkt:
+                memRunwDs.SetProjection(runwProjWkt)
+            memRunwDs.GetRasterBand(1).WriteArray(filledRunw)
+            memRunwDs.GetRasterBand(1).SetNoDataValue(float('nan'))
+            for frame in myArgs['frames']:
+                unfilledFrameTifs = glob.glob(
+                    f'{orbit}_{frame}/*.ionosphereCorrectionUnfilled.tif')
+                if not unfilledFrameTifs:
+                    u.mywarning(
+                        f'globalFillIonosphere: no unfilled RUNW tif for {orbit}_{frame}')
+                    continue
+                refTif = unfilledFrameTifs[0]
+                refDs = gdal.Open(refTif)
+                fGt = refDs.GetGeoTransform()
+                fProj = refDs.GetProjection() or runwProjWkt
+                fNcols = refDs.RasterXSize
+                fNrows = refDs.RasterYSize
+                refDs = None
+                perFrameRunwTif = refTif.replace(
+                    '.ionosphereCorrectionUnfilled.tif',
+                    '.ionosphereCorrection.globalFill.tif')
+                perFrameRunwVrt = perFrameRunwTif.replace('.tif', '.vrt')
+                gdal.Warp(perFrameRunwTif, memRunwDs, options=gdal.WarpOptions(
+                    format='GTiff',
+                    outputBounds=(fGt[0],
+                                  fGt[3] + fNrows * fGt[5],
+                                  fGt[0] + fNcols * fGt[1],
+                                  fGt[3]),
+                    width=fNcols, height=fNrows,
+                    dstSRS=fProj,
+                    resampleAlg='bilinear',
+                    srcNodata=float('nan'), dstNodata=-2.0e9,
+                    creationOptions=['COMPRESS=LZW']))
+                _ds = gdal.Open(perFrameRunwTif, gdal.GA_Update)
+                if _ds is not None:
+                    _ds.GetRasterBand(1).SetNoDataValue(-2.0e9)
+                    _ds.FlushCache()
+                    _ds = None
+                write_output_vrt(perFrameRunwVrt, [perFrameRunwTif],
+                                 ['ionosphereCorrection'], fGt)
+                perFrameRunwVrts.append(perFrameRunwVrt)
+                print(f'globalFillIonosphere: wrote {perFrameRunwVrt}')
+            if perFrameRunwVrts:
+                runwVrtBase = os.path.basename(unfilledRunwVrts[0]).replace(
+                    '.ionosphereCorrectionUnfilled.vrt', '.ionosphereCorrection.vrt')
+                globalFillRunwVrt = f'{frameDir}/{runwVrtBase}'
+                run(['custom_buildvrtWithOffsets', '--overWrite',
+                     globalFillRunwVrt] + perFrameRunwVrts,
+                    stdout=myArgs.get('stdout', DEVNULL),
+                    stderr=myArgs.get('stderr', DEVNULL))
+                print(f'globalFillIonosphere: RUNW VRT → {globalFillRunwVrt}')
+    else:
+        u.mywarning(
+            'globalFillIonosphere: no unfilled RUNW iono VRT found, skipping phase fill')
+
+    # --- ice-free pre-fill / rock-anchored DC correction ---
+    if myArgs.get('sepIceRock'):
+        # Rock pixels (v≈0) give an absolute "actual vs simulated offset"
+        # estimate: offsets.geom - range.offsets.  Assemble these across all
+        # frames into full-swath fv_full/rock_mask_full (averaging where
+        # frames overlap), then anchor the otherwise-floating ice-derived
+        # `arr` to this absolute reference via a single virtual-frame-wide
+        # additive constant C, and seed fv_full into the remaining gaps.
+        _nfr, _nfc = arr.shape
+        _fv_sum = np.zeros((_nfr, _nfc), dtype=np.float64)
+        _fv_count = np.zeros((_nfr, _nfc), dtype=np.int32)
+        _n_with_mask = 0
+        for frame in myArgs['frames']:
+            _fdir = f'{orbit}_{frame}'
+            _mask_path = os.path.join(_fdir, 'offsetSims', 'offsets.geom.mask.vrt')
+            _geom_paths = (glob.glob(f'{_fdir}/offsetSims/offsets.geom.vrt') +
+                           glob.glob(f'{_fdir}/H5/offsetSims/offsets.geom.vrt'))
+            _roff_paths = (glob.glob(f'{_fdir}/range.offsets.vrt') +
+                           glob.glob(f'{_fdir}/H5/range.offsets.vrt'))
+
+            if not os.path.exists(_mask_path) or not _geom_paths or not _roff_paths:
+                u.mywarning(f'globalFillIonosphere: no mask/geom/roff for {_fdir}, skipping')
+                continue
+
+            _mds = gdal.Open(_mask_path)
+            _mask = _mds.GetRasterBand(1).ReadAsArray()
+            _fgt = _mds.GetGeoTransform()
+            _fnr, _fnc = _mds.RasterYSize, _mds.RasterXSize
+            _mds = None
+
+            _gds = gdal.Open(_geom_paths[0])
+            _geom_r = _gds.GetRasterBand(1).ReadAsArray().astype(np.float64)
+            _gnd = _gds.GetRasterBand(1).GetNoDataValue()
+            _gds = None
+
+            _rds = gdal.Open(_roff_paths[0])
+            _roff_r = _rds.GetRasterBand(1).ReadAsArray().astype(np.float64)
+            _rnd = _rds.GetRasterBand(1).GetNoDataValue()
+            _rds = None
+
+            # Rock pixels (value=1); erode 5×5 to pull back from ice/water edges
+            _rock = (_mask == 1)
+            _rock_eroded = binary_erosion(_rock, structure=np.ones((5, 5), bool))
+            _g_ok = (_geom_r != _gnd) if _gnd is not None else np.ones(_mask.shape, bool)
+            _r_ok = np.isfinite(_roff_r)
+            if _rnd is not None:
+                _r_ok &= (_roff_r != _rnd)
+            _fv = np.where(_rock_eroded & _g_ok & _r_ok,
+                           (_geom_r - _roff_r).astype(np.float32), np.nan)
+
+            # Map per-frame pixel coordinates to full-swath array
+            _r0 = round((_fgt[3] - fullGt[3]) / fullGt[5])
+            _c0 = round((_fgt[0] - fullGt[0]) / fullGt[1])
+            _r1, _c1 = _r0 + _fnr, _c0 + _fnc
+            _R0 = max(0, _r0); _R1 = min(_nfr, _r1)
+            _C0 = max(0, _c0); _C1 = min(_nfc, _c1)
+            if _R1 <= _R0 or _C1 <= _C0:
+                continue
+            _fr0, _fc0 = _R0 - _r0, _C0 - _c0
+            _fr1, _fc1 = _fr0 + _R1 - _R0, _fc0 + _C1 - _C0
+
+            _fv_slice = _fv[_fr0:_fr1, _fc0:_fc1]
+            _fv_ok = np.isfinite(_fv_slice)
+            _fv_sum[_R0:_R1, _C0:_C1][_fv_ok] += _fv_slice[_fv_ok]
+            _fv_count[_R0:_R1, _C0:_C1][_fv_ok] += 1
+            _n_with_mask += 1
+            print(f'globalFillIonosphere: sepIceRock found {int(_fv_ok.sum())} rock px in {_fdir}')
+
+        if _n_with_mask == 0:
+            print('\033[1;34mWARNING globalFillIonosphere: offsets.geom.mask.vrt not found '
+                  'for any frame — rock-anchored DC correction skipped\033[0m')
+        else:
+            rock_mask_full = _fv_count > 0
+            fv_full = np.where(rock_mask_full, _fv_sum / np.maximum(_fv_count, 1), np.nan)
+            if rock_mask_full.any():
+                print('globalFillIonosphere: sepIceRock preliminary full-swath fill '
+                      'for rock-anchored DC correction...')
+                sIce = fill_and_smooth_iono(arr.astype(np.float32), valid,
+                                            sigma=(sigmaAz, sigmaRng),
+                                            boundary_mode='nearest')
+                _resid = (sIce - fv_full)[rock_mask_full]
+                _resid = _resid[np.isfinite(_resid)]
+                if len(_resid) > 0:
+                    dcC = float(np.mean(_resid))
+                    _dc_m = f'{dcC * slpSpacing:+.3f} m' if slpSpacing else ''
+                    print(f'globalFillIonosphere: sepIceRock rock-anchored DC '
+                          f'correction C = {dcC:+.4f} SLC px {_dc_m} '
+                          f'(from {len(_resid):,} rock px)')
+                    arr -= dcC
+                    _thresh_px = (1.5 / slpSpacing) if slpSpacing else np.inf
+                    _apply = (np.isfinite(fv_full) & ~valid
+                              & (np.abs(fv_full) < _thresh_px))
+                    arr[_apply] = fv_full[_apply]
+                    valid |= _apply
+                    print(f'globalFillIonosphere: sepIceRock seeded '
+                          f'{int(_apply.sum()):,} rock px into gaps')
+                else:
+                    u.mywarning('globalFillIonosphere: sepIceRock found rock pixels '
+                                'but no finite residuals — DC correction skipped')
+            else:
+                print('\033[1;34mWARNING globalFillIonosphere: sepIceRock found no rock '
+                      'pixels — DC correction skipped\033[0m')
+    else:
+        # --- ice-free pre-fill: offsets.geom − range.offsets at non-ice pixels ---
+        _n_with_mask = 0
+        for frame in myArgs['frames']:
+            _fdir = f'{orbit}_{frame}'
+            _mask_path = os.path.join(_fdir, 'offsetSims', 'offsets.geom.mask.vrt')
+            _geom_paths = (glob.glob(f'{_fdir}/offsetSims/offsets.geom.vrt') +
+                           glob.glob(f'{_fdir}/H5/offsetSims/offsets.geom.vrt'))
+            _roff_paths = (glob.glob(f'{_fdir}/range.offsets.vrt') +
+                           glob.glob(f'{_fdir}/H5/range.offsets.vrt'))
+
+            if not os.path.exists(_mask_path) or not _geom_paths or not _roff_paths:
+                u.mywarning(f'globalFillIonosphere: no mask/geom/roff for {_fdir}, skipping')
+                continue
+
+            _mds = gdal.Open(_mask_path)
+            _mask = _mds.GetRasterBand(1).ReadAsArray()
+            _fgt = _mds.GetGeoTransform()
+            _fnr, _fnc = _mds.RasterYSize, _mds.RasterXSize
+            _mds = None
+
+            _gds = gdal.Open(_geom_paths[0])
+            _geom_r = _gds.GetRasterBand(1).ReadAsArray().astype(np.float64)
+            _gnd = _gds.GetRasterBand(1).GetNoDataValue()
+            _gds = None
+
+            _rds = gdal.Open(_roff_paths[0])
+            _roff_r = _rds.GetRasterBand(1).ReadAsArray().astype(np.float64)
+            _rnd = _rds.GetRasterBand(1).GetNoDataValue()
+            _rds = None
+
+            # Rock pixels (value=1); erode 5×5 to pull back from ice/water edges
+            _rock = (_mask == 1)
+            _rock_eroded = binary_erosion(_rock, structure=np.ones((5, 5), bool))
+            _g_ok = (_geom_r != _gnd) if _gnd is not None else np.ones(_mask.shape, bool)
+            _r_ok = np.isfinite(_roff_r)
+            if _rnd is not None:
+                _r_ok &= (_roff_r != _rnd)
+            _fv = np.where(_rock_eroded & _g_ok & _r_ok,
+                           (_geom_r - _roff_r).astype(np.float32), np.nan)
+
+            # Map per-frame pixel coordinates to full-swath array
+            _r0 = round((_fgt[3] - fullGt[3]) / fullGt[5])
+            _c0 = round((_fgt[0] - fullGt[0]) / fullGt[1])
+            _r1, _c1 = _r0 + _fnr, _c0 + _fnc
+            _nfr, _nfc = arr.shape
+            _R0 = max(0, _r0); _R1 = min(_nfr, _r1)
+            _C0 = max(0, _c0); _C1 = min(_nfc, _c1)
+            if _R1 <= _R0 or _C1 <= _C0:
+                continue
+            _fr0, _fc0 = _R0 - _r0, _C0 - _c0
+            _fr1, _fc1 = _fr0 + _R1 - _R0, _fc0 + _C1 - _C0
+
+            # DC alignment: arr ice values are zero-meaned per frame (iono_mean was
+            # subtracted in estimate_and_correct); _fv is the raw absolute iono.
+            # Align rock values to the same DC level as the surrounding ice pixels.
+            _fv_rock_vals = _fv[np.isfinite(_fv)]
+            _arr_ice_vals = arr[_R0:_R1, _C0:_C1][valid[_R0:_R1, _C0:_C1]]
+            if len(_fv_rock_vals) > 0 and len(_arr_ice_vals) > 0:
+                _dc = float(np.mean(_fv_rock_vals)) - float(np.mean(_arr_ice_vals))
+                _fv = np.where(np.isfinite(_fv), _fv - _dc, np.nan)
+                _dc_m = f'{_dc * slpSpacing:+.3f} m' if slpSpacing else ''
+                print(f'  DC corrected: {_dc:+.4f} SLC px {_dc_m}')
+            elif len(_fv_rock_vals) > 0:
+                # No ice pixels in this frame footprint — zero-centre as fallback
+                _fv = np.where(np.isfinite(_fv),
+                               _fv - float(np.mean(_fv_rock_vals)), np.nan)
+                print(f'  No ice in frame footprint — rock values zero-centred')
+
+            _thresh_px = (1.5 / slpSpacing) if slpSpacing else np.inf
+            _fv_slice = _fv[_fr0:_fr1, _fc0:_fc1]
+            _apply = (np.isfinite(_fv_slice)
+                      & ~valid[_R0:_R1, _C0:_C1]
+                      & (np.abs(_fv_slice) < _thresh_px))
+            arr[_R0:_R1, _C0:_C1][_apply] = _fv_slice[_apply]
+            valid[_R0:_R1, _C0:_C1] |= _apply
+            _n_with_mask += 1
+            print(f'globalFillIonosphere: ice-free pre-fill {_apply.sum()} px in {_fdir}')
+
+        if _n_with_mask == 0:
+            print('\033[1;34mWARNING globalFillIonosphere: offsets.geom.mask.vrt not found '
+                  'for any frame — ice-free pre-fill skipped\033[0m')
+
+    # --- global fill on full-swath offset grid (values already in SLC pixels) ---
+    print('globalFillIonosphere: running pyramid fill on full-swath offset-grid iono...')
+    filled = fill_and_smooth_iono(arr.astype(np.float32), valid,
+                                  sigma=(sigmaAz, sigmaRng),
+                                  boundary_mode='nearest')
+
+    # Store in a MEM dataset for per-frame cropping
     nrows, ncols = filled.shape
     memDs = gdal.GetDriverByName('MEM').Create('', ncols, nrows, 1, gdal.GDT_Float32)
     memDs.SetGeoTransform(fullGt)
-    memDs.SetProjection(fullProj)
+    if projWkt:
+        memDs.SetProjection(projWkt)
     memDs.GetRasterBand(1).WriteArray(filled)
     memDs.GetRasterBand(1).SetNoDataValue(float('nan'))
 
-    # --- wavelength and slpSpacing for radians → SLC pixels conversion ---
-    wavelength, slpSpacing = _readIonosphereParams(myArgs)
-    if wavelength is None or slpSpacing is None:
-        u.mywarning('globalFillIonosphere: could not read wavelength/slpSpacing, skipping')
-        return
-    scale = -wavelength / (4.0 * np.pi * slpSpacing)
-
-    # --- re-partition: warp to each frame's offset grid, write per-frame tiles ---
+    # --- re-partition: crop filled surface to each frame's offset grid ---
     perFrameOffsetVrts = []
     for frame in myArgs['frames']:
         frameRoffVrts = glob.glob(f'{orbit}_{frame}/range.offsets.vrt')
@@ -979,6 +1486,8 @@ def globalFillIonosphere(myArgs, sigmaAz=100.0, sigmaRng=30.0):
         roffNcols = roffDs.RasterXSize
         roffNrows = roffDs.RasterYSize
         roffDs = None
+        if not roffProj:
+            roffProj = projWkt
 
         # Derive output name from the per-frame ionosphereCorrection.offset.vrt
         existingOffVrts = glob.glob(f'{orbit}_{frame}/*.ionosphereCorrection.offset.vrt')
@@ -990,7 +1499,7 @@ def globalFillIonosphere(myArgs, sigmaAz=100.0, sigmaRng=30.0):
             '.ionosphereCorrection.globalFill.offset.tif')
         perFrameOffsetVrt = perFrameOffsetTif.replace('.tif', '.vrt')
 
-        # Warp filled iono (radians, full-swath RUNW grid) to frame's offset grid
+        # Crop filled iono (SLC pixels, full-swath offset grid) to frame's offset grid
         warpOpts = gdal.WarpOptions(
             format='GTiff',
             outputBounds=(roffGt[0],
@@ -1003,30 +1512,59 @@ def globalFillIonosphere(myArgs, sigmaAz=100.0, sigmaRng=30.0):
             srcNodata=float('nan'), dstNodata=-2.0e9,
             creationOptions=['COMPRESS=LZW'])
         gdal.Warp(perFrameOffsetTif, memDs, options=warpOpts)
-
-        # Apply radians → SLC pixels scale in-place
-        ds = gdal.Open(perFrameOffsetTif, gdal.GA_Update)
-        if ds is not None:
-            arr2 = ds.GetRasterBand(1).ReadAsArray()
-            mask2 = arr2 != -2.0e9
-            arr2[mask2] *= scale
-            ds.GetRasterBand(1).WriteArray(arr2)
-            ds.GetRasterBand(1).SetNoDataValue(-2.0e9)
-            ds.FlushCache()
-            ds = None
+        _ds = gdal.Open(perFrameOffsetTif, gdal.GA_Update)
+        if _ds is not None:
+            _ds.GetRasterBand(1).SetNoDataValue(-2.0e9)
+            _ds.FlushCache()
+            _ds = None
 
         write_output_vrt(perFrameOffsetVrt, [perFrameOffsetTif],
                          ['ionosphereCorrection'], roffGt)
         perFrameOffsetVrts.append(perFrameOffsetVrt)
         print(f'globalFillIonosphere: wrote {perFrameOffsetVrt}')
 
+        # --- recompute debug/range.offsets.corrected with the final,
+        # globally-filled (and, with --sepIceRock, rock-anchored) iono
+        # correction, replacing the per-frame value written by
+        # estimateIonosphere.py before global fill ran ---
+        if myArgs.get('debugIono'):
+            _slpDs = gdal.Open(frameRoffVrts[0])
+            _offsetSlp = _slpDs.GetRasterBand(1).ReadAsArray().astype(np.float64)
+            _slpNd = _slpDs.GetRasterBand(1).GetNoDataValue()
+            _slpDs = None
+
+            _ionoDs = gdal.Open(perFrameOffsetTif)
+            _ionoFinal = _ionoDs.GetRasterBand(1).ReadAsArray().astype(np.float64)
+            _ionoNd = _ionoDs.GetRasterBand(1).GetNoDataValue()
+            _ionoDs = None
+
+            _slpValid = np.isfinite(_offsetSlp)
+            if _slpNd is not None:
+                _slpValid &= (_offsetSlp != _slpNd)
+            _ionoValid = np.isfinite(_ionoFinal)
+            if _ionoNd is not None:
+                _ionoValid &= (_ionoFinal != _ionoNd)
+
+            _correctedFinal = np.where(_slpValid & _ionoValid,
+                                       (_offsetSlp + _ionoFinal).astype(np.float32),
+                                       -2.0e9).astype(np.float32)
+
+            _debugDir = f'{orbit}_{frame}/debug'
+            os.makedirs(_debugDir, exist_ok=True)
+            _corrTif = os.path.join(_debugDir, 'range.offsets.corrected.tif')
+            _corrVrt = os.path.join(_debugDir, 'range.offsets.corrected.vrt')
+            write_geotiff(_corrTif, _correctedFinal, roffGt, nodata=-2.0e9, proj=roffProj)
+            write_output_vrt(_corrVrt, [_corrTif], ['RangeOffsetsCorrected'], roffGt)
+            print(f'globalFillIonosphere: updated final-corrected offsets debug → {_corrVrt}')
+
     if not perFrameOffsetVrts:
         u.mywarning('globalFillIonosphere: no per-frame tiles written, skipping VRT assembly')
         return
 
     # --- build plain geometry VRT in virtual-frame dir (no --offsets: biases baked in) ---
+    _srcFrame = os.path.dirname(perFrameOffsetVrts[0]).split('_')[-1]
     virtualProduct = os.path.basename(perFrameOffsetVrts[0]).replace(
-        f'_{myArgs["frames"][0]}.', f'_{virtualFrame}.')
+        f'_{_srcFrame}.', f'_{virtualFrame}.')
     globalFillOffsetVrt = f'{frameDir}/{virtualProduct}'
     run(['custom_buildvrtWithOffsets', '--overWrite',
          globalFillOffsetVrt] + perFrameOffsetVrts,
@@ -1042,14 +1580,225 @@ def globalFillIonosphere(myArgs, sigmaAz=100.0, sigmaRng=30.0):
         ds = None
     print(f'globalFillIonosphere: virtual frame VRT → {globalFillOffsetVrt}')
 
+    # --- phase-derived offset correction from RUNW global fill → always written to debug/ ---
+    if memRunwDs is not None and wavelength and slpSpacing:
+        scale = wavelength / (4.0 * np.pi * slpSpacing)
+        phaseData = memRunwDs.GetRasterBand(1).ReadAsArray().astype(np.float32)
+        scaledData = (phaseData * scale).astype(np.float32)
+        nrR2, ncR2 = scaledData.shape
+        scaledDs = gdal.GetDriverByName('MEM').Create('', ncR2, nrR2, 1, gdal.GDT_Float32)
+        scaledDs.SetGeoTransform(memRunwDs.GetGeoTransform())
+        if runwProjWkt:
+            scaledDs.SetProjection(runwProjWkt)
+        scaledDs.GetRasterBand(1).WriteArray(scaledData)
+        scaledDs.GetRasterBand(1).SetNoDataValue(float('nan'))
+        phaseBasedOffsetVrts = []
+        for frame in myArgs['frames']:
+            frameRoffVrts = glob.glob(f'{orbit}_{frame}/range.offsets.vrt')
+            if not frameRoffVrts:
+                continue
+            roffDs = gdal.Open(frameRoffVrts[0])
+            rGt = roffDs.GetGeoTransform()
+            rProj = roffDs.GetProjection() or projWkt
+            rNcols = roffDs.RasterXSize
+            rNrows = roffDs.RasterYSize
+            roffDs = None
+            existingGfVrts = glob.glob(
+                f'{orbit}_{frame}/*.ionosphereCorrection.globalFill.offset.vrt')
+            if not existingGfVrts:
+                continue
+            pbDebugDir = f'{orbit}_{frame}/debug'
+            os.makedirs(pbDebugDir, exist_ok=True)
+            pbTif = os.path.join(pbDebugDir, os.path.basename(existingGfVrts[0]).replace(
+                '.ionosphereCorrection.globalFill.offset.vrt',
+                '.ionosphereCorrection.phaseBasedGlobalFill.offset.tif'))
+            pbVrt = pbTif.replace('.tif', '.vrt')
+            gdal.Warp(pbTif, scaledDs, options=gdal.WarpOptions(
+                format='GTiff',
+                outputBounds=(rGt[0], rGt[3] + rNrows * rGt[5],
+                              rGt[0] + rNcols * rGt[1], rGt[3]),
+                width=rNcols, height=rNrows,
+                dstSRS=rProj,
+                resampleAlg='bilinear',
+                srcNodata=float('nan'), dstNodata=-2.0e9,
+                creationOptions=['COMPRESS=LZW']))
+            _ds = gdal.Open(pbTif, gdal.GA_Update)
+            if _ds is not None:
+                _ds.GetRasterBand(1).SetNoDataValue(-2.0e9)
+                _ds.FlushCache()
+                _ds = None
+            write_output_vrt(pbVrt, [pbTif], ['ionosphereCorrection'], rGt)
+            phaseBasedOffsetVrts.append(pbVrt)
+            print(f'globalFillIonosphere: wrote phase-derived offset → {pbVrt}')
+        if phaseBasedOffsetVrts:
+            _srcFrame = os.path.dirname(phaseBasedOffsetVrts[0]).split('_')[-1]
+            pbVfBase = os.path.basename(phaseBasedOffsetVrts[0]).replace(
+                f'_{_srcFrame}.', f'_{virtualFrame}.')
+            vfDebugDir = f'{frameDir}/debug'
+            os.makedirs(vfDebugDir, exist_ok=True)
+            pbVfVrt = os.path.join(vfDebugDir, pbVfBase)
+            run(['custom_buildvrtWithOffsets', '--overWrite',
+                 pbVfVrt] + phaseBasedOffsetVrts,
+                stdout=myArgs.get('stdout', DEVNULL),
+                stderr=myArgs.get('stderr', DEVNULL))
+            print(f'globalFillIonosphere: phase-derived offset VRT → {pbVfVrt}')
+
+    # --- debug: move intermediates into per-frame debug/ subdirs, build debug VRTs ---
+    if myArgs.get('debugIono'):
+        debugUnfilledVrts = []
+        debugOffsetUnfilledVrts = []
+        debugAmbigVrts = []
+        debugCorrectedOffsetVrts = []
+        # Build a full-swath MEM dataset from arr (post-ice-free-prefill, pre-pyramid-fill)
+        # arr is still float64 with NaN for unfilled; fill_and_smooth_iono worked on a copy.
+        _preFillArr = arr.astype(np.float32)
+        nrPF, ncPF = _preFillArr.shape
+        _preFillDs = gdal.GetDriverByName('MEM').Create('', ncPF, nrPF, 1, gdal.GDT_Float32)
+        _preFillDs.SetGeoTransform(fullGt)
+        if projWkt:
+            _preFillDs.SetProjection(projWkt)
+        _preFillDs.GetRasterBand(1).WriteArray(_preFillArr)
+        _preFillDs.GetRasterBand(1).SetNoDataValue(float('nan'))
+        for frame in myArgs['frames']:
+            orbitFrame = f'{orbit}_{frame}'
+            debugDir = f'{orbitFrame}/debug'
+            os.makedirs(debugDir, exist_ok=True)
+            # RUNW-grid unfilled iono (radians) → debug/
+            for unfTif in glob.glob(f'{orbitFrame}/*.ionosphereCorrectionUnfilled.tif'):
+                destTif = os.path.join(debugDir, os.path.basename(unfTif))
+                os.rename(unfTif, destTif)
+                _ds = gdal.Open(destTif)
+                _gt = _ds.GetGeoTransform()
+                _ds = None
+                destVrt = destTif.replace('.tif', '.vrt')
+                write_output_vrt(destVrt, [destTif],
+                                 ['ionosphereCorrectionUnfilled'], _gt)
+                debugUnfilledVrts.append(destVrt)
+            for oldVrt in glob.glob(f'{orbitFrame}/*.ionosphereCorrectionUnfilled.vrt'):
+                os.remove(oldVrt)
+            # Offset-grid pre-global-fill iono (sparse + ice-free seeds) → debug/
+            # Warp from the full-swath pre-fill MEM dataset rather than moving the
+            # original unfilled tif, so the ice-free pre-fill seeds are included.
+            for unfOffTif in glob.glob(f'{orbitFrame}/*.ionosphereCorrectionUnfilled.offset.tif'):
+                destName = os.path.basename(unfOffTif).replace(
+                    '.ionosphereCorrectionUnfilled.offset.tif',
+                    '.ionosphereCorrection.preGlobalFill.offset.tif')
+                destTif = os.path.join(debugDir, destName)
+                _pfDs = gdal.Open(unfOffTif)
+                _pfGt = _pfDs.GetGeoTransform()
+                _pfProj = _pfDs.GetProjection() or projWkt
+                _pfNcols = _pfDs.RasterXSize
+                _pfNrows = _pfDs.RasterYSize
+                _pfDs = None
+                os.remove(unfOffTif)
+                gdal.Warp(destTif, _preFillDs, options=gdal.WarpOptions(
+                    format='GTiff',
+                    outputBounds=(_pfGt[0], _pfGt[3] + _pfNrows * _pfGt[5],
+                                  _pfGt[0] + _pfNcols * _pfGt[1], _pfGt[3]),
+                    width=_pfNcols, height=_pfNrows,
+                    dstSRS=_pfProj,
+                    resampleAlg='bilinear',
+                    srcNodata=float('nan'), dstNodata=-2.0e9,
+                    creationOptions=['COMPRESS=LZW']))
+                _ds = gdal.Open(destTif, gdal.GA_Update)
+                if _ds is not None:
+                    _ds.GetRasterBand(1).SetNoDataValue(-2.0e9)
+                    _ds.FlushCache()
+                    _ds = None
+                destVrt = destTif.replace('.tif', '.vrt')
+                write_output_vrt(destVrt, [destTif], ['ionosphereCorrection'], _pfGt)
+                debugOffsetUnfilledVrts.append(destVrt)
+            for oldVrt in glob.glob(f'{orbitFrame}/*.ionosphereCorrectionUnfilled.offset.vrt'):
+                os.remove(oldVrt)
+            # Per-frame filled iono offset (superseded by globalFill) → debug/
+            # Pattern intentionally excludes *.globalFill.offset.tif
+            for offTif in glob.glob(f'{orbitFrame}/*.ionosphereCorrection.offset.tif'):
+                destTif = os.path.join(debugDir, os.path.basename(offTif))
+                os.rename(offTif, destTif)
+                oldVrt = offTif.replace('.tif', '.vrt')
+                if os.path.exists(oldVrt):
+                    os.rename(oldVrt, os.path.join(debugDir, os.path.basename(oldVrt)))
+            # Per-frame filled RUNW iono (superseded by globalFill) → debug/
+            # Pattern intentionally excludes *.globalFill.tif
+            for ionoTif in glob.glob(f'{orbitFrame}/*.ionosphereCorrection.tif'):
+                destTif = os.path.join(debugDir, os.path.basename(ionoTif))
+                os.rename(ionoTif, destTif)
+                oldVrt = ionoTif.replace('.tif', '.vrt')
+                if os.path.exists(oldVrt):
+                    os.rename(oldVrt, os.path.join(debugDir, os.path.basename(oldVrt)))
+            # Ambiguity-corrected (pre-iono) phase VRTs written by estimateIonosphere
+            debugAmbigVrts += sorted(
+                glob.glob(f'{debugDir}/*.ambiguityCorrectedUnwrappedPhase.vrt'))
+            # Ionosphere-corrected range offsets written by estimateIonosphere
+            debugCorrectedOffsetVrts += sorted(
+                glob.glob(f'{debugDir}/range.offsets.corrected.vrt'))
+        # Remove broken assembled virtual-frame VRTs (per-frame TIFs have moved)
+        for pattern in ['*.ionosphereCorrectionUnfilled.vrt',
+                        '*.ionosphereCorrectionUnfilled.offset.vrt']:
+            for oldVrt in glob.glob(f'{frameDir}/{pattern}'):
+                os.remove(oldVrt)
+        # Virtual-frame debug dir
+        vfDebugDir = f'{frameDir}/debug'
+        os.makedirs(vfDebugDir, exist_ok=True)
+        # Assemble virtual-frame RUNW-grid unfilled iono VRT in debug/
+        if debugUnfilledVrts:
+            _srcFrame = os.path.dirname(debugUnfilledVrts[0]).split('_')[-1]
+            vfProduct = os.path.basename(debugUnfilledVrts[0]).replace(
+                f'_{_srcFrame}.', f'_{virtualFrame}.')
+            vfVrt = os.path.join(vfDebugDir, vfProduct)
+            run(['custom_buildvrtWithOffsets', '--offsets', '--overWrite',
+                 vfVrt] + debugUnfilledVrts,
+                stdout=myArgs.get('stdout', DEVNULL),
+                stderr=myArgs.get('stderr', DEVNULL))
+            print(f'globalFillIonosphere: debug unfilled VRT → {vfVrt}')
+        # Assemble virtual-frame pre-global-fill offset VRT in debug/
+        if debugOffsetUnfilledVrts:
+            _srcFrame = os.path.dirname(debugOffsetUnfilledVrts[0]).split('_')[-1]
+            vfProduct = os.path.basename(debugOffsetUnfilledVrts[0]).replace(
+                f'_{_srcFrame}.', f'_{virtualFrame}.')
+            vfVrt = os.path.join(vfDebugDir, vfProduct)
+            run(['custom_buildvrtWithOffsets', '--offsets', '--overWrite',
+                 vfVrt] + debugOffsetUnfilledVrts,
+                stdout=myArgs.get('stdout', DEVNULL),
+                stderr=myArgs.get('stderr', DEVNULL))
+            print(f'globalFillIonosphere: debug pre-global-fill offset VRT → {vfVrt}')
+        # Assemble virtual-frame ambiguity-corrected phase VRT in debug/
+        if debugAmbigVrts:
+            _srcFrame = os.path.dirname(debugAmbigVrts[0]).split('_')[-1]
+            vfProduct = os.path.basename(debugAmbigVrts[0]).replace(
+                f'_{_srcFrame}.', f'_{virtualFrame}.')
+            vfVrt = os.path.join(vfDebugDir, vfProduct)
+            run(['custom_buildvrtWithOffsets', '--offsets', '--overWrite',
+                 vfVrt] + debugAmbigVrts,
+                stdout=myArgs.get('stdout', DEVNULL),
+                stderr=myArgs.get('stderr', DEVNULL))
+            print(f'globalFillIonosphere: debug ambiguity-corrected phase VRT → {vfVrt}')
+        # Assemble virtual-frame ionosphere-corrected range offsets VRT in debug/
+        if debugCorrectedOffsetVrts:
+            vfVrt = os.path.join(vfDebugDir, 'range.offsets.corrected.vrt')
+            run(['custom_buildvrtWithOffsets', '--offsets', '--overWrite',
+                 vfVrt] + debugCorrectedOffsetVrts,
+                stdout=myArgs.get('stdout', DEVNULL),
+                stderr=myArgs.get('stderr', DEVNULL))
+            print(f'globalFillIonosphere: debug corrected offsets VRT → {vfVrt}')
+        _preFillDs = None
     # --- clean up superseded and intermediate files (unless --retainIntermediateIono) ---
-    if not myArgs.get('retainIntermediateIono'):
+    elif not myArgs.get('retainIntermediateIono'):
         for frame in myArgs['frames']:
             for pattern in ['*.ionosphereCorrectionUnfilled.tif',
                             '*.ionosphereCorrectionUnfilled.vrt',
-                            '*.ionosphereCorrection.offset.tif']:
+                            '*.ionosphereCorrectionUnfilled.offset.tif',
+                            '*.ionosphereCorrectionUnfilled.offset.vrt',
+                            '*.ionosphereCorrection.tif',
+                            '*.ionosphereCorrection.vrt',
+                            '*.ionosphereCorrection.offset.tif',
+                            '*.ionosphereCorrection.offset.vrt']:
                 for f in glob.glob(f'{orbit}_{frame}/{pattern}'):
                     os.remove(f)
+        for pattern in ['*.ionosphereCorrectionUnfilled.vrt',
+                        '*.ionosphereCorrectionUnfilled.offset.vrt']:
+            for f in glob.glob(f'{frameDir}/{pattern}'):
+                os.remove(f)
 
 
 def createVirtualFrameCorr(myArgs):
@@ -1068,8 +1817,9 @@ def createVirtualFrameCorr(myArgs):
     if not myFiles:
         u.mywarning('createVirtualFrameCorr: no .cor.vrt files found')
         return
+    _srcFrame = os.path.dirname(myFiles[0]).split('_')[-1]
     virtualProduct = os.path.basename(
-        myFiles[0].replace(f'_{myArgs["frames"][0]}.', f'_{virtualFrame}.'))
+        myFiles[0].replace(f'_{_srcFrame}.', f'_{virtualFrame}.'))
     vrtFile = f'{frameDir}/{virtualProduct}'
     failFile = f'{vrtFile}.fail'
     if os.path.exists(failFile):
@@ -1149,8 +1899,16 @@ def main():
         Set up a series of nisar products for
     '''
     myArgs = parseCommandLine()
-    for key in myArgs:
-        print(key, ':', myArgs[key])
+    if myArgs.get('clean') or myArgs.get('cleanDebug'):
+        # Skip the verbose param dump below -- with processTrack.py calling SetupNISAR
+        # once per orbit, that dump (mostly identical across orbits) buries the much
+        # shorter clean summary between orbits. Just identify which orbit this is.
+        print(f'\n=== Cleaning orbit {myArgs["orbit1"]} ===')
+        buckets = cleanFrames(myArgs,
+                              debugOnly=myArgs.get('cleanDebug')
+                              and not myArgs.get('clean'))
+        confirmAndRemove(buckets, myArgs.get('noPrompt'))
+        return
     # Read optional regionFile from ../project.yaml
     myArgs['regionFile'] = None
     projectYaml = '../project.yaml'
@@ -1160,6 +1918,38 @@ def main():
         myArgs['regionFile'] = _proj.get('regionFile', None)
         if myArgs['regionFile']:
             print(f'regionFile from {projectYaml}: {myArgs["regionFile"]}')
+    # Read optional verticalCorrection from the region file, passed through
+    # to ROFFtoGrimp/RUNWtoGrimp so simoffsets/siminsar apply it.
+    myArgs['verticalCorrection'] = None
+    if myArgs['regionFile']:
+        regionDef = sarfunc.defaultRegionDefs(None, regionFile=myArgs['regionFile'])
+        myArgs['verticalCorrection'] = regionDef.verticalCorrection()
+        if myArgs['verticalCorrection']:
+            print(f'verticalCorrection from {myArgs["regionFile"]}: '
+                  f'{myArgs["verticalCorrection"]}')
+    # Read optional variable smoothing-radius map params from ../project.yaml, passed
+    # through to ROFFtoGrimp/RUNWtoGrimp (see variableSmoothingArgs()). minTol/percentSpeed/
+    # maxTol must be given together; missing all three leaves the feature off (default).
+    smoothDefaults = {'minTol': None, 'percentSpeed': None, 'maxTol': None,
+                      'maxSmoothRadius': 50, 'smoothNIter': 3,
+                      'noVariableSmoothing': False}
+    myArgs.update(smoothDefaults)
+    if os.path.exists(projectYaml):
+        with open(projectYaml) as _fp:
+            _proj = yaml.safe_load(_fp) or {}
+        smoothFlags = [_proj.get('minTol') is not None,
+                      _proj.get('percentSpeed') is not None,
+                      _proj.get('maxTol') is not None]
+        if any(smoothFlags) and not all(smoothFlags):
+            u.myerror('SetupNISAR: project.yaml minTol/percentSpeed/maxTol must be '
+                      'given together')
+        for key, default in smoothDefaults.items():
+            myArgs[key] = _proj.get(key, default)
+        if myArgs['minTol'] is not None:
+            print(f'variable smoothing-radius map from {projectYaml}: minTol='
+                  f'{myArgs["minTol"]} percentSpeed={myArgs["percentSpeed"]} maxTol='
+                  f'{myArgs["maxTol"]} noVariableSmoothing='
+                  f'{myArgs["noVariableSmoothing"]}')
     # Get list of frames
     myArgs['frames'] = getFrames(myArgs)
     print('Frames: ', myArgs['frames'])
@@ -1256,7 +2046,9 @@ def main():
                     if myArgs.get('globalFillIono'):
                         t_step = time.time()
                         print('\tGlobal iono fill....', end=' ', flush=True)
-                        globalFillIonosphere(myArgs)
+                        globalFillIonosphere(myArgs,
+                                             sigmaAz=myArgs.get('sigmaAz') or 10.0,
+                                             sigmaRng=myArgs.get('sigmaRg') or 30.0)
                         print(f'{time.time()-t_step:.1f}s  (total {time.time()-t0:.1f}s)')
         # Create a virtual frame if .pow images exist
         if not myArgs['RUNWOnly'] and not myArgs.get('correlationOnly') \

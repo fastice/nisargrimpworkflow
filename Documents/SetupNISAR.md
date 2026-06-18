@@ -150,6 +150,9 @@ Run from the directory containing the `<orbit1>_<frame>` subdirectories.
 | `--phaseDerivedIonosphere` | off | Use NISAR-embedded ionosphere screen inside `RUNWtoGrimp` instead of running `estimateIonosphere` (see [Two ionosphere paths](#two-ionosphere-paths)) |
 | `--outputAll` | off | Pass `--outputAll` to `estimateIonosphere`: write all 5 intermediate bands instead of the standard 3 outputs |
 | `--phaseThresh RAD` | 14π | Pass to `estimateIonosphere`: mask `correctedUnwrappedPhase` where \|correctedPhase − simPhase\| ≥ RAD radians — screens regions of likely incorrect unwrapping |
+| `--noPhaseThreshPass` | off | Pass to `estimateIonosphere`: disable the second-pass iono re-estimation that runs by default after Pass 1 converges (when `--phaseThresh` is active). The second pass uses the phase-residual mask instead of the velocity mask for a more principled pixel selection. |
+| `--sigmaAz PX` | 10 | Azimuth Gaussian smoothing sigma for the ionosphere estimate, in RUNW pixels (passed to `estimateIonosphere --sigma-az`) |
+| `--sigmaRg PX` | 30 | Range Gaussian smoothing sigma for the ionosphere estimate, in RUNW pixels (passed to `estimateIonosphere --sigma-rg`) |
 | `--correlationOnly` | off | Extract coherence and geodat files only — skips ROFF conversion, ionosphere estimation, and virtual-frame assembly |
 | `--verbose` | off | Print all subprocess output to terminal (default: suppressed) |
 
@@ -185,6 +188,16 @@ If found and it contains a `regionFile` key, that YAML path is forwarded to
 [estimateIonosphere](estimateIonosphere.md) so they use the correct
 region-specific DEM, velocity map, and ice mask without requiring per-frame
 `--regionFile` flags.
+
+`project.yaml` can also configure the variable smoothing-radius map (an additional
+smoothing pass layered on top of the existing fixed `-sr`/`-sa` offset smoothing and phase
+interpolation): `minTol`, `percentSpeed`, `maxTol` (must be given together to enable it;
+omitted by default), `maxSmoothRadius` (default 50), `smoothNIter` (default 3), and
+`noVariableSmoothing` (default false, forces it off even if the tolerance keys are set).
+`SetupNISAR` forwards these to both `ROFFtoGrimp` and `RUNWtoGrimp` as the matching
+`--minTol`/`--percentSpeed`/`--maxTol`/`--maxSmoothRadius`/`--smoothNIter`/
+`--noVariableSmoothing` flags. See `workflow_overview.md`'s `project.yaml` reference for the
+full key list.
 
 ---
 

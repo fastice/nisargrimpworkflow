@@ -2,6 +2,14 @@
 
 Converts NISAR Level-2 HDF5 products into GrIMP binary flat-file format for ingestion by the velocity mosaic pipeline. See the [packages CLAUDE.md](../CLAUDE.md) for the full pipeline context.
 
+## Active project directory
+
+Current NISAR Greenland development lives under:
+```
+/Volumes/insar1/ian/NISAR/realNISAR/newGreenlandProject/
+```
+This directory contains `project.yaml`, the track subdirectories, and a `templates/` directory with `tie_plan_header` and `vel_thumb_plan` templates. When searching for `project.yaml` or track data, look here first.
+
 ## Programs
 
 Scripts in this package:
@@ -12,6 +20,8 @@ Scripts in this package:
 | `RUNWtoGrimp` | `RUNWtoGrimp.py:main()` | RUNW HDF5 → GrIMP phase products |
 | `SetupNISAR` | `SetupNISAR.py:main()` | Orchestrate per-frame conversion + virtual-frame assembly |
 | `FileNISARProducts` | `FileNISARProducts.py:main()` | Organise raw HDF5 downloads into `track-{N}/source/` tree |
+| `processTrack` | `processTrack.py:main()` | Run `SetupNISAR` for every orbit in a single track directory |
+| `setupNISARTracks` | `setupNISARTracks.py:main()` | Initialise track dirs and refresh tie points across all tracks |
 
 ---
 

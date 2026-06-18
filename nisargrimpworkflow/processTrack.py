@@ -22,10 +22,25 @@ def parseArgs():
                         help='Overwrite if phase products already exist')
     parser.add_argument('--correlationOnly', action='store_true',
                         help='Process correlation products only (no phase/offsets)')
+    parser.add_argument('--debugIono', action='store_true',
+                        help='Pass --debugIono to SetupNISAR')
+    parser.add_argument('--sepIceRock', action='store_true',
+                        help='Pass --sepIceRock to SetupNISAR')
+    parser.add_argument('--clean', action='store_true',
+                        help='Pass --clean to SetupNISAR: remove computed output files '
+                        '(everything --overWrite would replace) for every orbit found '
+                        'in track, then exit without processing')
+    parser.add_argument('--cleanDebug', action='store_true',
+                        help='Pass --cleanDebug to SetupNISAR: empty the contents of '
+                        'all debug/ directories (leaving the empty directory), then exit')
+    parser.add_argument('-noPrompt', '--noPrompt', action='store_true',
+                        help='Pass --noPrompt to SetupNISAR: skip the confirmation '
+                        'prompt for --clean/--cleanDebug')
     args = parser.parse_args()
     #
     return args.track[0], args.overWrite, args.overWritePhase, args.RUNWOnly, \
-        args.correlationOnly
+        args.correlationOnly, args.debugIono, args.sepIceRock, args.clean, \
+        args.cleanDebug, args.noPrompt
 
 
 def main():
@@ -39,7 +54,8 @@ def main():
 
     '''
     # Get args
-    track, overWrite, overWritePhase, RUNWOnly, correlationOnly = parseArgs()
+    track, overWrite, overWritePhase, RUNWOnly, correlationOnly, debugIono, \
+        sepIceRock, clean, cleanDebug, noPrompt = parseArgs()
     orbitDirs =  glob.glob(f'{track}/*_*')
     print(orbitDirs)
     orbits = sorted(list(set([x.split('/')[-1].split('_')[0] for x in orbitDirs])))
@@ -57,8 +73,19 @@ def main():
             command += ['--overWritePhase']
         if correlationOnly:
             command += ['--correlationOnly']
-        #command += ['--verbose']                        
+        if debugIono:
+            command += ['--debugIono']
+        if sepIceRock:
+            command += ['--sepIceRock']
+        if clean:
+            command += ['--clean']
+        if cleanDebug:
+            command += ['--cleanDebug']
+        if noPrompt:
+            command += ['--noPrompt']
+        #command += ['--verbose']
         print(command)
         subprocess.run(command, cwd=track)
 
-main()
+if __name__ == '__main__':
+    main()
