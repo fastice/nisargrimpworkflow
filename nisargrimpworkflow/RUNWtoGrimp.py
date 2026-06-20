@@ -159,16 +159,16 @@ def simPhase(geodat, params, dT, outputDir='.', ompThreads=4):
                                           regionFile=params.get('regionFile'))
     #
     output = f'{outputDir}/phaseSim'
-    # run command
-    args = f"-ompThreads {ompThreads} -velocity -dT {dT} " \
-        f"{regionDef.dem()} {regionDef.velMap()}" \
-        f" {outputDir}/{geodat} {output}"
+    # run command. siminsar requires its last 4 tokens to be demFile/displacementFile/
+    # sceneFile/outputFile -- all optional flags must come before them, never after.
+    args = f"-ompThreads {ompThreads} -velocity -dT {dT}"
     if params.get('verticalCorrection') is not None:
         args += f" -verticalCorrection {params['verticalCorrection']}"
     if params.get('minTol') is not None and not params.get('noVariableSmoothing'):
         args += f" -minTol {params['minTol']} -percentSpeed {params['percentSpeed']} " \
             f"-maxTol {params['maxTol']} -maxSmoothRadius {params['maxSmoothRadius']} " \
             f"-smoothNIter {params['smoothNIter']}"
+    args += f" {regionDef.dem()} {regionDef.velMap()} {outputDir}/{geodat} {output}"
     #
     command = 'siminsar'
     u.callMyProg(command, myArgs=args.split(), screen=True)

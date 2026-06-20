@@ -49,6 +49,7 @@ import argparse
 import itertools
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -594,8 +595,9 @@ def run_vel_sim(runw, region, simDir='.', overwrite=False, verticalCorrection=No
         return
     os.makedirs(simDir, exist_ok=True)
     dT = runw.dT
-    cmd = ['siminsar', '-dT', str(dT), '-velOnly', '-velocity',
-           region.dem(), region.velMap(), geodat, velSimPath]
+    # siminsar requires its last 4 tokens to be demFile/displacementFile/sceneFile/
+    # outputFile -- all optional flags must come before them, never after.
+    cmd = ['siminsar', '-dT', str(dT), '-velOnly', '-velocity']
     if verticalCorrection is not None:
         cmd += ['-verticalCorrection', verticalCorrection]
     if smoothParams is not None:
@@ -604,6 +606,7 @@ def run_vel_sim(runw, region, simDir='.', overwrite=False, verticalCorrection=No
                '-maxTol', str(smoothParams['maxTol']),
                '-maxSmoothRadius', str(smoothParams['maxSmoothRadius']),
                '-smoothNIter', str(smoothParams['smoothNIter'])]
+    cmd += [region.dem(), region.velMap(), geodat, velSimPath]
     with _Spinner('Creating velSim'):
         subprocess.run(cmd, check=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -884,8 +887,19 @@ def main():
                       '-nIterations', str(args.smoothNIter), '-minValue', '-2.0e9']
             print(f"  {' '.join(command)}")
             subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
-            os.remove(interpTif)
-            os.remove(interpVrt)
+            if args.debugIono:
+                debugDir = os.path.join(os.path.dirname(os.path.abspath(phase_tif)), 'debug')
+                os.makedirs(debugDir, exist_ok=True)
+                unsmoothedTif = os.path.join(
+                    debugDir, os.path.basename(phase_tif).replace('.tif', '.unsmoothed.tif'))
+                unsmoothedVrt = unsmoothedTif.replace('.tif', '.vrt')
+                shutil.move(interpTif, unsmoothedTif)
+                write_output_vrt(unsmoothedVrt, [unsmoothedTif], ['Phase'], gt)
+                os.remove(interpVrt)
+                print(f"  Saved unsmoothed copy (--debugIono) -> {unsmoothedVrt}")
+            else:
+                os.remove(interpTif)
+                os.remove(interpVrt)
         else:
             os.replace(interpTif, phase_tif)
             # Don't just rename interpVrt -> phase_vrt: its embedded

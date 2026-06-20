@@ -669,6 +669,8 @@ def processFrameROFF(frame, myArgs):
         command += variableSmoothingArgs(myArgs)
         if myArgs['noMask'] is True:
             command += ['--noMask']
+        if myArgs.get('debugIono'):
+            command += ['--debugIono']
         if myArgs['verbose'] is True:
             command += ['--verbose'] #+['--mergeOnly']
         # Call command
@@ -965,6 +967,36 @@ def createVirtualFrameRUNW(myArgs):
         print(f'Building {maskVelVrt}')
         run(['custom_buildvrtWithOffsets', '--overWrite', maskVelVrt] + maskVelFiles)
 
+    # --debugIono: mosaic the per-frame unsmoothed-phase comparison copies (written by
+    # estimateIonosphere.py's variable-smoothing step) and the velSim.smr radius map
+    # itself, so smoothed vs unsmoothed phase can be compared at the virtual-frame level.
+    if myArgs.get('debugIono'):
+        debugFrameDir = f'{frameDir}/debug'
+        os.makedirs(debugFrameDir, exist_ok=True)
+        unsmoothedPhaseFiles = [
+            f for frame in myArgs['frames']
+            for f in glob.glob(f'{orbit}_{frame}/debug/*.correctedUnwrappedPhase.unsmoothed.vrt')]
+        if unsmoothedPhaseFiles:
+            unsmoothedPhaseVrt = f'{debugFrameDir}/correctedUnwrappedPhase.unsmoothed.vrt'
+            # Same --offsets/--referencePhase/--mask as the real correctedUnwrappedPhase
+            # merge above -- without them the per-frame DC/ambiguity bias is never
+            # reconciled, so adjacent frames show seams that have nothing to do with
+            # smoothing and would make the comparison misleading.
+            command = ['custom_buildvrtWithOffsets', '--offsets']
+            if os.path.exists(velSimVrt):
+                command += ['--referencePhase', velSimVrt]
+            if os.path.exists(maskVelVrt):
+                command += ['--mask', maskVelVrt]
+            command += ['--overWrite', unsmoothedPhaseVrt] + unsmoothedPhaseFiles
+            print(f'Building {unsmoothedPhaseVrt}')
+            run(command)
+        radiusFiles = [f for frame in myArgs['frames']
+                      for f in glob.glob(f'{orbit}_{frame}/simPhase/velSim.smr.vrt')]
+        if radiusFiles:
+            radiusVrt = f'{debugFrameDir}/velSim.smr.vrt'
+            print(f'Building {radiusVrt}')
+            run(['custom_buildvrtWithOffsets', '--overWrite', radiusVrt] + radiusFiles)
+
     # (glob suffix, use --offsets, label, save as ionosphereRangeOffsetCorrection)
     products = [
         ('*.correctedUnwrappedPhase.vrt',    True,  'correctedUnwrappedPhase',    False),
@@ -1072,6 +1104,34 @@ def createVirtualFrameROFF(myArgs):
              "range.offsets.vrt"]
     #
     virtualVRTs = {}
+    #
+    # --debugIono: mosaic the per-frame unsmoothed-offsets comparison copies (written by
+    # ROFFtoGrimp.py's variable-smoothing step) and the offsets.velocity.smr radius map
+    # itself, so smoothed vs unsmoothed offsets can be compared at the virtual-frame level.
+    if myArgs.get('debugIono'):
+        debugFrameDir = f'{frameDir}/debug'
+        os.makedirs(debugFrameDir, exist_ok=True)
+        # Unsmoothed copies are genuine offset values, so use --offsets (cross-frame
+        # radiometric continuity correction) the same way the real range/azimuth.offsets
+        # do. The radius map is a per-pixel pixel-count, not a continuous physical
+        # quantity -- --offsets's continuity correction would corrupt it, so omit it.
+        debugFiles = [
+            ('range.offsets.unsmoothed.vrt', 'debug/range.offsets.unsmoothed.vrt', True),
+            ('azimuth.offsets.unsmoothed.vrt', 'debug/azimuth.offsets.unsmoothed.vrt', True),
+            ('offsets.velocity.smr.vrt', 'offsetSims/offsets.velocity.smr.tif', False),
+        ]
+        for outName, globPattern, useOffsets in debugFiles:
+            myDebugFiles = [f for frame in myArgs['frames']
+                            for f in glob.glob(f'{orbit}_{frame}/{globPattern}')]
+            if not myDebugFiles:
+                continue
+            debugVrt = f'{debugFrameDir}/{outName}'
+            command = ['custom_buildvrtWithOffsets', '--overWrite']
+            if useOffsets:
+                command.append('--offsets')
+            command.append(debugVrt)
+            print(f'Building ROFF debug {debugVrt}')
+            run(command + myDebugFiles)
     #
     for myFileType in files:
         # Find files

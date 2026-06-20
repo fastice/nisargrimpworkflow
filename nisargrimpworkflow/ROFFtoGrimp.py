@@ -7,6 +7,7 @@ Created on Thu Sep 12 10:34:37 2024
 """
 import argparse
 import os
+import shutil
 import utilities as u
 from utilities import geodatrxa
 import nisarhdf
@@ -136,6 +137,10 @@ def parseArgs():
     parser.add_argument('--noVariableSmoothing', action='store_true', default=False,
                         help='Disable the variable smoothing-radius map even if '
                         '--minTol/--percentSpeed/--maxTol (or project.yaml) supply values')
+    parser.add_argument('--debugIono', action='store_true', default=False,
+                        help='Save an unsmoothed copy of range.offsets/azimuth.offsets to '
+                        'debug/ before the variable smoothing-radius map is applied, so '
+                        'smoothed vs unsmoothed can be compared')
 
     choices = [os.path.splitext(f)[0]
                for f in os.listdir(
@@ -174,7 +179,7 @@ def parseArgs():
                   'islandThresh', 'noMask', 'DEM', 'byteOrder', 'regionFile',
                   'mergeOnly', 'ompThreads', 'verticalCorrection',
                   'minTol', 'percentSpeed', 'maxTol', 'maxSmoothRadius',
-                  'smoothNIter', 'noVariableSmoothing']:
+                  'smoothNIter', 'noVariableSmoothing', 'debugIono']:
         params[param] = getattr(args, param)
     # Assemble cull params
     params['cullParams'] = {}
@@ -891,30 +896,33 @@ def mergeOffsets(outputDir, baseName='NISARoffsets', layers=[1, 2, 3],
         # Use grimp noData value
         for x in [rgMean, azMean, rgSigmaMean, azSigmaMean]:
             x[~validMean] = noData
-    # Save data. range.offsets/azimuth.offsets are written to a .slow-suffixed file and
-    # range.offsets/azimuth.offsets is left as a symlink to it, so a future process can
-    # merge in offsets from a separate ("fast") run and write the merged result directly
-    # to range.offsets/azimuth.offsets (replacing the symlink with a real file) without
-    # disturbing range.offsets.vrt or anything downstream, which only ever reference
-    # range.offsets/azimuth.offsets by name and follow the symlink transparently. The
-    # sigma sidecars (.sr/.sa) are written directly, unchanged.
+    # Save data. range.offsets/azimuth.offsets (and their .sr/.sa sigma sidecars, named
+    # in parallel) are written to a .slow-suffixed file, with the plain name left as a
+    # symlink to it, so a future process can merge in offsets from a separate ("fast")
+    # run and write the merged result directly to the plain name (replacing the symlink
+    # with a real file) without disturbing range.offsets.vrt or anything downstream,
+    # which only ever reference these files by name and follow the symlink transparently.
     dataType = {'LSB': 'f4', 'MSB': '>f4'}[byteOrder]
-    for filename, var in zip(['range.offsets', 'azimuth.offsets'], [rgMean, azMean]):
+    for filename, var in zip(
+            ['range.offsets', 'azimuth.offsets', 'range.offsets.sr', 'azimuth.offsets.sa'],
+            [rgMean, azMean, rgSigmaMean, azSigmaMean]):
         slowFile = f'{outputDir}/{filename}.slow'
         u.writeImage(slowFile, var, dataType)
         symlink_file(slowFile, f'{outputDir}/{filename}', relative=True, overwrite=True)
-    for filename, var in zip(['range.offsets.sr', 'azimuth.offsets.sa'],
-                             [rgSigmaMean, azSigmaMean]):
-        u.writeImage(f'{outputDir}/{filename}', var, dataType)
 
 
-def applyVariableSmoothing(outputDir, params, nr, na, simDir='offsetSims',
-                           simName='offsets', stderr=DEVNULL, stdout=DEVNULL):
+def applyVariableSmoothing(outputDir, params, nr, na, geoTransform, simDir='offsetSims',
+                           simName='offsets', stderr=DEVNULL, stdout=DEVNULL,
+                           debugIono=False):
     '''
     Apply the variable smoothing-radius map (.smr.tif, produced alongside
     {simName}.velocity by simoffsets when --minTol/--percentSpeed/--maxTol are set) to the
     final merged range.offsets/azimuth.offsets, in place. This is an additional smoothing
     pass layered on top of cullst's fixed -sr/-sa smoothing, which is left untouched.
+
+    debugIono : bool, optional
+        If True, save an unsmoothed copy of range.offsets/azimuth.offsets (as both the
+        raw binary and a matching .vrt) to debug/ before smoothing, for comparison.
 
     Parameters
     ----------
@@ -925,6 +933,11 @@ def applyVariableSmoothing(outputDir, params, nr, na, simDir='offsetSims',
     nr, na : int
         Range/azimuth size of range.offsets/azimuth.offsets (myROFF.OffsetRangeSize/
         OffsetAzimuthSize).
+    geoTransform : list
+        Geotransform for the debug VRT (myROFF.getGeoTransform(grimp=True, tiff=False)) --
+        matches what writeVRTs() stamps on the real range.offsets.vrt/azimuth.offsets.vrt,
+        so the debug copy lines up at the virtual-frame level instead of getting placed at
+        writeInterpVrt()'s dummy pixel-index default.
     simDir, simName : str, optional
         Where simoffsets wrote {simName}.velocity.smr.tif. Defaults match main()'s call to
         simulateOffsets().
@@ -942,6 +955,7 @@ def applyVariableSmoothing(outputDir, params, nr, na, simDir='offsetSims',
     slpR, slpA = geo.singleLookResolution()
     pixRatio = slpA / slpR
     byteOrderFlag = {'MSB': '', 'LSB': '-LSB'}[params['byteOrder']]
+    bandNames = {'range.offsets': 'RangeOffsets', 'azimuth.offsets': 'AzimuthOffsets'}
     for filename in ['range.offsets', 'azimuth.offsets']:
         inFile = f'{outputDir}/{filename}'
         # inFile is a symlink to {filename}.slow (mergeOffsets() writes the merged data
@@ -949,6 +963,16 @@ def applyVariableSmoothing(outputDir, params, nr, na, simDir='offsetSims',
         # points to, rather than os.replace() clobbering the symlink itself with a plain
         # file and silently breaking the .slow indirection.
         realInFile = os.path.realpath(inFile)
+        if debugIono:
+            debugDir = f'{outputDir}/debug'
+            os.makedirs(debugDir, exist_ok=True)
+            unsmoothedFile = f'{debugDir}/{filename}.unsmoothed'
+            unsmoothedVrt = f'{unsmoothedFile}.vrt'
+            shutil.copy2(realInFile, unsmoothedFile)
+            writeInterpVrt(unsmoothedVrt, [os.path.basename(unsmoothedFile)],
+                           [bandNames[filename]], nr, na, byteOrder=params['byteOrder'],
+                           geoTransform=geoTransform)
+            print(f'  Saved unsmoothed copy (--debugIono) -> {unsmoothedVrt}')
         tmpFile = f'{realInFile}.vsmooth'
         command = f'filterfloat -nr {nr} -na {na} {byteOrderFlag} ' \
             f'-radiusMap {radiusMap} -pixRatio {pixRatio} ' \
@@ -1157,8 +1181,10 @@ def main():
     if params.get('minTol') is not None and not params.get('noVariableSmoothing'):
         applyVariableSmoothing(params["outputDir"], params,
                                myROFF.OffsetRangeSize, myROFF.OffsetAzimuthSize,
+                               myROFF.getGeoTransform(grimp=True, tiff=False),
                                simDir='offsetSims', simName='offsets',
-                               stderr=params['stderr'], stdout=params['stdout'])
+                               stderr=params['stderr'], stdout=params['stdout'],
+                               debugIono=params.get('debugIono', False))
     #
     writeVRTs(myROFF, params["outputDir"], params)
     #
