@@ -22,6 +22,8 @@ Scripts in this package:
 | `FileNISARProducts` | `FileNISARProducts.py:main()` | Organise raw HDF5 downloads into `track-{N}/source/` tree |
 | `processTrack` | `processTrack.py:main()` | Run `SetupNISAR` for every orbit in a single track directory |
 | `setupNISARTracks` | `setupNISARTracks.py:main()` | Initialise track dirs and refresh tie points across all tracks |
+| `buildFrameGpkg` | `buildFrameGpkg.py:main()` | Per-cycle QC GeoPackages of virtual frames (see [doc](Documents/buildFrameGpkg.md)) |
+| `buildFrameLayers` | `buildFrameLayers.py:main()` | QGIS `.qlr` layer tree for `buildFrameGpkg`'s output (see [doc](Documents/buildFrameLayers.md)) |
 
 ---
 
@@ -238,5 +240,34 @@ track-64/
 **`parseFileName(product)`** — splits the NISAR filename on `_` and maps fields by position. Two layouts:
 - RSLC (13 fields): `NISAR_L1_PR_RSLC_{cycle}_{track}_{direction}_{frame}_{bw}_{pol}_{mode}_{date1Start}_{date1End}`
 - All others (15 fields): `NISAR_L1_PR_{type}_{cycle}_{track}_{direction}_{frame}_004_{bw}_{pol}_{date1Start}_{date1End}_{date2Start}_{date2End}`
+
+---
+
+## buildFrameGpkg / buildFrameLayers
+
+A read-only QC/inventory pair, independent of the conversion pipeline above —
+they never write into `track-N/`. Full detail in
+[buildFrameGpkg.md](Documents/buildFrameGpkg.md) and
+[buildFrameLayers.md](Documents/buildFrameLayers.md); summary:
+
+1. **`buildFrameGpkg`** walks `track-N/*_0000/` virtual frames under
+   `--projectDir` (default `.`) and writes one GeoPackage per cycle
+   (`<outputDir>/cycle<NN>.gpkg`, layers `ascending`/`descending`), pulling
+   baseline/rBaseline/azimuth sigma + tiepoint counts, frame list, and
+   footprint geometry from the sidecar files `SetupNISAR`/tie-point
+   processing already produced. Cycle/direction come from `ImageName` via
+   the same `parseFileName` used by `FileNISARProducts` above. Any frame
+   missing a required input is skipped with a printed reason, not silently
+   patched over.
+2. **`buildFrameLayers`** reads that GeoPackage directory and writes a QGIS
+   `.qlr` with three groups: `Frames` (sigma field switchable via a QGIS
+   project variable) and `rBaseline` (fixed 10-class `sigmaRBaseline`
+   coloring), both organized `ascending`/`descending` → `Cycle N`; and a flat
+   `sigmaRBaseline > <thresh>` group (`--offsetsSigmaThresh`, default `0.5`)
+   with just `ascending`/`descending` — no per-cycle split — built from an
+   OGR VRT Union Layer across all cycles' GeoPackages plus a subset filter.
+
+Both are general — they work on any directory laid out as `track-N/*_0000/`,
+not just one specific project.
 
 `track`, `frame`, `cycle` returned as `str(int(...))` (leading zeros stripped); date fields as `datetime` objects.

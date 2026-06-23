@@ -944,12 +944,14 @@ def applyVariableSmoothing(outputDir, params, nr, na, geoTransform, simDir='offs
 
     Returns
     -------
-    None.
+    bool
+        True if the smoothing pass actually ran (radius map was found),
+        False if it was skipped.
     '''
     radiusMap = f'{outputDir}/{simDir}/{simName}.velocity.smr.tif'
     if not os.path.exists(radiusMap):
         print(f'WARNING: variable smoothing requested but {radiusMap} not found; skipping')
-        return
+        return False
     print('Applying variable smoothing-radius map...')
     geo = geodatrxa(file=params['geo1'], echo=False)
     slpR, slpA = geo.singleLookResolution()
@@ -981,6 +983,7 @@ def applyVariableSmoothing(outputDir, params, nr, na, geoTransform, simDir='offs
         print(command)
         call(command, shell=True, stderr=stderr, stdout=stdout)
         os.replace(tmpFile, realInFile)
+    return True
 
 
 def _epsgFromProjectYaml(projectYaml='../project.yaml'):
@@ -1031,7 +1034,8 @@ def resolveRegion(myROFF, params):
     sys.exit()
 
 
-def writeVRTs(myROFF, ROFFPath, params):
+def writeVRTs(myROFF, ROFFPath, params, interpApplied=False,
+             smoothingApplied=False):
     '''
     Write the VRT's for final product
 
@@ -1043,6 +1047,15 @@ def writeVRTs(myROFF, ROFFPath, params):
         Path to ROFF.
     params : dict
         Dictionary of params.
+    interpApplied : bool, optional
+        True if cullst+interpOffsets (intfloat) actually ran for this frame.
+        Stamps intfloat_* metadata keys when True, so their presence on
+        range.offsets.vrt/azimuth.offsets.vrt is unambiguous proof of
+        execution rather than just configured intent.
+    smoothingApplied : bool, optional
+        True if applyVariableSmoothing (filterfloat) actually ran (it can
+        silently skip if the .smr.tif radius map is missing even when
+        configured to run). Stamps filterfloat_* metadata keys when True.
 
     Returns
     -------
@@ -1066,6 +1079,18 @@ def writeVRTs(myROFF, ROFFPath, params):
     metaData['sigmaRange'] = 0.0
     metaData['geo1'] = os.path.basename(metaData['geo1'])
     metaData['geo2'] = os.path.basename(metaData['geo2'])
+    # Explicit, execution-only provenance tags (mirrors the intfloat_*/
+    # filterfloat_* convention RUNWtoGrimp/estimateIonosphere already stamp
+    # on correctedUnwrappedPhase.tif) -- presence of these keys means the
+    # step actually ran, not just that it was configured to.
+    if interpApplied:
+        metaData['intfloat_thresh'] = params['interpThresh']
+        metaData['intfloat_islandThresh'] = params['islandThresh']
+        metaData['intfloat_interpType'] = 'wdist'
+    if smoothingApplied:
+        metaData['filterfloat_radiusMap'] = 'offsetSims/offsets.velocity.smr.tif'
+        metaData['filterfloat_nIterations'] = params['smoothNIter']
+        metaData['filterfloat_minValue'] = -2.0e9
     azFiles = ['azimuth.offsets', 'azimuth.offsets.sa']
     azDescriptions = ['AzimuthOffsets', 'AzimuthSigma']
     rgFiles = ['range.offsets', 'range.offsets.sr']
@@ -1178,15 +1203,19 @@ def main():
                  simName='offsets',
                  simDir='offsetSims')
     #
+    smoothingApplied = False
     if params.get('minTol') is not None and not params.get('noVariableSmoothing'):
-        applyVariableSmoothing(params["outputDir"], params,
-                               myROFF.OffsetRangeSize, myROFF.OffsetAzimuthSize,
-                               myROFF.getGeoTransform(grimp=True, tiff=False),
-                               simDir='offsetSims', simName='offsets',
-                               stderr=params['stderr'], stdout=params['stdout'],
-                               debugIono=params.get('debugIono', False))
+        smoothingApplied = applyVariableSmoothing(
+            params["outputDir"], params,
+            myROFF.OffsetRangeSize, myROFF.OffsetAzimuthSize,
+            myROFF.getGeoTransform(grimp=True, tiff=False),
+            simDir='offsetSims', simName='offsets',
+            stderr=params['stderr'], stdout=params['stdout'],
+            debugIono=params.get('debugIono', False))
     #
-    writeVRTs(myROFF, params["outputDir"], params)
+    writeVRTs(myROFF, params["outputDir"], params,
+             interpApplied=not params['mergeOnly'],
+             smoothingApplied=smoothingApplied)
     #
     # writeVRTsRD(myROFF, ROFFPath, params)
 

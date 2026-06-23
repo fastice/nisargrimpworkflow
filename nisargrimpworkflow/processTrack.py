@@ -26,6 +26,9 @@ def parseArgs():
                         help='Pass --debugIono to SetupNISAR')
     parser.add_argument('--sepIceRock', action='store_true',
                         help='Pass --sepIceRock to SetupNISAR')
+    parser.add_argument('--geodatsOnly', action='store_true',
+                        help='Pass --geodatsOnly to SetupNISAR: re-merge '
+                        'virtual-frame geodats only, no reprocessing')
     parser.add_argument('--clean', action='store_true',
                         help='Pass --clean to SetupNISAR: remove computed output files '
                         '(everything --overWrite would replace) for every orbit found '
@@ -39,8 +42,8 @@ def parseArgs():
     args = parser.parse_args()
     #
     return args.track[0], args.overWrite, args.overWritePhase, args.RUNWOnly, \
-        args.correlationOnly, args.debugIono, args.sepIceRock, args.clean, \
-        args.cleanDebug, args.noPrompt
+        args.correlationOnly, args.debugIono, args.sepIceRock, args.geodatsOnly, \
+        args.clean, args.cleanDebug, args.noPrompt
 
 
 def main():
@@ -55,7 +58,7 @@ def main():
     '''
     # Get args
     track, overWrite, overWritePhase, RUNWOnly, correlationOnly, debugIono, \
-        sepIceRock, clean, cleanDebug, noPrompt = parseArgs()
+        sepIceRock, geodatsOnly, clean, cleanDebug, noPrompt = parseArgs()
     orbitDirs =  glob.glob(f'{track}/*_*')
     print(orbitDirs)
     orbits = sorted(list(set([x.split('/')[-1].split('_')[0] for x in orbitDirs])))
@@ -77,6 +80,8 @@ def main():
             command += ['--debugIono']
         if sepIceRock:
             command += ['--sepIceRock']
+        if geodatsOnly:
+            command += ['--geodatsOnly']
         if clean:
             command += ['--clean']
         if cleanDebug:

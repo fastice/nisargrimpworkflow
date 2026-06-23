@@ -16,6 +16,7 @@ Intended to be called from SetupNISAR.main() after processFrameROFF completes:
 '''
 import glob
 import os
+import re
 import sys
 from subprocess import run, DEVNULL
 
@@ -51,18 +52,34 @@ def processFrameIonosphere(frame, myArgs, simDir='simPhase'):
         Frame number.
     myArgs : dict
         SetupNISAR argument dictionary.  Required keys:
-            orbit1, orbit2, NumberRangeLooks, NumberAzimuthLooks,
-            outputDir, stderr, stdout.
-        Optional keys: overWrite, overWritePhase, regionFile, verbose.
+            orbit1, orbit2, outputDir, stderr, stdout.
+        Optional keys: overWrite, overWritePhase, regionFile, verbose,
+            NumberRangeLooks, NumberAzimuthLooks (fallback only -- see below).
     simDir : str, optional
         Directory (relative to frameDir) where siminsar outputs (velSim,
         maskVel) are written.  Created if absent.  Default: 'simPhase'.
     '''
     orbit1 = myArgs['orbit1']
     orbit2 = myArgs['orbit2']
-    nLooksR = myArgs['NumberRangeLooks']
-    nLooksA = myArgs['NumberAzimuthLooks']
     frameDir = os.path.abspath(f'{myArgs["outputDir"]}/{orbit1}_{frame}')
+
+    # nLooksR/nLooksA must come from THIS frame's own geodat, not myArgs --
+    # myArgs['NumberRangeLooks']/['NumberAzimuthLooks'] are set once globally in
+    # getSecondaryOrbit() from whichever frame's H5 was found first, and a frame
+    # can have a genuinely different bandwidth (hence different looks) than its
+    # neighbors (e.g. track-58 frame 44 at 40 MHz/13 looks vs 77 MHz/26 looks).
+    # Using the wrong global value here bakes a mismatched looks suffix into the
+    # correctedUnwrappedPhase/ionosphereCorrection filenames, which then breaks
+    # downstream geodat lookups (e.g. insarworkflow.tieScript.process_phase_yaml).
+    ownGeodats = [f for f in glob.glob(f'{frameDir}/geodat*x*.geojson')
+                  if '.secondary.' not in os.path.basename(f)]
+    m = (re.match(r'geodat(\d+)x(\d+)\.geojson$', os.path.basename(ownGeodats[0]))
+         if ownGeodats else None)
+    if m:
+        nLooksR, nLooksA = int(m.group(1)), int(m.group(2))
+    else:
+        nLooksR = myArgs['NumberRangeLooks']
+        nLooksA = myArgs['NumberAzimuthLooks']
 
     # Output stem and VRT path (relative to frameDir; estimateIonosphere runs
     # from there via cwd=frameDir)

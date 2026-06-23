@@ -196,7 +196,7 @@ def setup_track_dirs(track_dirs, copy_files):
 
 
 def _extract_sigma(filepath):
-    """Return sigma from az.est.const, rBaseline.deltabp (old text), or rBaseline.deltab.yaml."""
+    """Return sigma from az.est.const, rBaseline.deltabp (old text), or rBaseline.deltabp.yaml."""
     try:
         with open(filepath) as f:
             for line in f:
@@ -226,7 +226,7 @@ def check_products():
 
         az_sigma     = _extract_sigma(os.path.join(proc_dir, 'motion', 'az.est.const'))
         rng_sigma    = (_extract_sigma(os.path.join(proc_dir, 'motion', 'rBaseline.deltabp')) or
-                        _extract_sigma(os.path.join(proc_dir, 'motion', 'rBaseline.deltab.yaml')))
+                        _extract_sigma(os.path.join(proc_dir, 'motion', 'rBaseline.deltabp.yaml')))
         rng_sigma_ni = _extract_sigma(os.path.join(proc_dir, 'motion', 'rBaseline.deltabp.noIonosphere'))
         if az_sigma is not None or rng_sigma is not None:
             sigma_rows.append((rel, rng_sigma, az_sigma, rng_sigma_ni))

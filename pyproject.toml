@@ -31,3 +31,7 @@ custom_buildvrtWithOffsets = "nisargrimpworkflow.custom_buildvrtWithOffsets:main
 processTrack = "nisargrimpworkflow.processTrack:main"
 setupNISARTracks = "nisargrimpworkflow.setupNISARTracks:main"
 setupTracks = "nisargrimpworkflow.setupNISARTracks:main"
+buildFrameGpkg = "nisargrimpworkflow.buildFrameGpkg:main"
+buildFrameLayers = "nisargrimpworkflow.buildFrameLayers:main"
+checkFrameInputs = "nisargrimpworkflow.checkFrameInputs:main"
+makeMaster = "nisargrimpworkflow.makeMaster:main"

@@ -121,17 +121,29 @@ def load_runw(path, frame):
 
 
 def apply_runw_mask(phase, runw):
+    """The RUNW interferogram mask is not a boolean -- it encodes per-RSLC
+    subswath validity in its two lowest bits: bit 1 = reference RSLC valid,
+    bit 0 = secondary RSLC valid; a pixel is only valid if both are set
+    (mask & 0b11 == 0b11). (Working interpretation as of 2026-06-22, pending
+    confirmation from the algorithm team on the official product spec.) A
+    plain `mask == 0` check matches almost nothing in practice -- e.g.
+    mask=1 (bit1=0) means the reference sample is invalid even though the
+    value isn't literally 0 -- and lets large invalid regions (e.g.
+    swath-edge pixels with passable-looking coherence but no valid subswath
+    in one RSLC) through unmasked.
+    """
     try:
         mask_ds = runw.h5[runw.product][runw.bands][runw.frequency][runw.productType]['mask']
     except KeyError:
         print("  No interferogram mask found — skipping.")
         return phase
     mask = np.asarray(mask_ds)
-    n_bad = int((mask == 0).sum())
+    invalid = (mask & 0b11) != 0b11
+    n_bad = int(invalid.sum())
     n_total = mask.size
     print(f"  Interferogram mask: {n_bad:,} / {n_total:,} pixels masked "
           f"({100.0 * n_bad / n_total:.2f}%)")
-    phase[mask == 0] = np.nan
+    phase[invalid] = np.nan
     return phase
 
 
@@ -355,6 +367,37 @@ def fill_and_smooth_iono(raw_iono, valid, sigma, boundary_mode='reflect'):
         f32 = _nn_fill(f32, valid)   # seed invalid pixels so zoom never touches NaN
     filled = _pyramid_fill(f32, valid, boundary_mode=boundary_mode)
     return gaussian_filter(filled.astype(np.float64), sigma).astype(np.float32)
+
+
+def local_consistency_mask(values, valid, size=21, n_std=4.0, min_count=20):
+    """Boolean mask: True where `values` agrees with its local neighborhood.
+
+    Distinguishes a single bad/outlier pixel (disagrees with nearby valid
+    pixels) from a large, spatially-coherent region that's genuinely far from
+    zero (every pixel agrees with its neighbors, so it passes regardless of
+    magnitude). For each valid pixel, compares its value against the
+    mean/std of other valid pixels within a `size`x`size` window. A pixel
+    passes if it has at least `min_count` valid neighbors (insufficient
+    evidence otherwise) and its deviation from the local mean is within
+    `n_std` local standard deviations.
+    """
+    v = np.where(valid, values, 0.0).astype(np.float64)
+    v2 = np.where(valid, values.astype(np.float64) ** 2, 0.0)
+    cnt = valid.astype(np.float64)
+
+    n = size * size
+    local_sum = ndimage.uniform_filter(v, size=size, mode='constant') * n
+    local_sumsq = ndimage.uniform_filter(v2, size=size, mode='constant') * n
+    local_count = ndimage.uniform_filter(cnt, size=size, mode='constant') * n
+
+    with np.errstate(invalid='ignore', divide='ignore'):
+        local_mean = local_sum / local_count
+        local_var = local_sumsq / local_count - local_mean ** 2
+    local_std = np.sqrt(np.maximum(local_var, 0.0))
+
+    enough = local_count >= min_count
+    dev = np.abs(values - local_mean)
+    return valid & enough & (dev < n_std * local_std)
 
 
 # ---------------------------------------------------------------------------
