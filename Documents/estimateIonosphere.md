@@ -41,7 +41,7 @@ Note the sign: because phase and group delay have opposite signs, multiplying th
 $$\phi_\mathrm{obs} + \phi_\mathrm{offset} = (\phi_\mathrm{signal} + \Delta\phi_\mathrm{ion}) + \Delta\phi_\mathrm{ion}
                                            = \phi_\mathrm{signal} + 2\,\Delta\phi_\mathrm{ion}$$
 
-A heavy spatial Gaussian smooth (σ_az ≈ 100 px, σ_rg ≈ 30 px) eliminates the spatially variable signal component, leaving only the slowly-varying ionosphere:
+A heavy spatial Gaussian smooth (σ_az ≈ 10 px, σ_rg ≈ 30 px) eliminates the spatially variable signal component, leaving only the slowly-varying ionosphere:
 
 $$\Delta\phi_\mathrm{ion} \approx \mathrm{smooth}\!\left(\frac{\phi_\mathrm{obs} + \phi_\mathrm{offset}}{2}\right)$$
 
@@ -122,10 +122,13 @@ estimateIonosphere.py RUNW offsets.vrt output.vrt [options]
 | `--regionFile YAML` | greenland | Region YAML for `defaultRegionDefs`; provides DEM and velocity map paths for `siminsar`. |
 | `--overWrite` | False | Force `siminsar` to regenerate `velSim` and `maskVel` even if they already exist. |
 | `--velThresh M/YR` | 100.0 | Velocity threshold (m/yr) for the `maskVel` `siminsar` call; pixels above this speed are excluded from the ionosphere fit. |
-| `--sigma-az PX` | 100.0 | Azimuth Gaussian σ for smoothing the raw ionosphere estimate (pixels). |
+| `--sigma-az PX` | 10.0 | Azimuth Gaussian σ for smoothing the raw ionosphere estimate (pixels). |
 | `--sigma-rg PX` | 30.0 | Range Gaussian σ (pixels). |
 | `--offset-geometry VRT` | `offsets.geom.vrt` | Offset geometry VRT containing the `RangeOffsets` band to subtract from the measured offsets before ionosphere estimation. |
-| `--maskFile FILE` | `maskVel.vrt` | GeoTIFF or VRT mask; only mask=1 pixels contribute to the ionosphere fit. Created by `siminsar` if not supplied. |
+| `--maskFile FILE` | `None` (resolves to `<simDir>/maskVel.vrt` at runtime) | GeoTIFF or VRT mask; only mask=1 pixels contribute to the ionosphere fit. Created by `siminsar` if not supplied. |
+| `--verticalCorrection FILE` | None | xyDEM grid (m/yr) of submergence/emergence rate; passed to the `velSim` `siminsar` call so its DC anchor matches `correctedUnwrappedPhase`. |
+| `--sepIceRock` | off | Restrict the per-frame `(phase+offset_phase)/2` ionosphere estimate to ice pixels only (mask==2); rock/water excluded, since the estimate assumes nonzero velocity. The excluded rock pixels feed `SetupNISAR.globalFillIonosphere()`'s ice-anchored bias (see below). Requires `--iceRockMask` or an auto-detected `offsetSims/offsets.geom.mask.vrt`. |
+| `--iceRockMask FILE` | None (auto-detects `offsetSims/offsets.geom.mask.vrt` in `--simDir`) | 3-value mask (0=water, 1=rock, 2=ice) for `--sepIceRock`. |
 | `--simOffsets VRT` | `offsets.vrt` if present | VRT of simulated range offsets (SLC pixels) for per-CC diagnostic columns in the ambiguity table. |
 | `--simDir DIR` | `.` (cwd) | Directory where `siminsar` outputs (`velSim.vrt`, `maskVel.vrt`) are written; created if absent. |
 | `--noInterp` | off | Skip `intfloat` hole-filling of `correctedUnwrappedPhase`. |
@@ -179,7 +182,7 @@ for pass in 1..MAX_PASSES:
         Stage 1: NN seed     — each gap pixel ← nearest valid neighbour
         Stage 2: pyramid fill — coarse-to-fine diffusion (4 levels × 50 iters;
                                 coarsest level gets 100 iters)
-        Stage 3: Gaussian smooth — σ = (σ_az, σ_rg), default (100, 30) px
+        Stage 3: Gaussian smooth — σ = (σ_az, σ_rg), default (10, 30) px
       iono_final -= mean(iono_final)    — zero-mean adjustment
       phase_final = phase − iono_final
 
@@ -369,13 +372,23 @@ the entire image regardless of gap size.
 
 ### Stage 3 — Final Gaussian smooth
 
-`scipy.ndimage.gaussian_filter` with σ = (σ_az, σ_rg), nominally **(100, 30)**
-pixels, is applied to the fully-filled image. The heavy azimuthal smoothing
-(100 px ≈ tens of km at typical NISAR multilook spacing) removes the spatially
-variable surface-displacement signal from the raw ionosphere estimate, leaving
-only the slowly-varying ionospheric component. The asymmetric kernel reflects
-the fact that ionospheric structures are typically elongated in azimuth
-(aligned with the orbital track) and shorter-scale in range.
+`scipy.ndimage.gaussian_filter` with σ = (σ_az, σ_rg), nominally **(10, 30)**
+pixels (`estimateIonosphere.py`'s own CLI defaults — `SetupNISAR.py`'s
+`--sigmaAz`/`--sigmaRg` pass-throughs default to the same values), is applied
+to the fully-filled image, removing the spatially variable surface-displacement
+signal from the raw ionosphere estimate and leaving only the slowly-varying
+ionospheric component.
+
+**Note (flagged, not verified):** σ_rg (30) is currently larger than σ_az
+(10) — more smoothing across range than along azimuth. An earlier version of
+this doc asserted the opposite ratio was intentional ("ionospheric structures
+are elongated in azimuth, aligned with the orbital track, so it gets more
+smoothing"), which would argue for σ_az > σ_rg — the reverse of the current
+defaults. Either the reasoning was wrong, the defaults changed for an
+unrelated reason without the comment being revisited, or there's a
+correct-but-different justification for σ_rg > σ_az that isn't captured
+here. Worth confirming with whoever set these values rather than trusting
+either explanation at face value.
 
 ---
 
