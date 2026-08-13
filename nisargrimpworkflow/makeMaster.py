@@ -10,9 +10,14 @@ each track's block and a ';' separator between consecutive per-year files.
 Before writing, verifies that every file path referenced in those data lines
 actually exists -- including any ionosphere-correction file embedded in a
 range.offsets VRT's ionosphereRangeOffsetCorrection metadata (see
-SetupNISAR.globalFillIonosphere). Entries with any missing file are skipped
-from the output.  A summary of how many were skipped and why is printed at the
-end; --verbose adds a sorted list of every missing file path per category.
+SetupNISAR.globalFillIonosphere). It also verifies that each range baseline's
+recorded offsetCorrectionFile agrees with that same VRT metadata -- the exact
+consistency mosaic3d/checkForIonosphereCorrection() enforces at runtime, so a
+line that would abort the mosaic (e.g. a baseline still pointing at an old
+globalFill name after the ionosphere product was regenerated) is caught here
+instead. Entries with any missing file or ionosphere mismatch are skipped from
+the output.  A summary of how many were skipped and why is printed at the end;
+--verbose adds a sorted list of every missing file path / mismatch per category.
 """
 
 import argparse
@@ -21,6 +26,7 @@ import os
 import re
 import sys
 from collections import Counter, defaultdict
+from functools import lru_cache
 
 import utilities as u
 from osgeo import gdal
@@ -112,13 +118,16 @@ def token_exists(tok):
     return os.path.exists(tok) or os.path.exists(tok + '.vrt')
 
 
+@lru_cache(maxsize=None)
 def find_ion_correction(range_offsets_path):
     """If range_offsets_path's .vrt has an ionosphereRangeOffsetCorrection
     metadata tag (written by SetupNISAR.globalFillIonosphere), return the
     resolved path to that ion-correction file -- relative to
     range_offsets_path's own directory, matching how rparams/
     checkForIonosphereCorrection() resolves it. Returns None if there's no
-    .vrt or no such tag (nothing to verify, not an error)."""
+    .vrt or no such tag (nothing to verify, not an error). Cached: the same
+    range.offsets is inspected for both file-existence and baseline
+    consistency."""
     vrtPath = range_offsets_path + '.vrt'
     if not os.path.exists(vrtPath):
         return None
@@ -130,6 +139,54 @@ def find_ion_correction(range_offsets_path):
     if not ionName:
         return None
     return os.path.join(os.path.dirname(range_offsets_path), ionName)
+
+
+def baseline_offset_correction(baseline_path):
+    """Return the basename of the range baseline's offsetCorrectionFile entry,
+    or None if it records no correction. 'nil' and a missing/blank entry both
+    map to None, matching getRParams()/readOffsets.c which treats 'nil' as
+    unset (checkForIonosphereCorrection then returns early, no comparison)."""
+    try:
+        with open(baseline_path) as f:
+            for line in f:
+                if line.strip().startswith('offsetCorrectionFile:'):
+                    val = line.split(':', 1)[1].strip()
+                    if not val or val == 'nil':
+                        return None
+                    return os.path.basename(val)
+    except OSError:
+        return None
+    return None
+
+
+def check_line_ion_consistency(line):
+    """Return a list of mismatch messages when a data line's range baseline
+    records an offsetCorrectionFile whose basename disagrees with the
+    range.offsets VRT's ionosphereRangeOffsetCorrection metadata -- the same
+    inconsistency mosaic3d/checkForIonosphereCorrection() aborts on. Empty
+    when consistent or not applicable (no range.offsets, no range baseline,
+    or the baseline records no correction)."""
+    range_offsets_tok = None
+    baseline_tok = None
+    for tok in line.split():
+        if not is_file_token(tok):
+            continue
+        base = os.path.basename(tok)
+        if base == 'range.offsets':
+            range_offsets_tok = tok
+        elif base.startswith('rBaseline') and base.endswith('.yaml'):
+            baseline_tok = tok
+    if range_offsets_tok is None or baseline_tok is None:
+        return []
+    blName = baseline_offset_correction(baseline_tok)
+    if blName is None:
+        return []
+    ionPath = find_ion_correction(range_offsets_tok)
+    vrtName = os.path.basename(ionPath) if ionPath is not None else None
+    if blName != vrtName:
+        return [f'{baseline_tok}: offsetCorrectionFile {blName} != VRT '
+                f'ionosphereRangeOffsetCorrection {vrtName}']
+    return []
 
 
 def check_line_files(line):
@@ -183,13 +240,15 @@ def assemble_master(track_entries, verbose=False):
     get_track_entries().
 
     Returns (lines, n_total, n_skipped, skip_counts, skip_files,
-             tracks_no_inputfile, frames_in_output).
+             tracks_no_inputfile, frames_in_output, n_mismatch, mismatch_msgs).
       n_total:            total data lines found across all inputFiles
-      n_skipped:          lines dropped due to missing referenced files
+      n_skipped:          lines dropped (missing files and/or ion mismatch)
       skip_counts:        Counter {type_label: lines_missing_that_type}
       skip_files:         {type_label: [path, ...]}  (verbose only)
       tracks_no_inputfile: list of track numbers with no inputFile found
       frames_in_output:   set of orbit_frame strings that made it into output
+      n_mismatch:         lines dropped for a baseline/VRT ionosphere mismatch
+      mismatch_msgs:      list of mismatch description strings
     """
     output = []
     n_total = 0
@@ -198,6 +257,8 @@ def assemble_master(track_entries, verbose=False):
     skip_files = defaultdict(list)
     tracks_no_inputfile = []
     frames_in_output = set()
+    n_mismatch = 0
+    mismatch_msgs = []
 
     for track_num, base_dir in track_entries:
         input_files = find_input_files(base_dir, track_num)
@@ -211,7 +272,8 @@ def assemble_master(track_entries, verbose=False):
             for line in extract_data_lines(filepath):
                 n_total += 1
                 missing = check_line_files(line)
-                if missing:
+                mismatches = check_line_ion_consistency(line)
+                if missing or mismatches:
                     n_skipped += 1
                     seen_types = set()
                     for m in missing:
@@ -221,13 +283,16 @@ def assemble_master(track_entries, verbose=False):
                             seen_types.add(label)
                         if verbose:
                             skip_files[label].append(m)
+                    if mismatches:
+                        n_mismatch += 1
+                        mismatch_msgs.extend(mismatches)
                 else:
                     frame = orbit_frame_from_line(line)
                     if frame:
                         frames_in_output.add(frame)
                     output.append(line)
     return (output, n_total, n_skipped, skip_counts, skip_files,
-            tracks_no_inputfile, frames_in_output)
+            tracks_no_inputfile, frames_in_output, n_mismatch, mismatch_msgs)
 
 
 def write_output(lines, output_path):
@@ -276,8 +341,8 @@ def main():
     print(f'Found {len(motion_dirs)} track-*/*_0???/motion directories')
 
     (lines, n_total, n_skipped, skip_counts, skip_files,
-     tracks_no_inputfile, frames_in_output) = assemble_master(
-        track_entries, verbose=args.verbose)
+     tracks_no_inputfile, frames_in_output, n_mismatch,
+     mismatch_msgs) = assemble_master(track_entries, verbose=args.verbose)
 
     n_motion = len(motion_dirs)
     n_tracks_no_data = len(tracks_no_inputfile)
@@ -299,6 +364,12 @@ def main():
             if args.verbose:
                 for f in sorted(set(skip_files[label])):
                     print(f'    {f}')
+
+    if n_mismatch:
+        print(f'\033[1;41mBaseline/VRT ionosphere mismatches '
+              f'(re-fit baseline): {n_mismatch}\033[0m')
+        for msg in sorted(set(mismatch_msgs)):
+            print(f'    {msg}')
 
     write_output(lines, output_path)
 

@@ -12,11 +12,15 @@ those data lines actually exists — including, for each `range.offsets`
 token, any ionosphere-correction file embedded in that frame's
 `range.offsets.vrt` `ionosphereRangeOffsetCorrection` metadata (the same
 mechanism `SetupNISAR.globalFillIonosphere()` writes and
-`rparams`/`checkForIonosphereCorrection()` reads). **Data lines with any
-missing referenced file are dropped from the output** — the rest of the
+`rparams`/`checkForIonosphereCorrection()` reads). It further verifies that
+each range baseline's recorded `offsetCorrectionFile` **agrees** with that
+same VRT metadata (see [below](#ionosphere-baselinevrt-consistency-check)).
+**Data lines with any missing referenced file — or an ionosphere
+baseline/VRT mismatch — are dropped from the output** — the rest of the
 track still gets assembled. A summary of how many lines were skipped, and
 why, is printed at the end; `--verbose` adds a sorted list of every
-missing file path per category.
+missing file path per category, and any ionosphere mismatches are always
+listed (they name the exact baseline to re-fit).
 
 Originally a one-off script hardcoded to `newGreenlandProject`
 (`/Volumes/insar1/ian/NISAR/realNISAR/newGreenlandProject/makeMaster.py`,
@@ -55,6 +59,35 @@ binary file written at all, just `range.offsets.vrt`) still work, because
 `.vrt` sidecar when given the bare name. `makeMaster`'s existence check
 matches this: a token is considered present if either the bare path or
 `<path>.vrt` exists.
+
+## Ionosphere baseline/VRT consistency check
+
+Each `range.offsets.vrt` carries an `ionosphereRangeOffsetCorrection`
+metadata key (stamped by `SetupNISAR`), and each range baseline
+(`motion/rBaseline.deltabp.yaml` — the variant `mosaic3d` actually reads)
+records an `offsetCorrectionFile:` naming the correction it was **fit
+against**. At runtime `mosaic3d`/`checkForIonosphereCorrection()`
+(`readOffsets.c`) refuses any frame where those two names disagree, so it
+never silently applies a different ionosphere correction than the baseline
+assumed — the run aborts on the first offending frame.
+
+`makeMaster` now performs the identical comparison per data line and drops
+mismatched lines (rather than letting the whole mosaic abort mid-run),
+listing each one under a `Baseline/VRT ionosphere mismatches (re-fit
+baseline)` summary block. A `nil` (or absent) `offsetCorrectionFile` is
+**not** a mismatch — `readOffsets.c` treats `nil` as "no correction" and
+skips the comparison, so `makeMaster` does too.
+
+**Typical cause:** a baseline gets re-fit while only an older-named
+ionosphere product exists on disk (e.g. `…ionosphereCorrection.`**`globalFill`**`.offset.vrt`),
+then the ionosphere pipeline regenerates/renames the product
+(`…ionosphereCorrection.offset.vrt`) and `SetupNISAR` re-stamps the VRT —
+but the baseline, fit *before* that, still points at the old name. Any
+frame whose ionosphere product is regenerated **after** its baseline was
+fit lands in this state. The fix is to re-fit that frame's baseline (its
+tie step) so it records the current name; the two correction products are
+typically numerically near-identical, so the re-fit reproduces the same
+coefficients.
 
 ## A track silently missing from the master inputFile
 

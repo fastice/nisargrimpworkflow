@@ -190,6 +190,7 @@ frame (a gap) correctly becomes its own virtual frame instead.
 | `setupFlags` | (optional) extra flags forwarded to `SetupNISAR` per orbit; default empty. Region-dependent processing choices are NOT put here — see `sepIceRock` below |
 | `nThreads` | (optional) number of `SetupNISAR` orbit jobs to run in parallel in step 5; default 20 |
 | `ompThreads` | (optional) OpenMP width passed to each orbit's `SetupNISAR` (`-ompThreads`); default = SetupNISAR's own (6). Balance `nThreads * ompThreads` against core count |
+| `notifyEmail` | (optional) address mailed the run summary **only when the run hits errors** (a failed step, a failed `SetupNISAR` orbit, or a crash). Silent on a clean run; with no key set, no mail is ever sent (opt-in). Best effort via the local MTA (`mail`/`mailx`) — a host with no working mailer just logs a warning and continues |
 
 Region-dependent processing choices live in **`project.yaml`**, read by `SetupNISAR`
 itself, not in `setupFlags`. In particular `sepIceRock` (the ice-anchored/rock-seeded

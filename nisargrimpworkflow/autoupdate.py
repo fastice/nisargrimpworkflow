@@ -5,14 +5,21 @@ Automated NISAR search/download/update driver, configured by autoupdate.yaml.
 
 Intended to run as a cron job. All paths and options come from autoupdate.yaml,
 which normally sits beside the project's project.yaml.
+
+If autoupdate.yaml sets `notifyEmail: you@example.com`, the run mails that
+address the per-run summary whenever it hits errors (a failed step, a failed
+SetupNISAR orbit, or a crash). A clean run stays silent, and with no
+notifyEmail key no mail is ever sent (opt-in, best effort via the local MTA).
 """
 import argparse
 import datetime
 import glob
 import os
 import shutil
+import socket
 import subprocess
 import threading
+import traceback
 
 import yaml
 import utilities as u
@@ -476,6 +483,70 @@ def _runSetupNISAR(command, cwd, orbit, track, frames, logPath, results):
     results.append(entry)
 
 
+def mailReport(recipient, subject, body):
+    '''
+    Mail a report via the local MTA (mail, then mailx). Best effort: a machine
+    with no working mailer must not fail the run, so any failure is warned and
+    swallowed. Mirrors asfSearchAndDownload.autoupdateS1.mailReport.
+    '''
+    for mailer in (['mail', '-s', subject, recipient],
+                   ['mailx', '-s', subject, recipient]):
+        try:
+            proc = subprocess.run(mailer, input=body, text=True,
+                                  capture_output=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if proc.returncode == 0:
+            print(f'autoupdate: mailed "{subject}" to {recipient}')
+            return True
+        u.mywarning(f'mailReport: {mailer[0]} exited {proc.returncode}: '
+                    f'{proc.stderr.strip()}')
+    u.mywarning(f'mailReport: could not mail "{subject}" to {recipient}: '
+                'no working mailer')
+    return False
+
+
+def runHadErrors(summary):
+    '''
+    True if the run recorded any failure worth emailing: a step with a non-zero
+    returncode, a FAILED SetupNISAR orbit, or an uncaught exception. A step
+    recorded as None (skipped this run, e.g. no tie year) is not an error.
+    '''
+    if summary.get('exception'):
+        return True
+    if any(rc not in (None, 0) for rc in summary['steps'].values()):
+        return True
+    if any(e['status'] == 'FAILED' for e in summary['orbitResults']):
+        return True
+    return False
+
+
+def notifyOnErrors(config, summary, projectDir, body):
+    '''
+    Email the run summary if the run had errors and a notifyEmail recipient is
+    configured. Silent on a clean run and when notifyEmail is unset (opt-in):
+    adding `notifyEmail: you@example.com` to autoupdate.yaml turns it on.
+    '''
+    recipient = config.get('notifyEmail')
+    if not recipient or not runHadErrors(summary):
+        return
+    host = socket.gethostname()
+    nFail = sum(1 for e in summary['orbitResults']
+                if e['status'] == 'FAILED')
+    stepFails = [k for k, rc in summary['steps'].items()
+                 if rc not in (None, 0)]
+    parts = []
+    if nFail:
+        parts.append(f'{nFail} orbit(s) failed')
+    if stepFails:
+        parts.append(f'{len(stepFails)} step(s) failed')
+    if summary.get('exception'):
+        parts.append('crashed')
+    subject = (f'autoupdate {os.path.basename(projectDir)}: '
+               f'{", ".join(parts) or "errors"} on {host}')
+    mailReport(recipient, subject, body or '(run summary unavailable)')
+
+
 def processReleased(config, released, projectDir, pendingFile=None):
     '''
     Steps 4-7: file the released granules, (re)build the affected orbits'
@@ -586,12 +657,22 @@ def processReleased(config, released, projectDir, pendingFile=None):
         r = subprocess.run(['makeMaster', '--projectDir', projectDir],
                            cwd=projectDir)
         summary['steps']['makeMaster'] = r.returncode
+    except Exception:
+        # Record a crash so notifyOnErrors mails even when a step raised rather
+        # than returning non-zero; re-raise so cron still logs the traceback.
+        summary['exception'] = traceback.format_exc()
+        raise
     finally:
         summary['end'] = datetime.datetime.now()
+        body = None
         try:
-            writeRunSummary(logDir, summary)
+            body = writeRunSummary(logDir, summary)
         except Exception as e:                 # never let logging break a run
             u.mywarning(f'processReleased: could not write run summary: {e}')
+        try:
+            notifyOnErrors(config, summary, projectDir, body)
+        except Exception as e:                 # never let mailing break a run
+            u.mywarning(f'processReleased: could not send notify email: {e}')
 
 
 def writeRunSummary(logDir, summary):
@@ -601,6 +682,8 @@ def writeRunSummary(logDir, summary):
     succeeded/failed, frames, granules, step statuses) followed by a per-orbit
     breakdown with frame counts, status, and -- for failures -- the returncode,
     a pointer to the full per-orbit log, and the tail of that log as the reason.
+
+    Returns the summary text so the caller can mail it (notifyOnErrors).
     '''
     os.makedirs(logDir, exist_ok=True)
     path = os.path.join(logDir, f'summary_{summary["stamp"]}.txt')
@@ -655,9 +738,11 @@ def writeRunSummary(logDir, summary):
                 lines.append(f'      | {rl}')
     if summary['orbitLogDir']:
         lines += ['', f'Full per-orbit logs: {summary["orbitLogDir"]}']
+    body = '\n'.join(lines) + '\n'
     with open(path, 'w') as fp:
-        fp.write('\n'.join(lines) + '\n')
+        fp.write(body)
     print(f'processReleased: wrote run summary {path}')
+    return body
 
 
 def main():
