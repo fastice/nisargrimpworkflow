@@ -19,7 +19,7 @@ ROFFtoGrimp [options] ROFF
 | Option | Default | Description |
 |--------|---------|-------------|
 | `ROFF` | — | ROFF HDF5 file to convert. |
-| `--geodat1 FILE` | auto | Primary geodat file (`geodatNLRxNLA.geojson`). Auto-detected from `*.nisar.uw` files in the output directory. |
+| `--geodat1 FILE` | auto | Primary geodat file (`geodatNLRxNLA.geojson`). Auto-detection scans for `*.nisar.uw` files, which the current default pipeline no longer writes — `SetupNISAR` always passes this explicitly, and standalone runs without it will fail in `findGeodat`. |
 | `--geodat2 FILE` | auto | Secondary geodat file (`geodatNLRxNLA.secondary.geojson`). Derived from `--geodat1` if not given. |
 | `--DEM FILE` | region default | DEM file for offset simulation. |
 | `--region NAME` | auto | Region name (`greenland` or `antarctica`). Auto-detected from the ROFF EPSG code if not given. |
@@ -37,6 +37,13 @@ ROFFtoGrimp [options] ROFF
 | `--byteOrder STR` | `MSB` | Byte order for binary output files (`MSB` or `LSB`). |
 | `--noMask` | False | Skip applying the fast-area mask to layer 3. |
 | `--mergeOnly` | False | Skip simulation, culling, and interpolation; re-run merge step only. |
+| `--verticalCorrection FILE` | None | xyDEM grid (m/yr) of submergence/emergence rate; passed to `simoffsets -verticalCorrection`. |
+| `--ompThreads N` | 4 | OpenMP threads passed to `simoffsets`/`siminsar`. |
+| `--minTol` / `--percentSpeed` / `--maxTol` | None | Variable smoothing-radius map (all three required together), applied on top of the fixed `--sr/--sa` smoothing. |
+| `--maxSmoothRadius N` | 50 | Variable smoothing: sweep cap in single-look pixels (≤255). |
+| `--smoothNIter N` | 3 | Variable smoothing: box-filter passes per sweep step. |
+| `--noVariableSmoothing` | False | Disable the variable smoothing-radius map even if the trio is supplied. |
+| `--debugIono` | False | Save unsmoothed copies of `range.offsets`/`azimuth.offsets` to `debug/` before variable smoothing is applied. |
 | `--verbose` | False | Print all subprocess output to the terminal. |
 
 ---
@@ -52,16 +59,18 @@ resolveRegion()          — determine region from EPSG if not set
 
 removeOutlierOffsets()   — discard pixels below per-layer correlation thresholds
 
-mkdir workingDir/
-writeOffsetsDatFile()    — write offsets.dat and offsets.geom.dat
+mkdir workingDir/ offsetSims/
+writeOffsetsDatFile()    — write offsetSims/offsets.velocity.dat and
+                           offsetSims/offsets.geom.dat
 
-setupGeodats()           — symlink geodat files into workingDir/
+setupGeodats()           — symlink geodat files into offsetSims/
 
-simulateOffsets()        — two parallel simoffsets calls:
-  │   offsets.geom.*   — geometry-only (no velocity)
-  └── offsets.*        — geometry + velocity
+simulateOffsets()        — two parallel simoffsets calls, outputs in offsetSims/:
+  │   offsets.geom.*     — geometry-only (no velocity)
+  └── offsets.velocity.* — geometry + velocity
 
-applyMask()              — mask fast-moving areas (unless --noMask)
+applyMask()              — mask fast-moving areas via
+                           workingDir/offsets.velocity.mask.vrt (unless --noMask)
 
 writeData()              — write NISARoffsets.layer{1,2,3}.{dr,da,sr,sa,cor}
 
@@ -71,11 +80,22 @@ interpOffsets()          — run intfloat on each layer×band in parallel
                          — write per-layer *.cull.interp.vrt
 
 mergeOffsets()           — nanmean across layers; add back geometry offsets;
-                           scale sigmas by sqrt(N); write final binary files
+                           scale sigmas by sqrt(N); write final binaries as
+                           *.slow files with the plain names left as symlinks
+                           (see note below)
+
+applyVariableSmoothing() — optional --minTol/--percentSpeed/--maxTol pass
 
 writeVRTs()              — write azimuth.offsets.vrt, range.offsets.vrt,
                            offsets.range-azimuth.vrt
 ```
+
+**`.slow` indirection:** `range.offsets`, `azimuth.offsets`, and their `.sr`/`.sa` sigma
+sidecars are written to `.slow`-suffixed files, with the plain name a symlink to the `.slow`
+file. This lets a future process merge in offsets from a separate ("fast") run and write the
+merged result directly to the plain name without disturbing the VRTs, which reference the plain
+names and follow the symlink transparently. `applyVariableSmoothing` resolves through the
+symlink (`os.path.realpath`) on purpose.
 
 ---
 
@@ -87,13 +107,13 @@ Simulates range and azimuth offset fields from a velocity map and DEM. Called tw
 
 ```
 simoffsets -region=REGION [-LSB] [--tiff] [-dem=DEM] [-noVel]
-    -offsetsDat=outputDir/offsets[.geom].dat
-    -azOffsets=outputDir/offsets[.geom].da -syncDat
-    -geodatFile=workingDir/geodat1
-    -secondGeodatFile=workingDir/geodat2
+    -offsetsDat=outputDir/offsetSims/offsets.{velocity,geom}.dat
+    -azOffsets=outputDir/offsetSims/offsets.{velocity,geom}.da -syncDat
+    -geodatFile=outputDir/offsetSims/geodat1
+    -secondGeodatFile=outputDir/offsetSims/geodat2
 ```
 
-The geometry-only call (with `-noVel`) produces the static offset baseline (`offsets.geom.*`). The full call (with velocity) produces `offsets.*`, which includes glacier motion.
+The geometry-only call (with `-noVel`) produces the static offset baseline (`offsets.geom.*`). The full call (with velocity) produces `offsets.velocity.*`, which includes glacier motion. Both are written into `offsetSims/`.
 
 `--tiff` is passed automatically by the NISAR workflow (`tiff=True` in `simulateOffsets`). When set, `simoffsets` passes `-tiff` to `siminsar`, which writes latitude/longitude as GeoTIFF files (`.lat.tif`, `.lon.tif`) plus a `.ll.vrt` wrapper instead of binary flat files. The offset arrays themselves (`.dr`, `.da`) are also written as GeoTIFF (`.dr.tif`, `.da.tif`) and a two-band VRT is generated from them. `offsets.readLatlon()` automatically prefers the `.ll.vrt` path, so downstream processing is unaffected.
 
@@ -129,9 +149,16 @@ Intermediate files in `outputDir/workingDir/`:
 | `NISARoffsets.layer{1,2,3}.cull.{dr,da}` | Culled offset binaries |
 | `NISARoffsets.layer{1,2,3}.cull.interp.{dr,da,sr,sa}` | Hole-filled offset/sigma binaries |
 | `NISARoffsets.layer{1,2,3}.cull.interp.vrt` | Four-band VRT per layer |
-| `offsets.{dr.tif,da.tif,vrt}` | Simulated offsets with velocity (GeoTIFF + VRT; NISAR workflow always uses `--tiff`) |
-| `offsets.geom.{dr.tif,da.tif,vrt}` | Geometry-only simulated offsets (GeoTIFF + VRT) |
-| `offsets.{geom.,velocity.}{lat.tif,lon.tif,ll.vrt,mask}` | lat/lon GeoTIFFs + VRT wrapper and binary mask written by `siminsar -tiff` |
+| `offsets.velocity.mask(.vrt)` | Fast-area mask applied to layer 3 |
+
+Simulation files in `outputDir/offsetSims/`:
+
+| File pattern | Description |
+|--------------|-------------|
+| `offsets.velocity.{dr.tif,da.tif,vrt,dat,smr.tif}` | Simulated offsets with velocity (GeoTIFF + VRT; NISAR workflow always uses `--tiff`) |
+| `offsets.geom.{dr.tif,da.tif,vrt,dat}` | Geometry-only simulated offsets (GeoTIFF + VRT) |
+| `offsets.{geom.,velocity.}{lat.tif,lon.tif,ll.vrt,mask,mask.vrt}` | lat/lon GeoTIFFs + VRT wrapper and mask written by `siminsar -tiff` |
+| `geodat*.geojson` | Symlinks to the per-frame geodats (`setupGeodats`) |
 
 ---
 
@@ -153,7 +180,7 @@ No-data pixels use fill value `−2×10⁹`.
 |----------|-------------|
 | `parseArgs()` | Parse command-line arguments; validate ROFF path; assemble `params` dict. |
 | `findGeodat(params, geodat1, geodat2)` | Auto-detect geodat filenames from `*.nisar.uw` files in the output directory. |
-| `setupGeodats(params)` | Create symlinks to geodat files inside `workingDir/`. |
+| `setupGeodats(params)` | Create symlinks to geodat files inside `offsetSims/`. |
 | `resolveRegion(myROFF, params)` | Determine region (`greenland`/`antarctica`) from ROFF EPSG code. |
 | `simulateOffsets(outputDir, baseName, params, ..., tiff=False)` | Spawn two `simoffsets` threads (geometry-only and full velocity). Always called with `tiff=True` in the NISAR workflow. |
 | `callSim(outputDir, baseName, params, ..., tiff=False)` | Build and execute a single `simoffsets` shell command; appends `--tiff` when `tiff=True`. |

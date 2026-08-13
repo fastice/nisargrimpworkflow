@@ -138,7 +138,7 @@ Run from the directory containing the `<orbit1>_<frame>` subdirectories.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--virtualFrame NNNN` | `0000` | Suffix for the consolidated virtual frame directory |
+| `--virtualFrame NNNN` | None (auto) | Suffix for the consolidated virtual frame directory. When omitted, numbers are assigned automatically per contiguous frame group (`assignVirtualFrameNumbers`): `0000` for the canonical group, higher suffixes for straggler/fragment groups |
 | `--firstFrame N` | 0 | Skip frames numbered below this value |
 | `--lastFrame N` | 999 | Skip frames numbered above this value |
 | `--overWrite` | off | Re-run all per-frame conversions even if outputs exist |
@@ -154,6 +154,18 @@ Run from the directory containing the `<orbit1>_<frame>` subdirectories.
 | `--sigmaAz PX` | 10 | Azimuth Gaussian smoothing sigma for the ionosphere estimate, in RUNW pixels (passed to `estimateIonosphere --sigma-az`) |
 | `--sigmaRg PX` | 30 | Range Gaussian smoothing sigma for the ionosphere estimate, in RUNW pixels (passed to `estimateIonosphere --sigma-rg`) |
 | `--correlationOnly` | off | Extract coherence and geodat files only — skips ROFF conversion, ionosphere estimation, and virtual-frame assembly |
+| `--corrOnly` | off | Extract `.cor` files per real frame and assemble only the correlation virtual frame — skips ROFF conversion, ionosphere estimation, and power images |
+| `--firstDate` / `--lastDate` | None | Only process pairs whose first (reference) acquisition date falls in `[firstDate, lastDate]` (ISO `YYYY-MM-DD`; a missing bound is open) |
+| `--sepIceRock` | off (default from `project.yaml` `sepIceRock` key) | Ice-only iono estimation (`estimateIonosphere --sepIceRock`) + rock-seeded, ice-anchored global fill. Also enables the global ionosphere fill. **The default is read from `../project.yaml`'s `sepIceRock` key** (`True` for Greenland, `False` for Antarctica for now); this flag forces it on regardless. `globalFillIono` is recomputed after that merge. |
+| `--noGlobalFillIono` | off | Disable the full-swath ionosphere gap fill (which only runs with `--sepIceRock` or `--debugIono`); per-frame fill only |
+| `--retainIntermediateIono` | off | Keep per-frame unfilled and per-frame filled offset iono files after global fill (debugging/comparison) |
+| `--debugIono` | off | Rename iono intermediates with `debug` in their names and build two extra debug virtual-frame VRTs (assembled unfilled + per-frame-filled) |
+| `--geodatsOnly` | off | Re-merge virtual-frame geodats from existing per-frame geodats/VRTs without any reprocessing |
+| `--bakeOnly` | off | Skip all processing; just bake existing virtual-frame VRTs from recursive multi-sub-frame VRTs into flat GeoTIFF + minimal VRT wrappers, then exit |
+| `--new` | off | Skip any virtual frame whose product VRT already exists (`*.correctedUnwrappedPhase.vrt`, or `*.cor.vrt` for `--correlationOnly`) |
+| `--clean` | off | Remove all computed output files for this orbit (everything `--overWrite` would replace), print the list, prompt unless `--noPrompt`, then exit |
+| `--cleanDebug` | off | Empty the contents of every `debug/` directory for this orbit (prompt unless `--noPrompt`), then exit |
+| `--noPrompt` | off | Skip the confirmation prompt for `--clean`/`--cleanDebug` |
 | `--verbose` | off | Print all subprocess output to terminal (default: suppressed) |
 
 ### Examples
@@ -426,6 +438,11 @@ Then geodats are merged (`mergedGeodat`):
 - Orbital state vectors: sorted, deduplicated, and cubic-spline interpolated
   onto a uniform time grid.
 - Azimuth size updated to match the merged VRT dimensions.
+- Squint polynomial (`squintAnglePolynomial`/`squintCoefficients`, reference image only):
+  each sub-frame's own fitted squint(r,a) surface is resampled onto the merged range
+  span and that sub-frame's own azimuth span, pooled across all sub-frames, and refit as
+  a single polynomial for the virtual frame (`mergeSquintAnglePolynomial`) — consumed
+  downstream by `mosaic3d -useSquint` (off by default; see `mosaicSource/CLAUDE.md`).
 
 #### 4c. Pair info file (`writePairInfo`)
 
@@ -456,7 +473,15 @@ assembling them from the per-frame `offsetSims/` and frame-root locations:
 
 After assembly, the `ionosphereRangeOffsetCorrection` metadata key is written
 onto the virtual `range.offsets.vrt` so the geocoding pipeline (`mosaic3d`)
-knows to apply the ionosphere correction automatically.
+knows to apply the ionosphere correction automatically (skipped with a
+warning if the virtual `range.offsets.vrt` was not built).
+
+When the global ionosphere fill is enabled (`--sepIceRock` or `--debugIono`,
+without `--noGlobalFillIono`), step 4d assembles the sparse
+`*.ionosphereCorrectionUnfilled(.offset).vrt` products instead of the
+per-frame-filled ones, and `globalFillIonosphere()` then does a single
+full-swath fill pass (rock-seeded/ice-anchored under `--sepIceRock`) — see
+[estimateIonosphere.md](estimateIonosphere.md) for the algorithm.
 
 #### 4e. Power virtual frame (`createVirtualFramePower`)
 
@@ -487,11 +512,15 @@ pipeline internally, using the ionosphere phase screen embedded in the RUNW
 HDF5.  This path can be used when ROFF products are unavailable.  See
 [RUNWtoGrimp](RUNWtoGrimp.md) for details of the internal correction.
 
-Note: the virtual-frame assembly in `createVirtualFrameRUNW` expects
-`*.correctedUnwrappedPhase.vrt` from each frame; the phaseDerivedIonosphere
-path produces `*.uw.interp.vrt` instead.  The virtual-frame VRT build will
-report a warning and write a `.fail` sentinel for the
-`correctedUnwrappedPhase` product.
+Note: under `--phaseDerivedIonosphere`, `createVirtualFrameRUNW` assembles the
+legacy products the RUNW path actually writes (`*.uw.interp.vrt`,
+`*.ion.filt.rangeOffset.vrt`, `*.ion.unfilt.rangeOffset.vrt`) in place of the
+`estimateIonosphere` products (`*.correctedUnwrappedPhase.vrt`,
+`*.ionosphereCorrection*.vrt`).  If no phase product could be assembled at
+all, the merged geodats are skipped with a warning.  Both paths produce a
+correction consumers ADD (correction = −ionosphere) — see
+[RUNWtoGrimp.md](RUNWtoGrimp.md) "Ionosphere correction" for the sign
+conventions.
 
 ---
 

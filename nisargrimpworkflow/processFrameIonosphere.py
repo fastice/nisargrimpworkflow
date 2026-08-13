@@ -18,6 +18,7 @@ import glob
 import os
 import re
 import sys
+import sarfunc
 from subprocess import run, DEVNULL
 
 # Use the running interpreter explicitly so we don't accidentally pick up a
@@ -104,8 +105,8 @@ def processFrameIonosphere(frame, myArgs, simDir='simPhase'):
         return
 
     # Locate the RUNW HDF5 (H5/ subdir or directly in frameDir)
-    RUNWFiles = (glob.glob(f'{frameDir}/H5/NISAR*RUNW*.h5') or
-                 glob.glob(f'{frameDir}/NISAR*RUNW*.h5'))
+    RUNWFiles = (sorted(glob.glob(f'{frameDir}/H5/NISAR*RUNW*.h5')) or
+                 sorted(glob.glob(f'{frameDir}/NISAR*RUNW*.h5')))
     if not RUNWFiles:
         print(f'  estimateIonosphere: no RUNW HDF5 found under {frameDir}; '
               f'skipping frame {frame}')
@@ -129,10 +130,20 @@ def processFrameIonosphere(frame, myArgs, simDir='simPhase'):
                           'H5/offsetSims/offsets.geom.vrt',
                           'offsets.geom.vrt'])
 
-    # Ice/rock/water mask for --sepIceRock (0=water, 1=rock, 2=ice)
-    iceRockMaskVRT = _find_file(frameDir,
-                                ['offsetSims/offsets.geom.mask.vrt',
-                                 'H5/offsetSims/offsets.geom.mask.vrt'])
+    # Ice/rock/water mask for --sepIceRock (0=water, 1=rock, 2=ice). Only trust
+    # auto-detection when the region actually defines icerockwatermask --
+    # offsets.geom.mask.vrt also exists (with plain land/sea values) when the
+    # region has none, since ROFFtoGrimp falls back to the default mask for
+    # offsets.geom in that case (see ROFFtoGrimp.simulateOffsets()).
+    regionHasIceRockMask = False
+    if myArgs.get('regionFile'):
+        regionHasIceRockMask = sarfunc.defaultRegionDefs(
+            None, regionFile=myArgs['regionFile']).iceRockWaterMask() is not None
+    iceRockMaskVRT = None
+    if regionHasIceRockMask:
+        iceRockMaskVRT = _find_file(frameDir,
+                                    ['offsetSims/offsets.geom.mask.vrt',
+                                     'H5/offsetSims/offsets.geom.mask.vrt'])
 
     command = [_PYTHON, '-m', 'nisargrimpworkflow.estimateIonosphere',
                RUNWFile,
@@ -149,6 +160,11 @@ def processFrameIonosphere(frame, myArgs, simDir='simPhase'):
         command += ['--verticalCorrection', myArgs['verticalCorrection']]
     if myArgs.get('overWrite'):
         command += ['--overWrite']
+    elif myArgs.get('overWritePhase'):
+        # --overWritePhase reuses the cached velSim/offsets but must refresh the
+        # cheap, param-dependent maskVel so changes to the velocity gate
+        # (velThresh/highVelThresh/largeCCFraction) take effect on rerun.
+        command += ['--overWriteMask']
     if myArgs.get('minTol') is not None:
         command += ['--minTol', str(myArgs['minTol']),
                     '--percentSpeed', str(myArgs['percentSpeed']),
@@ -165,6 +181,12 @@ def processFrameIonosphere(frame, myArgs, simDir='simPhase'):
         command += ['--islandThresh', str(myArgs['islandThresh'])]
     if myArgs.get('phaseThresh') is not None:
         command += ['--phaseThresh', str(myArgs['phaseThresh'])]
+    if myArgs.get('velThresh') is not None:
+        command += ['--velThresh', str(myArgs['velThresh'])]
+    if myArgs.get('highVelThresh') is not None:
+        command += ['--highVelThresh', str(myArgs['highVelThresh'])]
+    if myArgs.get('largeCCFraction') is not None:
+        command += ['--largeCCFraction', str(myArgs['largeCCFraction'])]
     if myArgs.get('sigmaAz') is not None:
         command += ['--sigma-az', str(myArgs['sigmaAz'])]
     if myArgs.get('sigmaRg') is not None:
@@ -177,6 +199,9 @@ def processFrameIonosphere(frame, myArgs, simDir='simPhase'):
             command += ['--iceRockMask', myArgs['iceRockMask']]
         elif iceRockMaskVRT is not None:
             command += ['--iceRockMask', iceRockMaskVRT]
+        elif not regionHasIceRockMask:
+            print('  --sepIceRock: icerockwatermask not defined for this region -- '
+                  'not applicable, continuing without ice/rock separation.')
         else:
             print(f'  Warning: --sepIceRock set but no offsets.geom.mask.vrt found '
                   f'under {frameDir}; rock pre-seeding will be skipped.')

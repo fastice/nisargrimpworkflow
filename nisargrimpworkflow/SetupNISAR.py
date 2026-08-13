@@ -7,10 +7,12 @@ Created on Wed Mar 11 12:07:17 2026
 """
 import utilities as u
 import argparse
+import datetime
 import nisarhdf
 import time
 from nisargrimpworkflow.wrapH5WithVRT import wrapH5sInFrameDir
 from nisargrimpworkflow.processFrameIonosphere import processFrameIonosphere
+from nisargrimpworkflow.custom_buildvrtWithOffsets import bakeVrtInPlace
 import geojson
 import copy
 import glob
@@ -32,6 +34,34 @@ def restrictedFrame(x):
     if x < 0.0 or x > 999:
         raise argparse.ArgumentTypeError("Value must be between 0 and 999")
     return x
+
+
+def _isoDate(x):
+    '''argparse type: parse a YYYY-MM-DD string to a datetime.date.'''
+    try:
+        return datetime.datetime.strptime(x, '%Y-%m-%d').date()
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"Date must be YYYY-MM-DD, got '{x}'")
+
+
+def refDateInRange(refDateStr, firstDate, lastDate):
+    '''True if the reference (first) date is within [firstDate, lastDate].
+
+    refDateStr is 'YYYY-MM-DD' (myProd.Date). firstDate/lastDate are
+    datetime.date or None; a None bound is open (-inf / +inf). An unparseable
+    or missing refDateStr is not filtered out (returns True).'''
+    if not refDateStr:
+        return True
+    try:
+        ref = datetime.datetime.strptime(refDateStr, '%Y-%m-%d').date()
+    except (ValueError, TypeError):
+        return True
+    if firstDate is not None and ref < firstDate:
+        return False
+    if lastDate is not None and ref > lastDate:
+        return False
+    return True
 
 
 def parseCommandLine():
@@ -79,6 +109,16 @@ def parseCommandLine():
                         help='Skip frames numbered below this value (0–999) [0]')
     parser.add_argument('--lastFrame', type=restrictedFrame, default=999,
                         help='Skip frames numbered above this value (0–999) [999]')
+    parser.add_argument('--firstDate', type=_isoDate, default=None,
+                        metavar='YYYY-MM-DD',
+                        help='Only process pairs whose first (reference) '
+                        'acquisition date is on or after this date. Omit for '
+                        'no lower bound.')
+    parser.add_argument('--lastDate', type=_isoDate, default=None,
+                        metavar='YYYY-MM-DD',
+                        help='Only process pairs whose first (reference) '
+                        'acquisition date is on or before this date. Omit for '
+                        'no upper bound (infinity).')
     parser.add_argument('--allowMixedMode', action="store_true",
                         help='Include mixed-mode frames (SLC granule name '
                         'contains _M_); these are skipped by default')
@@ -149,7 +189,9 @@ def parseCommandLine():
                         'processing. Per-frame products must already exist.')
     parser.add_argument('--noGlobalFillIono', action='store_true',
                         help='Disable full-swath ionosphere gap fill; use '
-                        'per-frame fill only (default: global fill is on)')
+                        'per-frame fill only. (Global fill only runs when '
+                        '--sepIceRock or --debugIono is set; otherwise this '
+                        'flag has no effect.)')
     parser.add_argument('--retainIntermediateIono', action='store_true',
                         help='Keep per-frame unfilled and per-frame filled '
                         'offset iono files after global fill (useful for '
@@ -182,20 +224,41 @@ def parseCommandLine():
                         'already empties debug/ too).')
     parser.add_argument('-noPrompt', '--noPrompt', action='store_true',
                         help='Skip the confirmation prompt for --clean/--cleanDebug')
+    parser.add_argument('--bakeOnly', action='store_true',
+                        help='Skip all HDF5/RUNW/ROFF processing; just bake every '
+                        'existing virtual-frame VRT for this orbit (range.offsets.vrt, '
+                        'azimuth.offsets.vrt, offsets.range-azimuth.vrt, '
+                        '*ionosphereCorrection*.vrt) from a recursive multi-sub-frame '
+                        'VRT into a flat GeoTIFF + minimal VRT wrapper (see '
+                        'custom_buildvrtWithOffsets.bakeVrtInPlace). No-op per file if '
+                        'its .tif already exists. Much faster than reprocessing -- only '
+                        'useful for virtual frames built before this baking step was '
+                        'added to createVirtualFrameROFF/globalFillIonosphere; not '
+                        'needed for newly-built ones. Exits immediately afterward.')
+    parser.add_argument('--new', action='store_true',
+                        help='Skip any virtual frame whose product VRT already exists '
+                        '(*.correctedUnwrappedPhase.vrt, or *.cor.vrt for '
+                        '--correlationOnly); only build virtual frames that are new.')
     args = parser.parse_args()
     #
     params = {}
     for key in ['overWrite', 'overWritePhase', 'firstFrame', 'lastFrame',
+                'firstDate', 'lastDate',
                 'orbit1', 'allowMixedMode', 'virtualFrame', 'noMask',
                 'verbose', 'RUNWOnly', 'ompThreads', 'phaseDerivedIonosphere',
                 'outputAll', 'phaseThresh', 'noPhaseThreshPass', 'sepIceRock',
                 'sigmaAz', 'sigmaRg',
                 'correlationOnly', 'corrOnly', 'geodatsOnly',
-                'retainIntermediateIono', 'debugIono',
-                'clean', 'cleanDebug', 'noPrompt']:
+                'noGlobalFillIono', 'retainIntermediateIono', 'debugIono',
+                'clean', 'cleanDebug', 'noPrompt', 'bakeOnly', 'new']:
         params[key] = getattr(args, key)
+    # Preliminary globalFillIono from CLI only; main() recomputes it after
+    # merging the project.yaml sepIceRock flag (see below). phaseDerivedIonosphere
+    # used to be an enabler here, but in that mode the *.ionosphereCorrectionUnfilled*
+    # inputs globalFillIonosphere needs are never produced, so it only ever warned
+    # and returned -- dropped.
     params['globalFillIono'] = not args.noGlobalFillIono and (
-        bool(args.phaseDerivedIonosphere) or bool(args.debugIono) or bool(args.sepIceRock))
+        bool(args.debugIono) or bool(args.sepIceRock))
     #
     if args.verbose:
         params['stdout'], params['stderr'] = None, None
@@ -225,11 +288,25 @@ def splitFrameGroups(frames):
     return groups
 
 
+# A frame whose secondary date differs from its group's majority but whose
+# secondary timestamp is within this many seconds of a majority frame's
+# timestamp (with a matching secondaryOrbit) is a UTC-midnight calendar
+# rollover within one overpass, not a different acquisition -- see
+# splitGroupsBySecondaryEpoch(). Generously larger than any realistic
+# frame-to-frame acquisition gap within one contiguous pass, but orders of
+# magnitude smaller than a day, so it can't be confused with a genuinely
+# different repeat-pass acquisition that happens to be ~1 day apart (possible
+# on sensors other than NISAR -- do not infer a rollover from the date label
+# alone).
+ROLLOVER_MAX_ELAPSED_SECONDS = 600
+
+
 def splitGroupsBySecondaryEpoch(groups, frameSecondaryInfo):
     '''
     Further split each frame-number-contiguous group wherever a frame's actual
     secondary date (from frameSecondaryInfo, see getSecondaryOrbit()) disagrees
-    with the group's majority secondary date.
+    with the group's majority secondary date -- unless the disagreement is
+    just a UTC-midnight calendar rollover within the same overpass.
 
     A contiguous run of frame numbers can still span two different secondary
     acquisitions: if the intended-epoch secondary product was missing
@@ -240,31 +317,60 @@ def splitGroupsBySecondaryEpoch(groups, frameSecondaryInfo):
     state vectors with no warning -- see [[project_track131_rparams_sigma]].
     Splitting it into its own group lets assignVirtualFrameNumbers() give it
     its own virtual frame instead.
+
+    A frame-contiguous group can also span a UTC-midnight rollover within a
+    single, physically continuous overpass: frames acquired just before/after
+    midnight get different secondaryDate calendar labels despite being only
+    seconds apart in real time and sharing the same secondaryOrbit (seen on
+    track-98/1408 frame 53). This is not a different acquisition and must not
+    be split out. The two cases are told apart by actual elapsed time between
+    full timestamps (frameSecondaryInfo[...][5], a datetime), not by the size
+    of the date-label gap -- a date-label gap of exactly one day is NOT by
+    itself proof of a rollover, since other SAR sensors can have genuinely
+    different repeat-pass acquisitions only one day apart.
     '''
     splitGroups = []
     for group in groups:
-        dates = [frameSecondaryInfo[f][1] for f in group if f in frameSecondaryInfo]
-        if not dates:
+        infos = {f: frameSecondaryInfo[f] for f in group if f in frameSecondaryInfo}
+        if not infos:
             splitGroups.append(group)
             continue
-        majorityDate = Counter(dates).most_common(1)[0][0]
+        majorityDate = Counter(info[1] for info in infos.values()).most_common(1)[0][0]
+        majorityOrbit = Counter(info[0] for info in infos.values()).most_common(1)[0][0]
+        majorityDatetimes = [info[5] for info in infos.values() if info[1] == majorityDate]
+        referenceDatetime = majorityDatetimes[0] if majorityDatetimes else None
         subGroup = []
         for f in group:
             info = frameSecondaryInfo.get(f)
-            if info is not None and info[1] != majorityDate:
-                u.mywarning(
-                    f'Frame {f}: secondary date {info[1]} does not match the '
-                    f'majority secondary date {majorityDate} for its '
-                    f'frame-contiguous group -- splitting it into its own '
-                    f'virtual frame instead of merging it in (likely a '
-                    f'missing-acquisition fallback to a different repeat '
-                    f'cycle for this one frame).')
-                if subGroup:
-                    splitGroups.append(subGroup)
-                    subGroup = []
-                splitGroups.append([f])
-            else:
+            if info is None or info[1] == majorityDate:
                 subGroup.append(f)
+                continue
+            isRollover = False
+            if referenceDatetime is not None and info[0] == majorityOrbit:
+                elapsedSeconds = abs((info[5] - referenceDatetime).total_seconds())
+                isRollover = elapsedSeconds < ROLLOVER_MAX_ELAPSED_SECONDS
+            if isRollover:
+                u.myalert(
+                    f'Frame {f}: secondary date {info[1]} differs from the '
+                    f'majority secondary date {majorityDate} for its '
+                    f'frame-contiguous group, but its timestamp is only '
+                    f'{elapsedSeconds:.0f}s from a majority frame with the '
+                    f'same secondaryOrbit -- treating as a UTC-midnight '
+                    f'calendar rollover within the same overpass and merging '
+                    f'it normally.')
+                subGroup.append(f)
+                continue
+            u.mywarning(
+                f'Frame {f}: secondary date {info[1]} does not match the '
+                f'majority secondary date {majorityDate} for its '
+                f'frame-contiguous group -- splitting it into its own '
+                f'virtual frame instead of merging it in (likely a '
+                f'missing-acquisition fallback to a different repeat '
+                f'cycle for this one frame).')
+            if subGroup:
+                splitGroups.append(subGroup)
+                subGroup = []
+            splitGroups.append([f])
         if subGroup:
             splitGroups.append(subGroup)
     return splitGroups
@@ -386,15 +492,54 @@ def assignVirtualFrameNumbers(groups, orbit1, cwd='.'):
     return assignments
 
 
+def _dropOrphanVirtualFrames(orbit1, groupAssignments, cwd='.'):
+    '''After a full (re)build, remove any {orbit1}_0??? virtual-frame dir that is
+    NOT in this run's assignment AND whose frames are all covered by a kept
+    virtual frame -- i.e. a stale fragment left by an earlier, different grouping
+    (e.g. the 40/80 MHz mode-transition, where a frame's 24-day pair was split
+    into its own virtual frame before its 12-day pair arrived and folded it back
+    into the neighbours). The subset-coverage guard is essential: a dir whose
+    frames are NOT all covered -- under a --firstFrame/--lastFrame restriction,
+    or a genuinely separate pass -- is kept and only warned about, never deleted.
+    '''
+    keptVFs = {vf for _, vf in groupAssignments}
+    keptFrames = set()
+    for groupFrames, _ in groupAssignments:
+        keptFrames.update(groupFrames)
+    for vfDir in sorted(glob.glob(os.path.join(cwd, f'{orbit1}_0???'))):
+        vf = os.path.basename(vfDir).rsplit('_', 1)[1]
+        if vf in keptVFs:
+            continue
+        try:
+            with open(os.path.join(vfDir, 'frames.txt')) as fp:
+                dirFrames = {int(x) for x in fp.read().split() if x.strip().isdigit()}
+        except OSError:
+            dirFrames = set()
+        if dirFrames and dirFrames.issubset(keptFrames):
+            print(f'Removing orphan virtual frame {orbit1}_{vf} (frames '
+                  f'{sorted(dirFrames)} now covered by this run\'s frames)')
+            shutil.rmtree(vfDir, ignore_errors=True)
+        else:
+            u.mywarning(
+                f'Keeping {orbit1}_{vf}: frames '
+                f'{sorted(dirFrames - keptFrames) or "(none listed)"} are not '
+                'covered by this run\'s virtual frames (frame restriction, or a '
+                'separate pass) -- not removing')
+
+
 def getFrames(myArgs):
     '''
-        Get a sort list of the frames to process
+        Get a numerically sorted list of the frames to process
     '''
-    dirs = glob.glob(f'{myArgs["orbit1"]}_??') + \
-             glob.glob(f'{myArgs["orbit1"]}_1??') + \
-             glob.glob(f'{myArgs["orbit1"]}_2??')    
-    frames = [int(x.split('_')[-1])
-              for x in sorted(dirs)]
+    # Match any 1-3 digit frame suffix and sort numerically. The old
+    # digit-width globs (_??/_1??/_2??) + string sort mis-ordered groups
+    # spanning the 99<->100 boundary (100 sorted before 98) and never matched
+    # single-digit or 300-999 frames. Four-digit suffixes (_0???) are the
+    # virtual frames and stay excluded.
+    dirs = glob.glob(f'{myArgs["orbit1"]}_*')
+    suffixes = [os.path.basename(d).split('_')[-1] for d in dirs]
+    frames = sorted({int(s) for s in suffixes
+                     if s.isdigit() and len(s) <= 3})
     return [x for x in frames
             if myArgs['firstFrame'] <= x <= myArgs['lastFrame']]
 
@@ -426,9 +571,9 @@ def cleanFrames(myArgs, debugOnly=False):
     Frame directories are discovered by globbing {orbit1}_* directly rather than via
     getFrames(), so directories with unexpected/bad frame numbers (e.g. left over from a
     failed run) are caught too -- that's the whole point of --clean. "Well-formed" means
-    matching one of the three real-frame patterns getFrames() itself uses (_?? / _1?? /
-    _2??) or the four-digit leading-zero virtual-frame pattern used elsewhere in this
-    file and in readReferenceFrameSets() (_0???); anything else is "mislabeled".
+    a 1-3 digit numeric real-frame suffix (the same rule getFrames() uses) or the
+    four-digit leading-zero virtual-frame pattern used elsewhere in this file and in
+    readReferenceFrameSets() (_0???); anything else is "mislabeled".
 
     Parameters
     ----------
@@ -446,10 +591,16 @@ def cleanFrames(myArgs, debugOnly=False):
         listed individually (debug/ itself is never included -- it's emptied, not removed).
     '''
     orbit1 = myArgs['orbit1']
-    wellFormedDirs = set(
-        glob.glob(f'{orbit1}_??') + glob.glob(f'{orbit1}_1??') +
-        glob.glob(f'{orbit1}_2??') + glob.glob(f'{orbit1}_0???'))
     allDirs = sorted(glob.glob(f'{orbit1}_*'))
+
+    # Well-formed: 1-3 digit real-frame suffix (same rule as getFrames()) or
+    # the 4-digit zero-leading virtual-frame suffix (_0???).
+    def wellFormed(d):
+        suffix = d.split('_')[-1]
+        return suffix.isdigit() and (
+            len(suffix) <= 3 or (len(suffix) == 4 and suffix[0] == '0'))
+
+    wellFormedDirs = set(d for d in allDirs if wellFormed(d))
 
     buckets = {'normal': [], 'mislabeled': [], 'stale': [], 'debug': []}
 
@@ -480,6 +631,32 @@ def cleanFrames(myArgs, debugOnly=False):
                     buckets[bucket].append(f)
 
     return buckets
+
+
+# Virtual-frame-level VRTs that createVirtualFrameROFF/globalFillIonosphere build by
+# mosaicking physical sub-frame VRTs together (see custom_buildvrtWithOffsets.buildVrt)
+# -- the ones --bakeOnly retrofits for virtual frames built before baking was added there.
+_BAKE_FILE_PATTERNS = [
+    'range.offsets.vrt', 'azimuth.offsets.vrt', 'offsets.range-azimuth.vrt',
+    '*.ionosphereCorrection*.vrt',
+]
+
+
+def bakeOnlyFrames(myArgs):
+    '''
+    For --bakeOnly: glob virtual-frame directories for this orbit directly (same
+    {orbit1}_0??? pattern cleanFrames() uses), bake every matching VRT found in each
+    via bakeVrtInPlace(skipIfExists=True), and return the count baked/skipped.
+    '''
+    orbit1 = myArgs['orbit1']
+    frameDirs = sorted(glob.glob(f'{orbit1}_0???'))
+    nFound = 0
+    for d in frameDirs:
+        for pat in _BAKE_FILE_PATTERNS:
+            for vrtPath in sorted(glob.glob(os.path.join(d, pat))):
+                nFound += 1
+                bakeVrtInPlace(vrtPath, skipIfExists=True)
+    return nFound, len(frameDirs)
 
 
 def _removePath(path):
@@ -537,30 +714,35 @@ def getSecondaryOrbit(myArgs):
     '''
     Get first and second orbits.
 
-    Also records each frame's own secondary date AND its own bandwidth/looks
-    (read directly from that frame's own RUNW/ROFF product) in
+    Also records each frame's own secondary date/timestamp AND its own
+    bandwidth/looks (read directly from that frame's own RUNW/ROFF product) in
     myArgs['frameSecondaryInfo'] as
-    {frame: (secondaryOrbit, secondaryDate, NumberRangeLooks, NumberAzimuthLooks, bandwidth)}.
+    {frame: (secondaryOrbit, secondaryDate, NumberRangeLooks, NumberAzimuthLooks,
+              bandwidth, secondaryDatetime)}.
     A frame-number-contiguous run can still span two different secondary
     acquisitions if the intended-epoch secondary product was missing
     upstream for just one frame and NISAR processing substituted a different
     repeat cycle for it (seen on track-131/3517 frame 38, track-126/3685
     frame 51, track-16/3748 frame 35, track-58/3444 frame 44 -- secondaryOrbit
     was unchanged but secondaryDate jumped a full repeat cycle).
-    splitGroupsBySecondaryEpoch() uses the secondaryDate part of this map to
-    keep such a frame out of the virtual frame it would otherwise be merged
-    into. The same kind of run can also mix a frame acquired at a different
-    bandwidth (e.g. 40 vs 77 MHz, hence a different NumberRangeLooks) than its
-    neighbors -- the per-group refresh in main() uses the looks/bandwidth part
-    of this map so a split-out group gets its own correct pairinfo/sensor YAML
-    instead of inheriting whichever frame getSecondaryOrbit() found first.
+    splitGroupsBySecondaryEpoch() uses the secondaryDate/secondaryDatetime part
+    of this map to keep such a frame out of the virtual frame it would
+    otherwise be merged into, while distinguishing that case from a benign
+    UTC-midnight rollover within a single overpass (track-98/1408 frame 53 --
+    same secondaryOrbit, secondaryDate label off by one calendar day, but only
+    seconds apart in secondaryDatetime). The same kind of run can also mix a
+    frame acquired at a different bandwidth (e.g. 40 vs 77 MHz, hence a
+    different NumberRangeLooks) than its neighbors -- the per-group refresh in
+    main() uses the looks/bandwidth part of this map so a split-out group gets
+    its own correct pairinfo/sensor YAML instead of inheriting whichever frame
+    getSecondaryOrbit() found first.
     '''
     myArgs['frameSecondaryInfo'] = {}
     found = False
     for frame in myArgs['frames']:
         for product in ['RUNW', 'ROFF']:
             frameDir = f'{myArgs["orbit1"]}_{frame}'
-            files = glob.glob(f'{frameDir}/H5/NISAR*{product}*.h5')
+            files = sorted(glob.glob(f'{frameDir}/H5/NISAR*{product}*.h5'))
             if len(files) < 1:
                 continue
             myProd = getattr(nisarhdf, f'nisar{product}HDF', None)()
@@ -571,7 +753,7 @@ def getSecondaryOrbit(myArgs):
                 myArgs['frameSecondaryInfo'][frame] = \
                     (myProd.secondaryOrbit, myProd.secondaryDate,
                      myProd.NumberRangeLooks, myProd.NumberAzimuthLooks,
-                     frameBandwidth)
+                     frameBandwidth, myProd.secondaryDatetime)
                 if not found:
                     myArgs['orbit2'] = myProd.secondaryOrbit
                     myArgs['bandwidth'] = frameBandwidth
@@ -681,20 +863,107 @@ def copy_sensor_yaml(myArgs, dest_dir):
                 u.mywarning(f'Failed writing YAML {dst}: {e}')
 
 
+def _pairBaselineDays(h5Path):
+    '''Temporal baseline |date2 - date1| in whole days from a NISAR product
+    filename (date1Sstart is field 11, date2Sstart is field 13, 0-based).
+    ROUNDED to the nearest day, not truncated: NISAR's 12-day repeat puts the
+    secondary ~12/24/... days out but at a slightly different time-of-day, so
+    timedelta.days would truncate a true 12-day pair (secondary 1 s earlier) to
+    11. Returns a large sentinel if the name can't be parsed, so a parseable
+    pair is always preferred.'''
+    try:
+        parts = os.path.basename(h5Path).split('_')
+        d1 = datetime.datetime.strptime(parts[11], '%Y%m%dT%H%M%S')
+        d2 = datetime.datetime.strptime(parts[13], '%Y%m%dT%H%M%S')
+        return round(abs((d2 - d1).total_seconds()) / 86400.0)
+    except (IndexError, ValueError):
+        return 10 ** 6
+
+
 def getProductH5(product,  frame, myArgs):
     '''
-    Get product for frame
+    Get product for frame. When a frame has more than one product (e.g. a
+    short- and a long-baseline pair from the 40/80 MHz mode-transition period),
+    pick the SHORTEST temporal baseline -- the same criterion FileNISARProducts
+    uses -- so every frame of a virtual frame lands on the same (most recent)
+    secondary acquisition. Relying on sorted()[0] here was only coincidentally
+    right (the shorter pair's cycle field happened to sort first).
     '''
     inputDir = myArgs['inputDir']
     productDir = f'{inputDir}/{myArgs["orbit1"]}_{frame}/H5/NISAR*{product}*h5'
-    myProduct = glob.glob(productDir)
+    myProduct = sorted(glob.glob(productDir))
     if len(myProduct) == 0:
         u.mywarning(f'There are no {product} products in {productDir}')
         return None
     if len(myProduct) > 1:
+        best = min(myProduct, key=_pairBaselineDays)
         u.mywarning(
-            f'Warning more than one {product} products in {productDir}')
+            f'More than one {product} product in {productDir}; using the '
+            f'shortest-baseline pair ({_pairBaselineDays(best)} d) '
+            f'{os.path.basename(best)}')
+        return best
     return myProduct[0]
+
+
+def _secondaryDate(s):
+    '''Parse a secondary date token ('YYYY-MM-DD' as written to pairinfo, or a
+    'YYYYMMDDTHHMMSS' filename field) to a date; None if unparseable.'''
+    for fmt in ('%Y-%m-%d', '%Y%m%dT%H%M%S'):
+        try:
+            return datetime.datetime.strptime(s, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def _frameSecondaryStale(frameDir, runwFile):
+    '''True if this frame should be rebuilt because runwFile (the now-selected,
+    shortest-baseline product) is a STRICT IMPROVEMENT over the pair the frame
+    was previously built from -- i.e. a strictly shorter temporal baseline.
+
+    Supersede only toward shorter baselines: a 12-day pair replaces a 24-day
+    pair, never the reverse. If the frame already holds a good short-baseline
+    pair and only a longer-baseline granule is now in the archive -- e.g. the
+    short pair's 40 MHz granule was withdrawn during the 40/80 MHz mode
+    transition, so getProductH5 has nothing shorter left to return -- keep the
+    existing products rather than downgrading (12-day always has priority over
+    24-day). Conservative: never clears a frame unless the new pair is a
+    confirmed, parseable, strictly-shorter baseline.'''
+    pinfo = sorted(glob.glob(os.path.join(frameDir, '*.pairinfo')))
+    if not pinfo:
+        return False
+    try:
+        priorFields = open(pinfo[0]).read().split()
+        priorRef = _secondaryDate(priorFields[2])
+        priorSec = _secondaryDate(priorFields[3])
+        curParts = os.path.basename(runwFile).split('_')
+        curRef = _secondaryDate(curParts[11])
+        curSec = _secondaryDate(curParts[13])
+    except (IndexError, OSError):
+        return False
+    if None in (priorRef, priorSec, curRef, curSec):
+        return False
+    if priorSec == curSec:
+        return False   # same secondary -- nothing changed
+    # Only rebuild when the newly-selected pair has a strictly shorter baseline;
+    # never downgrade an already-processed shorter pair to a longer one.
+    return abs((curSec - curRef).days) < abs((priorSec - priorRef).days)
+
+
+def _clearStaleFrameProducts(frameDir):
+    '''Remove a real frame dir's SetupNISAR-built products (keeping H5/) so the
+    frame is fully rebuilt from the now-selected secondary. Reuses the --clean
+    per-frame patterns so the two stay in sync.'''
+    for sub in _CLEAN_DIR_PATTERNS:
+        p = os.path.join(frameDir, sub)
+        if os.path.isdir(p):
+            shutil.rmtree(p, ignore_errors=True)
+    for pat in _CLEAN_FILE_PATTERNS:
+        for f in glob.glob(os.path.join(frameDir, pat)):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
 
 
 def variableSmoothingArgs(myArgs):
@@ -794,7 +1063,7 @@ def processFrameRUNW(frame, myArgs):
     #
     if not myArgs['allowMixedMode']:
         if isMixedMode(myRUNW):
-            print('Skipping mixed mode {RUNWFile}')
+            print(f'Skipping mixed mode {RUNWFile}')
             return True
     #
     outputDir = f'{myArgs["outputDir"]}/{orbit1}_{frame}'
@@ -809,6 +1078,17 @@ def processFrameRUNW(frame, myArgs):
     else:
         # Default (--noPhase --noIon): geodat is always written
         missing = not os.path.exists(geodat)
+    # Staleness: getProductH5 now returns the shortest-baseline pair, so a frame
+    # an earlier run processed against a longer-baseline (24-day) secondary --
+    # before its 12-day pair arrived, during the 40/80 MHz mode transition -- has
+    # a stale geodat that would mix secondaries in the virtual-frame merge and
+    # crash sortAndUniqueSV. Detect it and clear the frame so it rebuilds.
+    if (not missing and not (myArgs['overWrite'] or myArgs['overWritePhase'])
+            and _frameSecondaryStale(outputDir, RUNWFile)):
+        print(f'{orbit1}_{frame}: secondary changed (a shorter-baseline pair is '
+              'now available); clearing stale products and rebuilding')
+        _clearStaleFrameProducts(outputDir)
+        missing = True
     if missing or myArgs['overWrite'] or myArgs['overWritePhase']:
         command = ["RUNWtoGrimp",
                    "--frame", str(frame),
@@ -971,6 +1251,75 @@ def getPolygon(geodat):
     return dict(zip(['ll', 'ul', 'ur', 'lr'], c))
 
 
+def mergeSquintAnglePolynomial(geos, geoMerged, nRangeSamples=9,
+                               nAzimuthSamples=9):
+    '''
+    Refit a single squintAnglePolynomial for the merged virtual frame from
+    the per-sub-frame fits. Each sub-frame's polynomial is only valid over
+    its own local azimuth window, so coefficients can't be averaged --
+    instead resample each sub-frame's fitted surface onto the merged range
+    span and that sub-frame's own azimuth span, pool the samples, and refit
+    over the combined domain (same "redistribute onto one common reference"
+    approach as mergeStateVectors). No-op for the secondary image, which
+    never has a real fit -- see nisarhdf CLAUDE.md. Also a no-op (not an
+    error) for pre-squint geodats where the key is absent entirely rather
+    than present-and-None: old on-disk per-frame geodats written before this
+    feature existed predate the key, and --geodatsOnly re-merges whatever
+    per-frame geodats already exist without regenerating them.
+    '''
+    if geoMerged['properties'].get('squintAnglePolynomial') is None:
+        return
+    rangeSamples = np.linspace(geoMerged['properties']['MLNearRange'],
+                               geoMerged['properties']['MLFarRange'],
+                               nRangeSamples)
+    allR, allA, allSquint = [], [], []
+    for geo in geos.values():
+        props = geo['properties']
+        poly = props.get('squintAnglePolynomial')
+        if poly is None:
+            continue
+        zeroDopplerTimeSpacing = props['NumberAzimuthLooks'] / props['PRF']
+        azimuthSpan = (props['MLAzimuthSize'] - 1) * zeroDopplerTimeSpacing
+        aMid = poly['refAzimuthTime']
+        azimuthSamples = np.linspace(aMid - azimuthSpan / 2,
+                                     aMid + azimuthSpan / 2,
+                                     nAzimuthSamples)
+        R, A = np.meshgrid(rangeSamples, azimuthSamples, indexing='ij')
+        c = poly['coefficients']
+        rPrime = R - poly['refRange']
+        aPrime = A - aMid
+        squint = (c[0] + c[1] * rPrime + c[2] * aPrime + c[3] * aPrime**2
+                 + c[4] * rPrime * aPrime + c[5] * rPrime**2)
+        allR.append(R.flatten())
+        allA.append(A.flatten())
+        allSquint.append(squint.flatten())
+    allR = np.concatenate(allR)
+    allA = np.concatenate(allA)
+    allSquint = np.concatenate(allSquint)
+    refRange = geoMerged['properties']['MLCenterRange']
+    refAzimuthTime = 0.5 * (allA.min() + allA.max())
+    rPrime = allR - refRange
+    aPrime = allA - refAzimuthTime
+    designMatrix = np.array([rPrime * 0 + 1, rPrime, aPrime, aPrime**2,
+                             rPrime * aPrime, rPrime**2]).T
+    coefficients, _, _, _ = np.linalg.lstsq(designMatrix, allSquint,
+                                            rcond=None)
+    geoMerged['properties']['squintAnglePolynomial'] = {
+        'coefficients': list(coefficients),
+        'refRange': refRange,
+        'refAzimuthTime': refAzimuthTime,
+        }
+    # Note: the legacy scalar Squint field is left untouched (not set here)
+    # -- older code uses it for a deskew time delay to zero Doppler, a
+    # different quantity from this angle fit, and must not be repurposed.
+    # Flat top-level fields mirroring squintAnglePolynomial, since GDAL's
+    # OGR GeoJSON driver (used by mosaic3d's C-side reader) can't read
+    # nested objects -- only flat scalars/lists, like state vectors.
+    geoMerged['properties']['squintCoefficients'] = list(coefficients)
+    geoMerged['properties']['squintRefRange'] = refRange
+    geoMerged['properties']['squintRefAzimuthTime'] = refAzimuthTime
+
+
 def mergedGeodat(geodatFiles, vrtFile, secondary=False):
     # Save first and last frame
     firstFrame = sorted(list(geodatFiles))[0].split('/')[-2].split('_')[-1]
@@ -1032,36 +1381,71 @@ def mergedGeodat(geodatFiles, vrtFile, secondary=False):
         # nothing inside those bounds regardless of real data coverage.
         geodatMerged['properties']['MLAzimuthSize'] = na
         # MLNearRange/MLFarRange genuinely are independent physical
-        # quantities (slant range to first sample depends on orbit/baseline),
-        # so they correctly come from the secondary's own geodats, not the
-        # (primary-aligned) output grid -- the deep copy above from
-        # geodats[firstFrame] already has the right, mutually-consistent
-        # values for them and MLRangeSize -- just check the other frames
-        # agree on MLNearRange/MLRangeSize.
+        # quantities (slant range to first sample depends on orbit/baseline)
+        # -- but, like the primary's own near/far range, they can legitimately
+        # vary frame-to-frame within the same merge (e.g. a slight swath-start
+        # shift between physical frames). Using firstFrame's value as a
+        # stand-in for the whole merge (the previous approach) is wrong
+        # whenever that variation is real: it silently ignores whichever
+        # frames don't match firstFrame instead of covering their range too.
+        # Mirror the primary branch's logic instead -- there, the VRT
+        # geotransform's near/far range reflects min(near)/max(far) across
+        # the contributing primary frames -- by computing secondary's own
+        # min(near)/max(far) directly from its own per-frame geodats, then
+        # deriving MLRangeSize/MLCenterRange consistently from that span
+        # using the (frame-invariant) per-pixel spacing. This one rule
+        # handles both cases correctly without needing to detect which one
+        # applies: when secondary's per-frame values vary in lockstep with
+        # primary's (e.g. track-25/3757_0000, frames 51 vs 52-55), min/max
+        # over secondary's own values comes out numerically equal to
+        # min/max over primary's own values, so the merged secondary
+        # naturally ends up equal to the merged primary; when secondary has
+        # a genuinely different epoch/geometry, the same rule correctly
+        # reflects secondary's own span, independent of primary.
+        # near, spacing, and size fully determine far (verified: primary's
+        # own x0 + (nr-0.5)*pixelWidth is exactly equivalent to
+        # nearRange + (size-1)*pixelWidth) -- so derive far from near+size
+        # rather than sourcing it independently as max(far). Using max(far)
+        # directly from the per-frame fields can disagree by a fraction of a
+        # pixel with whatever size the near/far span rounds to, leaving
+        # near/far/size mutually inconsistent for the merged secondary in a
+        # way primary's VRT-derived fields never are.
+        mlPixelSpacing = (geodats[f'{firstFrame}']['properties']['SLCRangePixelSize']
+                          * geodats[f'{firstFrame}']['properties']['NumberRangeLooks'])
+        mlNearRangeSecondary = min(geo['properties']['MLNearRange']
+                                   for geo in geodats.values())
+        _maxFarRange = max(geo['properties']['MLFarRange']
+                           for geo in geodats.values())
+        mlRangeSizeSecondary = round(
+            (_maxFarRange - mlNearRangeSecondary) / mlPixelSpacing) + 1
+        mlFarRangeSecondary = (mlNearRangeSecondary
+                               + (mlRangeSizeSecondary - 1) * mlPixelSpacing)
+        geodatMerged['properties']['MLNearRange'] = mlNearRangeSecondary
+        geodatMerged['properties']['MLFarRange'] = mlFarRangeSecondary
+        geodatMerged['properties']['MLCenterRange'] = \
+            (mlNearRangeSecondary + mlFarRangeSecondary) / 2.0
+        geodatMerged['properties']['MLRangeSize'] = mlRangeSizeSecondary
+
         firstNearRange = geodats[f'{firstFrame}']['properties']['MLNearRange']
-        firstRangeSize = geodats[f'{firstFrame}']['properties']['MLRangeSize']
         for frame, geo in geodats.items():
             frameNearRange = geo['properties']['MLNearRange']
-            frameRangeSize = geo['properties']['MLRangeSize']
             if abs(frameNearRange - firstNearRange) > 1.0:
                 u.mywarning(
                     f'mergedGeodat: secondary MLNearRange for frame {frame} '
                     f'({frameNearRange}) differs from frame {firstFrame} '
                     f'({firstNearRange}) by '
-                    f'{frameNearRange - firstNearRange:.3f} m -- using '
-                    f'frame {firstFrame}\'s value for the merged secondary '
-                    f'geodat')
-            if frameRangeSize != firstRangeSize:
-                u.mywarning(
-                    f'mergedGeodat: secondary MLRangeSize for frame {frame} '
-                    f'({frameRangeSize}) differs from frame {firstFrame} '
-                    f'({firstRangeSize}) -- using frame {firstFrame}\'s '
-                    f'value for the merged secondary geodat')
+                    f'{frameNearRange - firstNearRange:.3f} m -- merged '
+                    f'secondary MLNearRange/MLFarRange/MLRangeSize now span '
+                    f'the union of all frames ({mlNearRangeSecondary:.3f} to '
+                    f'{mlFarRangeSecondary:.3f}, size={mlRangeSizeSecondary})')
+    mergeSquintAnglePolynomial(geodats, geodatMerged)
     # Return result
     geojsonString = nisarhdf.formatGeojson(geojson.dumps(geodatMerged))
-    # Remove existing file to avoid problems with links
     geodatFileName = os.path.join(os.path.dirname(vrtFile),
                                   os.path.basename(geodatFiles[0]))
+    # Remove existing file to avoid problems with links
+    if os.path.exists(geodatFileName):
+        os.remove(geodatFileName)
     # Save the file
     with open(geodatFileName, 'w') as fpGeojson:
         print(geojsonString, file=fpGeojson)
@@ -1084,6 +1468,25 @@ def writePairInfo(myArgs):
               f'{myArgs["secondaryDateTime"]}  '
               f'{myArgs["NumberRangeLooks"]}  {myArgs["NumberAzimuthLooks"]}',
               file=fp)
+
+
+def _selectVrtBySecondary(vrtList, secondaryOrbit, frame):
+    '''Resolve a sub-frame product glob that returned more than one VRT by
+    picking the one whose secondary orbit matches this virtual frame's pairing.
+
+    A sub-frame dir can hold products for more than one secondary -- e.g. a
+    stale 24-day product left beside the intended 12-day one after a 40/80 MHz
+    mode-transition reprocess spilled the whole orbit's longer-baseline pair
+    across every sub-frame. The VRT filename embeds '.{secondaryOrbit}_{frame}.',
+    so filter on the group's own secondary (myArgs['orbit2'], already split-
+    corrected by splitGroupsBySecondaryEpoch) rather than dropping the sub-frame
+    from the merge. Returns the input unchanged if the filter does not resolve to
+    exactly one, so the caller's existing missing/ambiguous warning still fires.'''
+    if len(vrtList) <= 1 or secondaryOrbit is None:
+        return vrtList
+    matched = [v for v in vrtList
+               if f'.{secondaryOrbit}_{frame}.' in os.path.basename(v)]
+    return matched if len(matched) == 1 else vrtList
 
 
 def createVirtualFrameRUNW(myArgs):
@@ -1166,29 +1569,49 @@ def createVirtualFrameRUNW(myArgs):
             run(['custom_buildvrtWithOffsets', '--overWrite', radiusVrt] + radiusFiles)
 
     # (glob suffix, use --offsets, label, save as ionosphereRangeOffsetCorrection)
-    products = [
-        ('*.correctedUnwrappedPhase.vrt',    True,  'correctedUnwrappedPhase',    False),
-        ('*.cor.vrt',                         False, 'cor',                         False),
-        ('*.ionosphereCorrection.vrt',        True,  'ionosphereCorrection',        False),
-        ('*.ionosphereCorrection.offset.vrt', True,  'ionosphereCorrection.offset', True),
-    ]
-    if myArgs.get('globalFillIono'):
-        # Global fill replaces both the per-frame-filled phase and offset VRTs;
-        # skip assembling them here and add the sparse unfilled versions so
-        # globalFillIonosphere can do a single full-swath fill pass on each.
-        products = [(g, o, l, r) for g, o, l, r in products
-                    if l not in ('ionosphereCorrection', 'ionosphereCorrection.offset')]
-        products.append(
-            ('*.ionosphereCorrectionUnfilled.vrt', True,
-             'ionosphereCorrectionUnfilled', False))
-        products.append(
-            ('*.ionosphereCorrectionUnfilled.offset.vrt', True,
-             'ionosphereCorrectionUnfilled.offset', False))
+    if myArgs.get('phaseDerivedIonosphere'):
+        # Legacy phase-derived path: RUNWtoGrimp itself writes the interpolated
+        # phase (*.uw.interp.vrt) and phase-derived iono rangeOffset VRTs;
+        # estimateIonosphere never runs, so no *.correctedUnwrappedPhase.vrt or
+        # *.ionosphereCorrection*.vrt exist in this mode. Keep the
+        # 'correctedUnwrappedPhase' label so the phase.uw.vrt symlink and
+        # geodat merge below work unchanged. Sign convention: RUNWtoGrimp's
+        # radiansToPixels = -lambda/(4*pi*slp) converts the ionosphere phase
+        # screen to a correction (correction = -ionosphere), so, like the
+        # estimateIonosphere products, consumers ADD it -- see
+        # Documents/estimateIonosphere.md "Background and equations".
+        products = [
+            ('*.uw.interp.vrt',              True,  'correctedUnwrappedPhase', False),
+            ('*.cor.vrt',                    False, 'cor',                     False),
+            ('*.ion.filt.rangeOffset.vrt',   True,  'ionosphereCorrection.offset', True),
+            ('*.ion.unfilt.rangeOffset.vrt', True,
+             'ionosphereCorrection.offset.unfilt', False),
+        ]
+    else:
+        products = [
+            ('*.correctedUnwrappedPhase.vrt',    True,  'correctedUnwrappedPhase',    False),
+            ('*.cor.vrt',                         False, 'cor',                         False),
+            ('*.ionosphereCorrection.vrt',        True,  'ionosphereCorrection',        False),
+            ('*.ionosphereCorrection.offset.vrt', True,  'ionosphereCorrection.offset', True),
+        ]
+        if myArgs.get('globalFillIono'):
+            # Global fill replaces both the per-frame-filled phase and offset VRTs;
+            # skip assembling them here and add the sparse unfilled versions so
+            # globalFillIonosphere can do a single full-swath fill pass on each.
+            products = [(g, o, l, r) for g, o, l, r in products
+                        if l not in ('ionosphereCorrection', 'ionosphereCorrection.offset')]
+            products.append(
+                ('*.ionosphereCorrectionUnfilled.vrt', True,
+                 'ionosphereCorrectionUnfilled', False))
+            products.append(
+                ('*.ionosphereCorrectionUnfilled.offset.vrt', True,
+                 'ionosphereCorrectionUnfilled.offset', False))
     for globPattern, useOffsets, label, isIonoRangeOffset in products:
         # Find files
         myFiles = []
         for frame in myArgs['frames']:
             myFile = glob.glob(f'{orbit}_{frame}/{globPattern}')
+            myFile = _selectVrtBySecondary(myFile, myArgs.get('orbit2'), frame)
             if len(myFile) == 1:
                 myFiles += myFile
             else:
@@ -1239,6 +1662,10 @@ def createVirtualFrameRUNW(myArgs):
             os.remove(phase_link)
         os.symlink(target, phase_link)
     # Now create geodats
+    if 'correctedUnwrappedPhase' not in virtualVRTs:
+        u.mywarning('createVirtualFrameRUNW: no phase product assembled for '
+                    f'{orbit}_{virtualFrame}; skipping merged geodats')
+        return
     mergedGeodat(myArgs['geodat1'], virtualVRTs['correctedUnwrappedPhase'])
     mergedGeodat(myArgs['geodat2'], virtualVRTs['correctedUnwrappedPhase'],
                 secondary=True)
@@ -1308,6 +1735,7 @@ def createVirtualFrameROFF(myArgs):
         for frame in myArgs['frames']:
             # print(frame, f'{orbit}_{frame}/*.{key}.vrt')
             myFile = glob.glob(f'{orbit}_{frame}/{myFileType}')
+            myFile = _selectVrtBySecondary(myFile, myArgs.get('orbit2'), frame)
             # print(myFile)
             if len(myFile) == 1:
                 myFiles += myFile
@@ -1343,11 +1771,17 @@ def createVirtualFrameROFF(myArgs):
         if not os.path.exists(virtualVRTs[myFileType]):
             open(failFile, 'w').close()
     #
-    ds = gdal.Open(f'{frameDir}/range.offsets.vrt' , gdal.GA_Update)
+    rangeOffsetsVrt = f'{frameDir}/range.offsets.vrt'
     if 'ionosphereRangeOffsetCorrection' in myArgs:
-        ds.SetMetadataItem("ionosphereRangeOffsetCorrection",
-                       myArgs['ionosphereRangeOffsetCorrection'])
-        ds = None  # flush and close
+        if os.path.exists(rangeOffsetsVrt):
+            ds = gdal.Open(rangeOffsetsVrt, gdal.GA_Update)
+            ds.SetMetadataItem("ionosphereRangeOffsetCorrection",
+                               myArgs['ionosphereRangeOffsetCorrection'])
+            ds = None  # flush and close
+        else:
+            u.mywarning(f'createVirtualFrameROFF: {rangeOffsetsVrt} was not '
+                        'built; cannot stamp ionosphereRangeOffsetCorrection '
+                        'metadata')
 
 
 def _readIonosphereParams(myArgs):
@@ -1355,8 +1789,8 @@ def _readIonosphereParams(myArgs):
     orbit = myArgs['orbit1']
     for frame in myArgs['frames']:
         frameDir = f'{orbit}_{frame}'
-        h5Files = (glob.glob(f'{frameDir}/H5/NISAR*RUNW*.h5') or
-                   glob.glob(f'{frameDir}/NISAR*RUNW*.h5'))
+        h5Files = (sorted(glob.glob(f'{frameDir}/H5/NISAR*RUNW*.h5')) or
+                   sorted(glob.glob(f'{frameDir}/NISAR*RUNW*.h5')))
         if not h5Files:
             continue
         try:
@@ -1386,7 +1820,7 @@ def globalFillIonosphere(myArgs, sigmaAz=10.0, sigmaRng=30.0):
     frameDir = f'{myArgs["outputDir"]}/{orbit}_{virtualFrame}'
 
     # --- locate assembled sparse offset-grid iono VRT ---
-    unfilledVrts = glob.glob(f'{frameDir}/*.ionosphereCorrectionUnfilled.offset.vrt')
+    unfilledVrts = sorted(glob.glob(f'{frameDir}/*.ionosphereCorrectionUnfilled.offset.vrt'))
     if not unfilledVrts:
         u.mywarning('globalFillIonosphere: no unfilled offset iono VRT found, skipping')
         return
@@ -1424,7 +1858,7 @@ def globalFillIonosphere(myArgs, sigmaAz=10.0, sigmaRng=30.0):
     memRunwDs = None
     runwProjWkt = ''
     perFrameRunwVrts = []
-    unfilledRunwVrts = glob.glob(f'{frameDir}/*.ionosphereCorrectionUnfilled.vrt')
+    unfilledRunwVrts = sorted(glob.glob(f'{frameDir}/*.ionosphereCorrectionUnfilled.vrt'))
     if unfilledRunwVrts:
         dsR = gdal.Open(unfilledRunwVrts[0])
         bandR = dsR.GetRasterBand(1)
@@ -1452,8 +1886,8 @@ def globalFillIonosphere(myArgs, sigmaAz=10.0, sigmaRng=30.0):
             memRunwDs.GetRasterBand(1).WriteArray(filledRunw)
             memRunwDs.GetRasterBand(1).SetNoDataValue(float('nan'))
             for frame in myArgs['frames']:
-                unfilledFrameTifs = glob.glob(
-                    f'{orbit}_{frame}/*.ionosphereCorrectionUnfilled.tif')
+                unfilledFrameTifs = sorted(glob.glob(
+                    f'{orbit}_{frame}/*.ionosphereCorrectionUnfilled.tif'))
                 if not unfilledFrameTifs:
                     u.mywarning(
                         f'globalFillIonosphere: no unfilled RUNW tif for {orbit}_{frame}')
@@ -1503,7 +1937,21 @@ def globalFillIonosphere(myArgs, sigmaAz=10.0, sigmaRng=30.0):
             'globalFillIonosphere: no unfilled RUNW iono VRT found, skipping phase fill')
 
     # --- ice-free pre-fill / sepIceRock ice-anchored bias + rock-truth seeding ---
-    if myArgs.get('sepIceRock'):
+    # Both branches below key off offsetSims/offsets.geom.mask.vrt assuming it
+    # carries genuine 0=water/1=rock/2=ice classes. That's only true when the
+    # region defines icerockwatermask (currently Greenland only) -- otherwise
+    # ROFFtoGrimp falls back to the plain land/sea mask for offsets.geom, which
+    # would be silently misread as rock/ice here. Gate on the region instead of
+    # file-existence to avoid that.
+    _regionFile = myArgs.get('regionFile')
+    _hasIceRockMask = (_regionFile is not None and
+                       sarfunc.defaultRegionDefs(None, regionFile=_regionFile)
+                       .iceRockWaterMask() is not None)
+    if not _hasIceRockMask:
+        print('\033[1;34mWARNING globalFillIonosphere: icerockwatermask not defined '
+              'for this region -- ice/rock pre-fill and sepIceRock anchoring not '
+              'applicable, skipping\033[0m')
+    elif myArgs.get('sepIceRock'):
         # Ice pixels (mask==2): compare each pixel's own measured range offset
         # plus its own ice-derived ionosphere estimate against the
         # velocity-inclusive simulation (offsets.velocity, NOT offsets.geom --
@@ -1774,7 +2222,7 @@ def globalFillIonosphere(myArgs, sigmaAz=10.0, sigmaRng=30.0):
             roffProj = projWkt
 
         # Derive output name from the per-frame ionosphereCorrection.offset.vrt
-        existingOffVrts = glob.glob(f'{orbit}_{frame}/*.ionosphereCorrection.offset.vrt')
+        existingOffVrts = sorted(glob.glob(f'{orbit}_{frame}/*.ionosphereCorrection.offset.vrt'))
         if not existingOffVrts:
             u.mywarning(f'globalFillIonosphere: no offset vrt for {orbit}_{frame}')
             continue
@@ -1887,8 +2335,8 @@ def globalFillIonosphere(myArgs, sigmaAz=10.0, sigmaRng=30.0):
             rNcols = roffDs.RasterXSize
             rNrows = roffDs.RasterYSize
             roffDs = None
-            existingGfVrts = glob.glob(
-                f'{orbit}_{frame}/*.ionosphereCorrection.globalFill.offset.vrt')
+            existingGfVrts = sorted(glob.glob(
+                f'{orbit}_{frame}/*.ionosphereCorrection.globalFill.offset.vrt'))
             if not existingGfVrts:
                 continue
             pbDebugDir = f'{orbit}_{frame}/debug'
@@ -2091,7 +2539,7 @@ def createVirtualFrameCorr(myArgs):
     virtualFrame = myArgs['virtualFrame']
     frameDir = f'{myArgs["outputDir"]}/{orbit}_{virtualFrame}'
     if myArgs.get('geodatsOnly'):
-        existingVrts = glob.glob(f'{frameDir}/*.cor.vrt')
+        existingVrts = sorted(glob.glob(f'{frameDir}/*.cor.vrt'))
         if not existingVrts:
             u.mywarning(f'createVirtualFrameCorr: --geodatsOnly requested but no '
                        f'existing .cor.vrt found in {frameDir} -- skipping')
@@ -2156,8 +2604,8 @@ def processFramePow(frame, myArgs):
         if not os.path.exists(geodatFile):
             u.myerror(f'Mising {geodatFile} for powFile')
         return
-    elif len(powFiles) == 1:
-        u.myerror(f'To many pow files {powFiles}')    
+    elif len(powFiles) > 1:
+        u.myerror(f'Too many pow files {powFiles}')
     
 def createVirtualFramePower(myArgs):
     if not myArgs['pow']:
@@ -2202,13 +2650,23 @@ def main():
                               and not myArgs.get('clean'))
         confirmAndRemove(buckets, myArgs.get('noPrompt'))
         return
-    # Read optional regionFile from ../project.yaml
+    if myArgs.get('bakeOnly'):
+        print(f'\n=== Baking existing virtual-frame VRTs for orbit {myArgs["orbit1"]} ===')
+        nFound, nFrameDirs = bakeOnlyFrames(myArgs)
+        print(f'Checked {nFrameDirs} virtual-frame directories, {nFound} VRTs found '
+              f'(already-baked ones skipped).')
+        return
+    # Read optional regionFile from ../project.yaml. Projects key this as
+    # either 'regionFile' or 'region' (the latter holding a path to a region
+    # YAML, not a bare region code -- e.g. Antarctica80/project.yaml and
+    # newGreenlandProject/project.yaml both use 'region'); accept either,
+    # matching setupNISARTracks.py's proj.get('region') or proj.get('regionFile').
     myArgs['regionFile'] = None
     projectYaml = '../project.yaml'
     if os.path.exists(projectYaml):
         with open(projectYaml) as _fp:
             _proj = yaml.safe_load(_fp) or {}
-        myArgs['regionFile'] = _proj.get('regionFile', None)
+        myArgs['regionFile'] = _proj.get('regionFile') or _proj.get('region', None)
         if myArgs['regionFile']:
             print(f'regionFile from {projectYaml}: {myArgs["regionFile"]}')
     # Read optional verticalCorrection from the region file, passed through
@@ -2243,6 +2701,39 @@ def main():
                   f'{myArgs["minTol"]} percentSpeed={myArgs["percentSpeed"]} maxTol='
                   f'{myArgs["maxTol"]} noVariableSmoothing='
                   f'{myArgs["noVariableSmoothing"]}')
+    # Read optional ionosphere maskVel velocity-gate params from ../project.yaml,
+    # passed through to estimateIonosphere. velThresh is the base slow-pixel
+    # threshold; on Antarctic (EPSG 3031) frames whose largest connected component
+    # is >= largeCCFraction of the scene (smooth fast shelves that unwrap well),
+    # highVelThresh is used instead so those pixels can still anchor the iono fit.
+    # None => estimateIonosphere's own defaults (100 / 1200 / 0.20).
+    ionoVelDefaults = {'velThresh': None, 'highVelThresh': None,
+                       'largeCCFraction': None}
+    myArgs.update(ionoVelDefaults)
+    if os.path.exists(projectYaml):
+        with open(projectYaml) as _fp:
+            _proj = yaml.safe_load(_fp) or {}
+        for key in ionoVelDefaults:
+            myArgs[key] = _proj.get(key, None)
+        if any(myArgs[k] is not None for k in ionoVelDefaults):
+            print(f'ionosphere maskVel gate from {projectYaml}: velThresh='
+                  f'{myArgs["velThresh"]} highVelThresh={myArgs["highVelThresh"]} '
+                  f'largeCCFraction={myArgs["largeCCFraction"]}')
+    # Read optional sepIceRock flag from ../project.yaml. sepIceRock selects the
+    # ice-anchored / rock-seeded ionosphere path (and enables the global fill).
+    # It is region-dependent -- enabled for Greenland, disabled for Antarctica for
+    # now -- so it belongs in project.yaml rather than being passed per run. Default
+    # False; the --sepIceRock CLI flag still forces it on. globalFillIono depends on
+    # the merged value, so recompute it here.
+    if os.path.exists(projectYaml):
+        with open(projectYaml) as _fp:
+            _proj = yaml.safe_load(_fp) or {}
+        if _proj.get('sepIceRock'):
+            myArgs['sepIceRock'] = True
+    myArgs['globalFillIono'] = (not myArgs['noGlobalFillIono']) and (
+        bool(myArgs['debugIono']) or bool(myArgs['sepIceRock']))
+    if myArgs['sepIceRock']:
+        print(f'sepIceRock enabled (from {projectYaml} or --sepIceRock)')
     # Get list of frames
     myArgs['frames'] = getFrames(myArgs)
     print('Frames: ', myArgs['frames'])
@@ -2253,9 +2744,20 @@ def main():
     # get second orbit
     haveData = getSecondaryOrbit(myArgs)
     if not haveData:
-        print('No InSAR products for orbit: myArgs["orbit1"]')
+        print(f'No InSAR products for orbit: {myArgs["orbit1"]}')
     else:
         print('orbit2:', myArgs['orbit2'])
+        # Date filter: skip this orbit when its first (reference) acquisition date
+        # is outside [--firstDate, --lastDate]. myArgs['datetime'] is myProd.Date
+        # ('YYYY-MM-DD'), the reference acquisition, uniform across an orbit's
+        # frames. A missing bound is open (firstDate -> -inf, lastDate -> +inf).
+        if not refDateInRange(myArgs.get('datetime'),
+                              myArgs.get('firstDate'), myArgs.get('lastDate')):
+            print(f'Skipping orbit {myArgs["orbit1"]}: reference date '
+                  f'{myArgs["datetime"]} outside '
+                  f'[{myArgs.get("firstDate") or "-inf"}, '
+                  f'{myArgs.get("lastDate") or "+inf"}]')
+            return
     # Move bandwidth-based YAML copy to helper (will run after frameDir exists)
     #
     # Process frames, recording per-frame geodat/pow so groups can be assembled
@@ -2307,7 +2809,8 @@ def main():
     groups = splitGroupsBySecondaryEpoch(groups, myArgs.get('frameSecondaryInfo', {}))
     if len(groups) > 1:
         print(f'Frame break(s) detected — {len(groups)} virtual frames will be created')
-    if myArgs['virtualFrame'] is not None:
+    explicitVFOverride = myArgs['virtualFrame'] is not None
+    if explicitVFOverride:
         # Explicit override: assign sequentially from the given base number.
         baseVF = int(myArgs['virtualFrame'])
         groupAssignments = [(g, f'{baseVF + i:04d}') for i, g in enumerate(groups)]
@@ -2340,11 +2843,36 @@ def main():
         groupSecInfo = [myArgs['frameSecondaryInfo'][f] for f in groupFrames
                         if f in myArgs.get('frameSecondaryInfo', {})]
         if groupSecInfo:
+            # Vote over the first 5 elements only: the per-frame acquisition
+            # datetime (element 5) is unique to every frame, so including it
+            # would make every tuple's count 1 and the "vote" degenerate to
+            # whichever frame happened to be inserted first.
             (myArgs['orbit2'], myArgs['secondaryDateTime'],
              myArgs['NumberRangeLooks'], myArgs['NumberAzimuthLooks'],
-             myArgs['bandwidth']) = Counter(groupSecInfo).most_common(1)[0][0]
+             myArgs['bandwidth']) = Counter(
+                 tuple(info[:5]) for info in groupSecInfo).most_common(1)[0][0]
+            # A merged group can legitimately span a UTC-midnight rollover (same
+            # overpass, secondaryDate label off by one calendar day -- see
+            # splitGroupsBySecondaryEpoch()). State vectors for such a group are
+            # referenced to seconds since the *earliest* date, with time running
+            # past 86400s for the post-midnight frames, so use the earliest
+            # date as the canonical secondaryDateTime instead of majority vote
+            # whenever more than one distinct date is present in the group.
+            distinctDates = {info[1] for info in groupSecInfo}
+            if len(distinctDates) > 1:
+                earliestInfo = min(groupSecInfo, key=lambda info: info[5])
+                myArgs['secondaryDateTime'] = earliestInfo[1]
 
         frameDir = f'{myArgs["outputDir"]}/{myArgs["orbit1"]}_{virtualFrame}'
+        if myArgs.get('new'):
+            if myArgs.get('corrOnly') or myArgs.get('correlationOnly'):
+                builtVrt = glob.glob(f'{frameDir}/*.cor.vrt')
+            else:
+                builtVrt = glob.glob(f'{frameDir}/*.correctedUnwrappedPhase.vrt')
+            if builtVrt:
+                print(f'--new: skipping existing virtual frame '
+                      f'{myArgs["orbit1"]}_{virtualFrame}')
+                continue
         if not os.path.exists(frameDir):
             os.mkdir(frameDir)
         writeFramesList(frameDir, groupFrames)
@@ -2372,6 +2900,17 @@ def main():
         if not myArgs['RUNWOnly'] and not myArgs.get('correlationOnly') \
                 and not myArgs.get('corrOnly'):
             createVirtualFramePower(myArgs)
+
+    # Drop stale virtual-frame dirs left by an earlier, different grouping (see
+    # _dropOrphanVirtualFrames). Only after a normal full (re)build: not with an
+    # explicit --virtualFrame override, not --new (which intentionally leaves
+    # existing frames alone), and not the geodats-only / correlation-only modes,
+    # which don't recompute the full grouping.
+    if (haveData and not explicitVFOverride and not myArgs.get('new')
+            and not myArgs.get('geodatsOnly')
+            and not myArgs.get('corrOnly')
+            and not myArgs.get('correlationOnly')):
+        _dropOrphanVirtualFrames(myArgs['orbit1'], groupAssignments)
 
 
 if __name__ == "__main__":

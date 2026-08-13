@@ -77,7 +77,7 @@ def parseArgs():
     parser.add_argument('--boxSize', type=int, default=boxSize,
                         help='Size of the box surrounding the point over '
                         f'which to calculate stats. [{boxSize}]')
-    parser.add_argument('--nGood', type=float, default=nGood,
+    parser.add_argument('--nGood', type=int, default=nGood,
                         help='Reject points where there are fewer than nGood '
                         f'points in a box centered on the point. [{nGood}]')
     # Max deviations
@@ -141,11 +141,6 @@ def parseArgs():
                         help='Save an unsmoothed copy of range.offsets/azimuth.offsets to '
                         'debug/ before the variable smoothing-radius map is applied, so '
                         'smoothed vs unsmoothed can be compared')
-
-    choices = [os.path.splitext(f)[0]
-               for f in os.listdir(
-                   os.path.join(os.path.dirname(sarfunc.__file__), 'regions'))
-               if f.endswith('.yaml')]
 
     args = parser.parse_args()
     smoothFlags = [args.minTol is not None, args.percentSpeed is not None,
@@ -384,12 +379,22 @@ def simulateOffsets(outputDir, baseName, params,
     '''
     print('Simulating offsets ...')
     threads = []
+    # offsets.geom.mask.vrt (consumed downstream by --sepIceRock) only carries
+    # genuine 0=water/1=rock/2=ice classes when the region defines
+    # icerockwatermask (currently Greenland only). Request it from simoffsets
+    # only in that case; otherwise fall back to the default mask -- same as
+    # the .velocity simulation below -- so simoffsets doesn't abort outright.
+    myRegion = sarfunc.defaultRegionDefs(params['region'], regionFile=params['regionFile'])
+    useIceRockMask = myRegion.iceRockWaterMask() is not None
+    if not useIceRockMask:
+        print('simulateOffsets: icerockwatermask not defined for this region -- '
+              '--sepIceRock will not be applicable; using default mask for offsets.geom')
     # Geometry
     threads.append(threading.Thread(target=callSim,
                                     args=[outputDir, f'{baseName}.geom',
                                           params],
                                     kwargs={'includeVel': False,
-                                            'iceRockWaterMask': True,
+                                            'iceRockWaterMask': useIceRockMask,
                                             'stderr': stderr,
                                             'stdout': stdout,
                                             'simDir': simDir,
@@ -717,7 +722,7 @@ def interpOffsets(outputDir, baseName, ratThresh=1, thresh=20, islandThresh=20,
     '''
     print('Interpolating...')
     datPath = f'{outputDir}/{workingDir}/{baseName}.layer?.dat'
-    datFiles = glob.glob(datPath)
+    datFiles = sorted(glob.glob(datPath))
     if len(datFiles) > 0:
         with open(datFiles[0], 'r') as fp:
             line = fp.readlines()[0].split()
@@ -877,8 +882,10 @@ def mergeOffsets(outputDir, baseName='NISARoffsets', layers=[1, 2, 3],
         geomVRT = f'{outputDir}/{simDir}/{simName}.geom.vrt'
         geom = readVRTAndRenameBands(geomVRT, nameKey='Description')
         print(geomVRT)
-        # Add geometry back to valid pixels
-        validMean = np.isfinite(azMean)
+        # Add geometry back to valid pixels. Require BOTH means finite so a
+        # pixel culled in only one of range/azimuth still gets the noData
+        # sentinel (not NaN) in both output files.
+        validMean = np.isfinite(azMean) & np.isfinite(rgMean)
         print(np.sum(validMean), np.nanmean(rgMean[validMean]))
         #rgMean[validMean] += geom.RangeOffsets.data[validMean]
         rgMean[validMean] = (rgMean[validMean] +

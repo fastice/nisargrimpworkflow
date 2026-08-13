@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import os
 import glob
+import fnmatch
 import re
+import shutil
 import subprocess
 import argparse
 import yaml
@@ -24,8 +26,13 @@ def parse_args():
             'refreshties.py across all tracks for the requested\n'
             'years. Use --tracks to restrict processing to specific tracks.\n\n'
             'Optional flags enable first-time setup (--copyFiles), product\n'
-            'checking (--check), thumbnail generation (--runVelThumbs), and\n'
-            'velocity-stats-region recomputation (--runVelstatsregions).'
+            'checking (--check), and thumbnail generation (--runVelThumbs).\n\n'
+            '--runVelstatsregions recomputes velocity-stats regions, and since that\n'
+            'changes each vel_thumb_header\'s image extent, it also automatically\n'
+            'chains a forced tiepointing pass (so makeframetie.py regenerates the\n'
+            'per-range vel_thumb_plan/vel_thumbs output under the new extent) and a\n'
+            'velocityStats.py rebuild -- all three run together, standalone (see\n'
+            '--runVelstatsregions --help for the exact sequence).'
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='Part of the nisargrimpworkflow package.')
@@ -42,7 +49,38 @@ def parse_args():
     parser.add_argument('--runVelThumbs', action='store_true',
                         help='Run "vel_thumbs vel_thumb_plan" in each tiepoints/ dir')
     parser.add_argument('--runVelstatsregions', action='store_true',
-                        help='Run makevelstatsregions.py in each track dir')
+                        help='Run makevelstatsregions.py in each track dir, which rewrites each '
+                             'vel_thumb_header_<range>\'s resolution/extent line (filling in the '
+                             '"0 0 0 0" auto-size sentinel with the common domain covering all '
+                             'data). Since the per-range vel_thumb_plan_<year>dash<range> file '
+                             'vel_thumbs actually reads is only regenerated from that header by '
+                             'makeframetie.py, this flag also automatically chains: (1) '
+                             'makevelstatsregions.py, (2) a forced tiepointing pass (ties_only=False, '
+                             'so makeframetie.py reruns and regenerates the per-range plan + calls '
+                             'vel_thumbs itself under the new extent), (3) a "velocityStats.py '
+                             '--doRA" rebuild from the freshly regenerated mosaics. Standalone, '
+                             'early-return action -- not combined with --runVelThumbs/the default '
+                             'tiepointing flow')
+    parser.add_argument('--runVelStats', action='store_true',
+                        help='Run "velocityStats.py --doRA" in each track\'s velocityStats/ '
+                             'dir, using the project\'s region file and velMap to build the '
+                             'reference basemap if missing')
+    parser.add_argument('--updateAutoclean', action='store_true',
+                        help='Force velStats+autocleanNISAR to (re)run for every track, even '
+                             'ones whose frames already have an autoclean mask embedded in '
+                             'range.offsets.vrt. Default: only run it for tracks missing masks')
+    parser.add_argument('--nThreads', type=int, default=32, metavar='N',
+                        help='Parallelism for the heavy steps: passed as '
+                             '-nThreads to refreshties.py (tracks in parallel) '
+                             'and as -threads to autocleanNISAR.py --tracks '
+                             '(frame pool) [32]')
+    parser.add_argument('--noUpdateVelStats', action='store_true',
+                        help='Skip the "velocityStats.py --doRA" rebuild step in this invocation, '
+                             'reusing the existing velStats reference. Use to avoid rebuilding '
+                             'velStats twice when running --runVelstatsregions and then '
+                             '--updateAutoclean back to back: pass it on whichever of the two '
+                             'commands should not redo velStats (the other one leaves a fresh '
+                             'reference for autocleanNISAR to consume)')
     parser.add_argument('--overWrite', action='store_true',
                         help='Pass --overWrite to refreshties.py to rerun existing products')
     parser.add_argument('--keepVz', action='store_true',
@@ -50,6 +88,10 @@ def parse_args():
     parser.add_argument('--check', action='store_true',
                         help='Report which track-*/*_000? dirs have range.offsets.vrt '
                              'but lack velocity/mosaicOffsets.vx; print baseline sigmas')
+    parser.add_argument('--checkFrames', action='store_true',
+                        help='Check virtual-frame directory health: report orphaned dirs '
+                             '(suffix does not match framePattern) and current-format dirs '
+                             'missing upstream products (range offsets, phase, geodat, pairinfo)')
     parser.add_argument('--year', type=int, nargs='+', default=[2025, 2026], metavar='YYYY',
                         help='One or more years to pass to refreshties.py (default: 2025 2026)')
     parser.add_argument('--noPhase', action='store_true',
@@ -57,6 +99,13 @@ def parse_args():
     parser.add_argument('--quadFit', action='store_true',
                         help='Enable the -deltaBQ quadratic baseline correction estimate '
                              '(default: NISAR uses --noQuadFit)')
+    parser.add_argument('--useSquint', dest='useSquint', action='store_true', default=None,
+                        help='Apply the squint heading correction (mosaic3d -useSquint and '
+                             'tiepoints -motion), overriding project.yaml applySquintCorrection '
+                             'for this run')
+    parser.add_argument('--noUseSquint', dest='useSquint', action='store_false',
+                        help='Disable the squint heading correction for this run, overriding '
+                             'project.yaml applySquintCorrection')
     return parser.parse_args()
 
 
@@ -72,7 +121,8 @@ def get_track_dirs(tracks=None):
 
 
 def _load_project_config():
-    """Return (proj dict, dem string, template_content dict) read from project.yaml."""
+    """Return (proj dict, dem string, velMap string, template_content dict,
+    frame_pattern string) read from project.yaml."""
     proj_path = os.path.join(PROJECT_DIR, 'project.yaml')
     proj = {}
     if os.path.exists(proj_path):
@@ -80,12 +130,15 @@ def _load_project_config():
             proj = yaml.safe_load(f) or {}
 
     dem = ''
+    velMap = ''
     region_path = proj.get('region') or proj.get('regionFile', '')
     for ext in ('', '.yaml'):
         rpath = (region_path + ext) if ext else region_path
         if rpath and os.path.exists(rpath):
             with open(rpath) as f:
-                dem = (yaml.safe_load(f) or {}).get('dem', '')
+                regionYaml = yaml.safe_load(f) or {}
+            dem = regionYaml.get('dem', '')
+            velMap = regionYaml.get('velMap', '')
             break
 
     templates_dir = os.path.join(PROJECT_DIR, 'templates')
@@ -105,7 +158,7 @@ def _load_project_config():
         else:
             contents[name] = None
     frame_pattern = proj.get('framePattern', '00??')
-    return proj, dem, contents, frame_pattern
+    return proj, dem, velMap, contents, frame_pattern
 
 
 def _apply_substitutions(content, track_num, dem, tiepoint_file):
@@ -135,8 +188,8 @@ def _vel_stats_dirs_for_track(track_dir, frame_pattern):
     return sorted(groups)
 
 
-def setup_track_dirs(track_dirs, copy_files):
-    proj, dem, templates, frame_pattern = _load_project_config()
+def setup_track_dirs(track_dirs, copy_files, overwrite=False):
+    proj, dem, _, templates, frame_pattern = _load_project_config()
     tiepoint_file = proj.get('tiepointFile', '')
 
     n_created = 0
@@ -156,17 +209,21 @@ def setup_track_dirs(track_dirs, copy_files):
             for tmpl_name, dest_name in (('tie_plan_header', 'tie_plan_header'),
                                          ('vel_thumb_plan', 'vel_thumb_plan')):
                 dest = os.path.join(tpdir, dest_name)
-                if not os.path.exists(dest):
-                    if templates[tmpl_name] is None:
-                        print(f'WARNING: template {tmpl_name} not found, skipping {dest}')
-                        continue
-                    content = _apply_substitutions(templates[tmpl_name], track_num, dem, tiepoint_file)
-                    with open(dest, 'w') as f:
-                        f.write(content)
+                exists = os.path.exists(dest)
+                if exists and not overwrite:
+                    n_skipped += 1
+                    continue
+                if templates[tmpl_name] is None:
+                    print(f'WARNING: template {tmpl_name} not found, skipping {dest}')
+                    continue
+                content = _apply_substitutions(templates[tmpl_name], track_num, dem, tiepoint_file)
+                with open(dest, 'w') as f:
+                    f.write(content)
+                if exists:
+                    print(f'Overwrote {dest}')
+                else:
                     print(f'Created {dest}')
                     n_created += 1
-                else:
-                    n_skipped += 1
 
         for dir_name in _vel_stats_dirs_for_track(track_dir, frame_pattern):
             vel_dir = os.path.join(track_dir, 'velocityStats', dir_name)
@@ -307,11 +364,141 @@ def check_products():
             print(f'{"RSS sigma":<35}  {rss_rng:>12.4f}  {rss_az:>10.4f}')
 
 
-def run_vel_thumbs(track_dirs):
+def check_frames():
+    """Check physical source frames and virtual frames for missing key files.
+
+    Physical frames (suffix does not match framePattern) are checked for the
+    files that virtual-frame VRTs reference.  Virtual frames (suffix matches
+    framePattern) are checked for the assembled VRT products.
+    """
+    _, _, _, _, frame_pattern = _load_project_config()
+    track_dirs = get_track_dirs()
+
+    # Files that must exist in each physical source frame so the virtual-frame
+    # VRTs can reference them.
+    physical_checks = [
+        ('range offsets',    ['range.offsets.vrt', 'range.offsets']),
+        ('azimuth offsets',  ['azimuth.offsets.vrt', 'azimuth.offsets']),
+        ('phase',            ['*.correctedUnwrappedPhase.vrt']),
+        ('ionosphere',       ['*.ionosphereCorrection.globalFill.offset.vrt',
+                              '*.ionosphereCorrection.offset.vrt']),
+        ('geodat',           ['geodat*.geojson']),
+        ('secondary geodat', ['geodat*.secondary.geojson']),
+    ]
+
+    # Files that must exist in each assembled virtual frame.
+    virtual_checks = [
+        ('range offsets', ['range.offsets.vrt', 'range.offsets']),
+        ('phase',         ['phase.uw.vrt']),
+        ('geodat',        ['geodat*.geojson']),
+        ('pairinfo',      ['*.pairinfo']),
+    ]
+
+    phys_incomplete = []   # (rel_path, [missing_label, ...])
+    virt_incomplete = []   # (rel_path, [missing_label, ...])
+    empty_h5_stubs = []   # (rel_path, abs_path) — frame dirs with only an empty H5/
+    frames_txt_stubs = [] # (rel_path, abs_path) — virtual frames with only frames.txt
+    n_phys = 0
+    n_virt = 0
+    n_excluded = 0
+
+    for track_dir in track_dirs:
+        for entry in sorted(os.scandir(track_dir), key=lambda e: e.name):
+            if not entry.is_dir():
+                continue
+            parts = entry.name.rsplit('_', 1)
+            if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+                continue
+            suffix = parts[1]
+            frame_dir = entry.path
+            rel = os.path.relpath(frame_dir, PROJECT_DIR)
+
+            if os.path.exists(os.path.join(frame_dir, 'Exclude')) or \
+                    os.path.exists(os.path.join(frame_dir, 'Exclude.pending')):
+                n_excluded += 1
+                continue
+
+            # Detect stub: directory whose only visible content is an empty H5/ subdir
+            visible = [f for f in os.listdir(frame_dir) if not f.startswith('.')]
+            h5_dir = os.path.join(frame_dir, 'H5')
+            if visible == ['H5'] and os.path.isdir(h5_dir) and not os.listdir(h5_dir):
+                empty_h5_stubs.append((rel, frame_dir))
+                continue
+
+            if not fnmatch.fnmatch(suffix, frame_pattern):
+                # Physical source frame
+                n_phys += 1
+                missing = [label
+                           for label, pats in physical_checks
+                           if not any(glob.glob(os.path.join(frame_dir, p)) for p in pats)]
+                if missing:
+                    phys_incomplete.append((rel, missing))
+            else:
+                # Virtual assembled frame — detect frames.txt-only stub
+                if visible == ['frames.txt']:
+                    frames_txt_stubs.append((rel, frame_dir))
+                    continue
+                n_virt += 1
+                missing = [label
+                           for label, pats in virtual_checks
+                           if not any(glob.glob(os.path.join(frame_dir, p)) for p in pats)]
+                if missing:
+                    virt_incomplete.append((rel, missing))
+
+    if empty_h5_stubs:
+        print(f'\n{len(empty_h5_stubs)} frame director{"y" if len(empty_h5_stubs) == 1 else "ies"}'
+              f' contain only an empty H5/ subdirectory (download stub, no data):')
+        for rel, _ in empty_h5_stubs:
+            print(f'  {rel}')
+        answer = input(f'Remove all {len(empty_h5_stubs)}? [y/N]: ').strip().lower()
+        if answer == 'y':
+            for rel, abs_path in empty_h5_stubs:
+                shutil.rmtree(abs_path)
+                print(f'  Removed {rel}')
+        else:
+            print('  Skipped.')
+
+    if frames_txt_stubs:
+        print(f'\n{len(frames_txt_stubs)} virtual frame director{"y" if len(frames_txt_stubs) == 1 else "ies"}'
+              f' contain only frames.txt (no assembled products):')
+        for rel, _ in frames_txt_stubs:
+            print(f'  {rel}')
+        answer = input(f'Remove all {len(frames_txt_stubs)}? [y/N]: ').strip().lower()
+        if answer == 'y':
+            for rel, abs_path in frames_txt_stubs:
+                shutil.rmtree(abs_path)
+                print(f'  Removed {rel}')
+        else:
+            print('  Skipped.')
+
+    excl_str = f' ({n_excluded} excluded)' if n_excluded else ''
+    print(f'\nframePattern: {frame_pattern!r}')
+    print(f'{n_phys} physical source frame(s), {n_virt} virtual frame(s){excl_str}')
+
+    if phys_incomplete:
+        print(f'\n{len(phys_incomplete)} INCOMPLETE physical frame(s)'
+              f' (missing files that virtual-frame VRTs reference):')
+        for r, miss in phys_incomplete:
+            print(f'  {r}: missing {", ".join(miss)}')
+    else:
+        print(f'\nAll {n_phys} physical frames have required source files.')
+
+    if virt_incomplete:
+        print(f'\n{len(virt_incomplete)} INCOMPLETE virtual frame(s)'
+              f' (missing assembled VRT products):')
+        for r, miss in virt_incomplete:
+            print(f'  {r}: missing {", ".join(miss)}')
+    else:
+        print(f'\nAll {n_virt} virtual frames have required assembled products.')
+
+
+def run_vel_thumbs(track_dirs, over_write=False):
+    overWrite = ' --overWrite' if over_write else ''
+
     def _run(track_dir):
         tpdir = os.path.join(track_dir, 'tiepoints')
         print(f'Running vel_thumbs in {tpdir}')
-        subprocess.run(['csh', '-c', 'vel_thumbs vel_thumb_plan'], cwd=tpdir)
+        subprocess.run(['csh', '-c', f'vel_thumbs vel_thumb_plan{overWrite}'], cwd=tpdir)
 
     with ThreadPoolExecutor(max_workers=10) as executor:
         executor.map(_run, track_dirs)
@@ -323,8 +510,87 @@ def run_velstats_regions(track_dirs):
         subprocess.run(['csh', '-c', 'makevelstatsregions.py'], cwd=track_dir)
 
 
+def run_vel_stats(track_dirs, region_path, vel_map, n_threads=None):
+    """Run 'velocityStats.py --doRA' in each track's velocityStats/ dir, passing
+    the project's region file and velMap so the RA reference basemap is built
+    (if missing) from the project's own velocity map rather than a generic
+    region default. Tracks are independent (each velocityStats.py works only
+    inside its own velocityStats/ dir), so they run in parallel up to n_threads
+    (default: all at once) instead of serially."""
+    regionArg = f'-regionFile {region_path} ' if region_path else ''
+    velMapArg = f'-velmap {vel_map} ' if vel_map else ''
+    cmd = f'velocityStats.py --doRA {regionArg}{velMapArg}'
+
+    jobs = []
+    for track_dir in track_dirs:
+        vsd = os.path.join(track_dir, 'velocityStats')
+        if not os.path.isdir(vsd):
+            print(f'Skipping {track_dir}: no velocityStats/ dir')
+            continue
+        jobs.append(vsd)
+    if not jobs:
+        return
+
+    def _run(vsd):
+        print(f'Running: {cmd}  (in {vsd})')
+        subprocess.run(['csh', '-c', cmd], cwd=vsd)
+
+    maxWorkers = n_threads if n_threads else len(jobs)
+    with ThreadPoolExecutor(max_workers=maxWorkers) as executor:
+        list(executor.map(_run, jobs))
+
+
+def _track_has_autoclean_mask(track_dir, frame_pattern):
+    """Return True if every merged frame dir in track_dir already has an
+    autoclean mask embedded in its range.offsets.vrt (<MaskBand> block written
+    by autocleanNISAR.py:embedMaskBand()). False if any frame is missing one
+    (including tracks with no frame dirs at all, or no range.offsets.vrt
+    yet) -- those need (re)running."""
+    frame_dirs = glob.glob(os.path.join(track_dir, f'*_{frame_pattern}'))
+    if not frame_dirs:
+        return False
+    for frame_dir in frame_dirs:
+        vrt = os.path.join(frame_dir, 'range.offsets.vrt')
+        if not os.path.exists(vrt):
+            return False
+        with open(vrt) as f:
+            if '<MaskBand' not in f.read():
+                return False
+    return True
+
+
+def run_autoclean(track_dirs, frame_pattern, n_threads=None, new=True):
+    """Run 'autocleanNISAR.py --tracks' once from the project root over all
+    track dirs -- flags outlier range/azimuth offset pixels against the
+    velocityStats reference (just refreshed by run_vel_stats) and embeds the
+    resulting masks into each frame's range.offsets.vrt/azimuth.offsets.vrt,
+    so the tiepointing step that follows (rparams/azparams, both
+    -noMask-aware) fits baselines against cleaned data. --tracks pools every
+    frame across all tracks into one multithreaded run (previously this
+    looped 'autocleanNISAR.py --allFrames' per track serially, so each
+    track's straggler frames idled the pool before the next track started).
+    When new is True (the default), '--new' is passed so only frames without
+    an embedded mask are (re)cleaned -- already-cleaned frames are skipped;
+    --updateAutoclean forces new=False to reclean every frame."""
+    if not track_dirs:
+        return
+    # frame_pattern (e.g. "00??") contains csh glob metacharacters --
+    # quote it or csh expands it against cwd's filenames before
+    # autocleanNISAR.py ever sees it, aborting with "No match." when
+    # nothing happens to match (same reason run_refresh_ties() quotes
+    # -toRun="...").
+    tracks = ' '.join(os.path.basename(d) for d in track_dirs)
+    threadsArg = f' -threads {n_threads}' if n_threads else ''
+    newArg = ' --new' if new else ''
+    cmd = (f'autocleanNISAR.py --tracks {tracks}'
+           f' -framePattern "{frame_pattern}"{threadsArg}{newArg}')
+    print(f'Running: {cmd}  (in {PROJECT_DIR})')
+    subprocess.run(['csh', '-c', cmd], cwd=PROJECT_DIR)
+
+
 def run_refresh_ties(track_dirs, ties_only, over_write, keep_vz, year,
-                      phase_and_offsets=True, no_quad_fit=True, use_yaml=False):
+                      phase_and_offsets=True, no_quad_fit=True, use_yaml=False,
+                      use_squint=False, n_threads=None):
     tracks_str = str([os.path.basename(d) for d in track_dirs]).replace(' ', '')
     tiesOnly = '-tiesOnly ' if ties_only else ''
     overWrite = '--overWrite ' if over_write else ''
@@ -332,8 +598,10 @@ def run_refresh_ties(track_dirs, ties_only, over_write, keep_vz, year,
     phaseAndOffsets = '--phaseAndOffsets ' if phase_and_offsets else ''
     noQuadFit = '--noQuadFit ' if no_quad_fit else ''
     useYaml = '--yaml ' if use_yaml else ''
+    useSquint = '--useSquint ' if use_squint else ''
+    nThreadsFlag = f'-nThreads {n_threads} ' if n_threads else ''
     years_str = ' '.join(str(y) for y in year)
-    cmd = f'refreshties.py {tiesOnly}{overWrite}{keepVz}{phaseAndOffsets}{noQuadFit}{useYaml}-toRun="{tracks_str}" {years_str} -noPrompt'
+    cmd = f'refreshties.py {tiesOnly}{overWrite}{keepVz}{phaseAndOffsets}{noQuadFit}{useYaml}{useSquint}{nThreadsFlag}-toRun="{tracks_str}" {years_str} -noPrompt'
     print(f'Running: {cmd}')
     subprocess.run(['csh', '-c', cmd], cwd=PROJECT_DIR)
 
@@ -345,21 +613,88 @@ def main():
         check_products()
         return
 
-    track_dirs = get_track_dirs(args.tracks)
+    if args.checkFrames:
+        check_frames()
+        return
 
-    setup_track_dirs(track_dirs, args.copyFiles)
+    track_dirs = get_track_dirs(args.tracks)
+    proj, _, vel_map, _, frame_pattern = _load_project_config()
+    region_path = proj.get('region') or proj.get('regionFile', '')
+
+    # Drop tracks that have no virtual-frame data yet.
+    have_data = [d for d in track_dirs
+                 if glob.glob(os.path.join(d, f'*_{frame_pattern}'))]
+    empty = sorted(set(os.path.basename(d) for d in track_dirs)
+                   - set(os.path.basename(d) for d in have_data),
+                   key=lambda t: int(t.split('-')[1]))
+    if empty:
+        print(f'Skipping {len(empty)} track(s) with no virtual-frame data: {empty}')
+    track_dirs = have_data
+
+    setup_track_dirs(track_dirs, args.copyFiles, overwrite=args.overWrite)
+
+    if args.copyFiles:
+        return
+
+    projectUseSquint = bool(proj.get('applySquintCorrection', False))
+    useSquint = projectUseSquint if args.useSquint is None else args.useSquint
 
     if args.runVelThumbs:
-        run_vel_thumbs(track_dirs)
+        run_vel_thumbs(track_dirs, over_write=args.overWrite)
 
     if args.runVelstatsregions:
         run_velstats_regions(track_dirs)
+        # makevelstatsregions.py rewrites each vel_thumb_header_<range>'s
+        # resolution/extent line to the common domain covering all data
+        # (filling in the "0 0 0 0" auto-size sentinel). The per-range plan
+        # file vel_thumbs actually reads (vel_thumb_plan_<year>dash<range>)
+        # is only regenerated from that header by makeframetie.py -- which
+        # also calls vel_thumbs on it -- so force a full tiepointing pass
+        # (ties_only=False, so makeframetie.py actually runs) rather than
+        # calling vel_thumbs on the generic vel_thumb_plan directly (a
+        # separate, whole-track auto-extent file that never carries
+        # per-range resolutions).
+        run_refresh_ties(track_dirs, False, True, args.keepVz, args.year,
+                         phase_and_offsets=not args.noPhase,
+                         no_quad_fit=not args.quadFit,
+                         use_yaml=True,
+                         use_squint=useSquint,
+                         n_threads=args.nThreads)
+        # velocityStats aggregates from those same source mosaics, so its
+        # own reference (velocity.vr/.va/.er/.ea/.navg) is now stale too --
+        # rebuild it from the freshly regenerated mosaics (unless the caller
+        # will do it in a following --updateAutoclean run, via --noUpdateVelStats).
+        if not args.noUpdateVelStats:
+            run_vel_stats(track_dirs, region_path, vel_map,
+                          n_threads=args.nThreads)
         return
+
+    if args.runVelStats:
+        run_vel_stats(track_dirs, region_path, vel_map,
+                      n_threads=args.nThreads)
+        return
+
+    # velStats+autoclean only for tracks that don't already have an autoclean
+    # mask embedded (or all of them, with --updateAutoclean) -- tiepointing
+    # below always runs for every track regardless, since it's what actually
+    # benefits from the (possibly just-refreshed) masks.
+    needs_autoclean = [d for d in track_dirs
+                       if args.updateAutoclean or not _track_has_autoclean_mask(d, frame_pattern)]
+    if needs_autoclean:
+        # --noUpdateVelStats reuses velStats built by a prior --runVelstatsregions
+        # run, so autoclean consumes it directly without a redundant rebuild.
+        if not args.noUpdateVelStats:
+            run_vel_stats(needs_autoclean, region_path, vel_map,
+                          n_threads=args.nThreads)
+        run_autoclean(needs_autoclean, frame_pattern, n_threads=args.nThreads,
+                      new=not args.updateAutoclean)
 
     run_refresh_ties(track_dirs, args.tiesOnly, args.overWrite, args.keepVz, args.year,
                      phase_and_offsets=not args.noPhase,
                      no_quad_fit=not args.quadFit,
-                     use_yaml=True)
+                     use_yaml=True,
+                     use_squint=useSquint,
+                     n_threads=args.nThreads)
 
 
 if __name__ == '__main__':

@@ -14,11 +14,13 @@ into GrIMP-format phase, coherence, and ionosphere-correction VRT products.
 **SetupNISAR** — Orchestrates per-frame RUNW/ROFF conversion and consolidates
 multi-frame products into a virtual-frame VRT mosaic.
 
-**searchASF** — Search the ASF DAAC for Sentinel-1 IW SLC products within a
-date range and spatial area.
+**autoupdateNISAR** — Daily cron driver: searches/downloads new granules with a
+one-day pass-completion buffer, then runs the full processing chain on the
+newly-completed data.
 
 ## Documentation
 
+- [autoupdate](Documents/autoupdate.md) — daily incremental update driver (search → buffer → process)
 - [setupNISARTracks](Documents/setupNISARTracks.md) — orchestrate per-track NISAR processing
 - [SetupNISAR](Documents/SetupNISAR.md) — per-frame RUNW/ROFF conversion and VRT mosaicking
 - [processTrack](Documents/processTrack.md) — per-track processing workflow

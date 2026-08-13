@@ -10,8 +10,9 @@ each track's block and a ';' separator between consecutive per-year files.
 Before writing, verifies that every file path referenced in those data lines
 actually exists -- including any ionosphere-correction file embedded in a
 range.offsets VRT's ionosphereRangeOffsetCorrection metadata (see
-SetupNISAR.globalFillIonosphere) -- and reports (but does not block on) any
-that are missing.
+SetupNISAR.globalFillIonosphere). Entries with any missing file are skipped
+from the output.  A summary of how many were skipped and why is printed at the
+end; --verbose adds a sorted list of every missing file path per category.
 """
 
 import argparse
@@ -19,6 +20,7 @@ import glob
 import os
 import re
 import sys
+from collections import Counter, defaultdict
 
 import utilities as u
 from osgeo import gdal
@@ -30,25 +32,33 @@ def parseArgs():
         'inputFile-N-all20?? files.',
         epilog='Part of the nisargrimpworkflow package.')
     parser.add_argument('--projectDir', type=str, default='.',
-                        help='Root directory containing track-N '
-                        'subdirectories [.] (current directory)')
+                        help='Root directory for anchoring --outputPath when '
+                        'it is a relative path [.]. Ignored for track '
+                        'discovery when --inputPaths is given.')
+    parser.add_argument('--inputPaths', nargs='+', metavar='PATH',
+                        help='One or more directories to search for track-N '
+                        'subdirectories (overrides --projectDir for input). '
+                        'Example: . ../anotherDir')
     parser.add_argument('--outputPath', default='Release/masterInput',
                         metavar='PATH',
                         help='Directory to write inputFile (default: '
                         'Release/masterInput, relative to --projectDir '
                         'unless absolute)')
+    parser.add_argument('--verbose', action='store_true',
+                        help='List every missing file path in the skip summary')
     return parser.parse_args()
 
 
-def get_track_numbers(project_dir):
-    """Return sorted list of track numbers found in the project dir."""
-    dirs = glob.glob(os.path.join(project_dir, 'track-*'))
-    numbers = []
-    for d in dirs:
-        m = re.search(r'track-(\d+)$', d)
-        if m:
-            numbers.append(int(m.group(1)))
-    return sorted(numbers)
+def get_track_entries(input_paths):
+    """Return sorted list of (track_num, base_dir) pairs found across all input paths."""
+    entries = []
+    for base_dir in input_paths:
+        dirs = glob.glob(os.path.join(base_dir, 'track-*'))
+        for d in dirs:
+            m = re.search(r'track-(\d+)$', d)
+            if m:
+                entries.append((int(m.group(1)), base_dir))
+    return sorted(entries, key=lambda x: x[0])
 
 
 def find_input_files(project_dir, track_num):
@@ -122,48 +132,102 @@ def find_ion_correction(range_offsets_path):
     return os.path.join(os.path.dirname(range_offsets_path), ionName)
 
 
-def verify_referenced_files(track_numbers, project_dir):
-    """Check that every file referenced in each track's inputFile-N-all20??
-    exists, including any ion-correction file embedded in range.offsets'
-    VRT metadata. Prints one warning per missing file. Returns the count of
-    missing files found."""
-    n_missing = 0
-    for track_num in track_numbers:
-        for filepath in find_input_files(project_dir, track_num):
-            for line in extract_data_lines(filepath):
-                for tok in line.split():
-                    if not is_file_token(tok):
-                        continue
-                    if not token_exists(tok):
-                        u.mywarning(f'track-{track_num} '
-                                   f'{os.path.basename(filepath)}: missing {tok}')
-                        n_missing += 1
-                        continue
-                    if os.path.basename(tok) == 'range.offsets':
-                        ionPath = find_ion_correction(tok)
-                        if ionPath is not None and not os.path.exists(ionPath):
-                            u.mywarning(f'track-{track_num} '
-                                       f'{os.path.basename(filepath)}: missing '
-                                       f'ion correction {ionPath} (referenced by '
-                                       f'{tok})')
-                            n_missing += 1
-    return n_missing
+def check_line_files(line):
+    """Return list of missing file paths for a single data line."""
+    missing = []
+    for tok in line.split():
+        if not is_file_token(tok):
+            continue
+        if not token_exists(tok):
+            missing.append(tok)
+        elif os.path.basename(tok) == 'range.offsets':
+            ionPath = find_ion_correction(tok)
+            if ionPath is not None and not os.path.exists(ionPath):
+                missing.append(ionPath)
+    return missing
 
 
-def assemble_master(track_numbers, project_dir):
-    """Build output lines for all tracks."""
+def file_type_label(path):
+    """Categorise a missing file path into a short human-readable type label."""
+    base = os.path.basename(path)
+    if 'rBaseline' in base:
+        return 'rBaseline'
+    if 'range.offsets' in base:
+        return 'range.offsets'
+    if 'azimuth.offsets' in base:
+        return 'azimuth.offsets'
+    if 'ionosphere' in base.lower():
+        return 'ionosphere correction'
+    if base.endswith('.geojson') or 'geodat' in base:
+        return 'geodat'
+    return base
+
+
+def orbit_frame_from_line(line):
+    """Extract the orbit_frame token (e.g. '4040_0000') from a data line."""
+    for tok in line.split():
+        if not is_file_token(tok):
+            continue
+        # Walk up from the file path looking for a ????_???? component
+        parts = tok.replace('\\', '/').split('/')
+        for part in parts:
+            if re.fullmatch(r'\d+_\d+', part):
+                return part
+    return None
+
+
+def assemble_master(track_entries, verbose=False):
+    """Build output lines for all tracks, skipping entries with missing files.
+
+    track_entries is a list of (track_num, base_dir) pairs as returned by
+    get_track_entries().
+
+    Returns (lines, n_total, n_skipped, skip_counts, skip_files,
+             tracks_no_inputfile, frames_in_output).
+      n_total:            total data lines found across all inputFiles
+      n_skipped:          lines dropped due to missing referenced files
+      skip_counts:        Counter {type_label: lines_missing_that_type}
+      skip_files:         {type_label: [path, ...]}  (verbose only)
+      tracks_no_inputfile: list of track numbers with no inputFile found
+      frames_in_output:   set of orbit_frame strings that made it into output
+    """
     output = []
-    for track_num in track_numbers:
-        input_files = find_input_files(project_dir, track_num)
+    n_total = 0
+    n_skipped = 0
+    skip_counts = Counter()
+    skip_files = defaultdict(list)
+    tracks_no_inputfile = []
+    frames_in_output = set()
+
+    for track_num, base_dir in track_entries:
+        input_files = find_input_files(base_dir, track_num)
         if not input_files:
+            tracks_no_inputfile.append(track_num)
             continue
         output.append(f'; track-{track_num}')
         for i, filepath in enumerate(input_files):
             if i > 0:
                 output.append(';')
-            lines = extract_data_lines(filepath)
-            output.extend(lines)
-    return output
+            for line in extract_data_lines(filepath):
+                n_total += 1
+                missing = check_line_files(line)
+                if missing:
+                    n_skipped += 1
+                    seen_types = set()
+                    for m in missing:
+                        label = file_type_label(m)
+                        if label not in seen_types:
+                            skip_counts[label] += 1
+                            seen_types.add(label)
+                        if verbose:
+                            skip_files[label].append(m)
+                else:
+                    frame = orbit_frame_from_line(line)
+                    if frame:
+                        frames_in_output.add(frame)
+                    output.append(line)
+    return (output, n_total, n_skipped, skip_counts, skip_files,
+            tracks_no_inputfile, frames_in_output)
 
 
 def write_output(lines, output_path):
@@ -196,21 +260,46 @@ def write_output(lines, output_path):
 
 def main():
     args = parseArgs()
-    project_dir = args.projectDir
+    input_paths = args.inputPaths if args.inputPaths else [args.projectDir]
+    # Anchor a relative --outputPath to --projectDir (default CWD),
+    # independently of --inputPaths.
     output_path = (args.outputPath if os.path.isabs(args.outputPath)
-                   else os.path.join(project_dir, args.outputPath))
+                   else os.path.join(args.projectDir, args.outputPath))
 
-    track_numbers = get_track_numbers(project_dir)
+    track_entries = get_track_entries(input_paths)
+    track_numbers = sorted(set(n for n, _ in track_entries))
     print(f'Found tracks: {track_numbers}')
 
-    n_missing = verify_referenced_files(track_numbers, project_dir)
-    if n_missing:
-        print(f'\033[1;43m{n_missing} referenced file(s) missing — see warnings '
-              f'above\033[0m')
-    else:
-        print('All referenced files verified present.')
+    motion_dirs = []
+    for p in input_paths:
+        motion_dirs.extend(glob.glob(os.path.join(p, 'track-*', '*_0???', 'motion')))
+    print(f'Found {len(motion_dirs)} track-*/*_0???/motion directories')
 
-    lines = assemble_master(track_numbers, project_dir)
+    (lines, n_total, n_skipped, skip_counts, skip_files,
+     tracks_no_inputfile, frames_in_output) = assemble_master(
+        track_entries, verbose=args.verbose)
+
+    n_motion = len(motion_dirs)
+    n_tracks_no_data = len(tracks_no_inputfile)
+    n_frames_out = len(frames_in_output)
+
+    print(f'Tracks with no inputFile (tiepoints not yet run): '
+          f'{n_tracks_no_data} of {len(track_entries)}')
+    if args.verbose and tracks_no_inputfile:
+        print(f'  tracks: {tracks_no_inputfile}')
+    print(f'Data lines found in inputFiles: {n_total}  '
+          f'kept: {n_total - n_skipped}  '
+          f'skipped (missing files): {n_skipped}')
+    print(f'Unique frames in output: {n_frames_out} of {n_motion} motion dirs')
+
+    if n_skipped:
+        print(f'\033[1;43mSkip breakdown:\033[0m')
+        for label, count in sorted(skip_counts.items(), key=lambda x: -x[1]):
+            print(f'  {count:4d} missing {label}')
+            if args.verbose:
+                for f in sorted(set(skip_files[label])):
+                    print(f'    {f}')
+
     write_output(lines, output_path)
 
 

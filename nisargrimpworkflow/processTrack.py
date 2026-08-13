@@ -1,7 +1,19 @@
 import glob
+import threading
 import utilities as u
 import argparse
+import datetime
 import subprocess
+
+
+def _isoDateStr(x):
+    '''argparse type: validate YYYY-MM-DD, return the original string
+    (passed through verbatim to SetupNISAR).'''
+    try:
+        datetime.datetime.strptime(x, '%Y-%m-%d')
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Date must be YYYY-MM-DD, got '{x}'")
+    return x
 
 def parseArgs():
     '''
@@ -25,7 +37,10 @@ def parseArgs():
     parser.add_argument('--debugIono', action='store_true',
                         help='Pass --debugIono to SetupNISAR')
     parser.add_argument('--sepIceRock', action='store_true',
-                        help='Pass --sepIceRock to SetupNISAR')
+                        help='Force --sepIceRock on for every SetupNISAR call. '
+                        'Normally left unset: SetupNISAR reads the sepIceRock '
+                        'default from the project.yaml key (on for Greenland, off '
+                        'for Antarctica), so this flag is only an override.')
     parser.add_argument('--geodatsOnly', action='store_true',
                         help='Pass --geodatsOnly to SetupNISAR: re-merge '
                         'virtual-frame geodats only, no reprocessing')
@@ -36,14 +51,36 @@ def parseArgs():
     parser.add_argument('--cleanDebug', action='store_true',
                         help='Pass --cleanDebug to SetupNISAR: empty the contents of '
                         'all debug/ directories (leaving the empty directory), then exit')
+    parser.add_argument('--bakeOnly', action='store_true',
+                        help='Pass --bakeOnly to SetupNISAR: just bake existing '
+                        'virtual-frame VRTs into flat GeoTIFFs, skip all reprocessing')
+    parser.add_argument('--new', action='store_true',
+                        help='Pass --new to SetupNISAR: skip any virtual frame whose '
+                        'product VRT already exists; only build new virtual frames')
     parser.add_argument('-noPrompt', '--noPrompt', action='store_true',
                         help='Pass --noPrompt to SetupNISAR: skip the confirmation '
                         'prompt for --clean/--cleanDebug')
+    parser.add_argument('--firstDate', type=_isoDateStr, default=None,
+                        metavar='YYYY-MM-DD',
+                        help='Pass --firstDate to SetupNISAR: only process pairs '
+                        'whose first (reference) acquisition date is on or after '
+                        'this date. Omit for no lower bound.')
+    parser.add_argument('--lastDate', type=_isoDateStr, default=None,
+                        metavar='YYYY-MM-DD',
+                        help='Pass --lastDate to SetupNISAR: only process pairs '
+                        'whose first (reference) acquisition date is on or before '
+                        'this date. Omit for no upper bound (infinity).')
+    parser.add_argument('--threads', type=int, default=1,
+                        help='Number of orbits to process concurrently '
+                        '(separate from -ompThreads, which controls OpenMP '
+                        'threads within each C binary call); default 1 '
+                        '(orbits run one at a time)')
     args = parser.parse_args()
     #
     return args.track[0], args.overWrite, args.overWritePhase, args.RUNWOnly, \
         args.correlationOnly, args.debugIono, args.sepIceRock, args.geodatsOnly, \
-        args.clean, args.cleanDebug, args.noPrompt
+        args.clean, args.cleanDebug, args.noPrompt, args.bakeOnly, args.new, \
+        args.threads, args.firstDate, args.lastDate
 
 
 def main():
@@ -58,11 +95,13 @@ def main():
     '''
     # Get args
     track, overWrite, overWritePhase, RUNWOnly, correlationOnly, debugIono, \
-        sepIceRock, geodatsOnly, clean, cleanDebug, noPrompt = parseArgs()
+        sepIceRock, geodatsOnly, clean, cleanDebug, noPrompt, bakeOnly, new, \
+        threads, firstDate, lastDate = parseArgs()
     orbitDirs =  glob.glob(f'{track}/*_*')
     print(orbitDirs)
     orbits = sorted(list(set([x.split('/')[-1].split('_')[0] for x in orbitDirs])))
     print(orbits)
+    orbitThreads = []
     for orbit in orbits:
         if 'tie' in orbit:
             continue
@@ -88,9 +127,20 @@ def main():
             command += ['--cleanDebug']
         if noPrompt:
             command += ['--noPrompt']
+        if bakeOnly:
+            command += ['--bakeOnly']
+        if new:
+            command += ['--new']
+        if firstDate:
+            command += ['--firstDate', firstDate]
+        if lastDate:
+            command += ['--lastDate', lastDate]
         #command += ['--verbose']
         print(command)
-        subprocess.run(command, cwd=track)
+        orbitThreads.append(threading.Thread(target=subprocess.run,
+                                             args=[command],
+                                             kwargs={'cwd': track}))
+    u.runMyThreads(orbitThreads, threads, 'processTrack')
 
 if __name__ == '__main__':
     main()

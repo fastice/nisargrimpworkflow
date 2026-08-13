@@ -12,11 +12,11 @@ those data lines actually exists — including, for each `range.offsets`
 token, any ionosphere-correction file embedded in that frame's
 `range.offsets.vrt` `ionosphereRangeOffsetCorrection` metadata (the same
 mechanism `SetupNISAR.globalFillIonosphere()` writes and
-`rparams`/`checkForIonosphereCorrection()` reads). Missing files are
-reported as warnings, one per missing path, plus a summary count — this
-does **not** block writing the output (loud, not silent: a track with
-missing inputs still gets assembled, so you can see exactly what's
-incomplete rather than have the whole run abort).
+`rparams`/`checkForIonosphereCorrection()` reads). **Data lines with any
+missing referenced file are dropped from the output** — the rest of the
+track still gets assembled. A summary of how many lines were skipped, and
+why, is printed at the end; `--verbose` adds a sorted list of every
+missing file path per category.
 
 Originally a one-off script hardcoded to `newGreenlandProject`
 (`/Volumes/insar1/ian/NISAR/realNISAR/newGreenlandProject/makeMaster.py`,
@@ -35,25 +35,14 @@ makeMaster --outputPath /some/other/dir # writes /some/other/dir/inputFile direc
 
 | Flag | Default | Description |
 |---|---|---|
-| `--projectDir` | `.` | Root directory containing `track-N` subdirectories |
+| `--projectDir` | `.` | Root for anchoring a relative `--outputPath`; also the track-discovery root unless `--inputPaths` is given |
+| `--inputPaths` | None | One or more directories to search for `track-N` subdirectories (overrides `--projectDir` for input) |
 | `--outputPath` | `Release/masterInput` | Output directory (relative to `--projectDir` unless absolute) |
+| `--verbose` | off | List every missing file path per category in the skip summary |
 
-Output:
-
-```
-Found tracks: [1, 11, 14, ...]
-	 ---- track-170 inputFile-170-all2026: missing /path/.../range.offsets ----- 
-754 referenced file(s) missing — see warnings above
-Wrote 377 data lines to Release/masterInput/inputFile
-```
-
-or, when everything resolves:
-
-```
-Found tracks: [1, 11, 14, ...]
-All referenced files verified present.
-Wrote 377 data lines to Release/masterInput/inputFile
-```
+The end-of-run summary reports the total number of data lines seen, how many
+were skipped (and per-category counts of the missing-file types that caused
+the skips), and any tracks that had no `inputFile-N-all20??` at all.
 
 ## Bare-name vs `.vrt` resolution
 

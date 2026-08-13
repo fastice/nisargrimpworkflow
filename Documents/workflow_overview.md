@@ -256,21 +256,22 @@ SetupNISAR 3744 [options]
 
 For each frame directory (`3744_125`, `3744_126`, …):
 
-1. **`RUNWtoGrimp`** — RUNW HDF5 → VRTs:
-   - `*.uw.interp.vrt` — unwrapped phase
+1. **`RUNWtoGrimp`** — RUNW HDF5 → VRTs (default path passes `--noPhase --noIon`):
    - `*.cor.vrt` — coherence
-   - `*.ion.filt.vrt`, `*.ion.filt.rangeOffset.vrt` — ionosphere correction
    - `geodat{NLR}x{NLA}.geojson` — image geometry for reference and secondary
+   - (phase and iono products come from `estimateIonosphere` in step 3;
+     only the legacy `--phaseDerivedIonosphere` path writes `*.uw.interp.vrt`
+     / `*.ion.*.rangeOffset.vrt` here)
 
 2. **`ROFFtoGrimp`** — ROFF HDF5 → GrIMP offset files:
    - Simulates geometry (`simoffsets`), culls (`cullst`), interpolates (`intfloat`)
    - `range.offsets`, `azimuth.offsets` (big-endian float32)
    - `range.offsets.vrt`, `azimuth.offsets.vrt`
 
-3. **Ionosphere** — estimates ionosphere from range offsets (`estimateIonosphere`) unless `--phaseDerivedIonosphere` was set (in which case RUNW step already wrote the correction)
+3. **Ionosphere** — estimates ionosphere from range offsets (`estimateIonosphere`), writing `*.correctedUnwrappedPhase.vrt` and `*.ionosphereCorrection(.offset).vrt` — unless `--phaseDerivedIonosphere` was set (in which case RUNW step already wrote the correction)
 
 4. **Virtual frame assembly** — merges all frames into `{orbit1}_0000/`:
-   - One merged VRT per product type (uw.interp, cor, ion, offsets, …)
+   - One merged VRT per product type (correctedUnwrappedPhase, cor, ionosphereCorrection, offsets, …)
    - Merged geodat GeoJSON (corners and state vectors spanning all frames)
    - `pairinfo` file
 

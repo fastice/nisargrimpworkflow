@@ -47,9 +47,10 @@ filename parser the rest of the package uses — not a separate one-off regex.
 
 One GeoPackage per cycle, named `cycle<NN>.gpkg` (2-digit zero-padded), each
 with layers `ascending` and `descending`. Geometry is reprojected from the
-source geodat's WGS84 lon/lat to **EPSG:3413** (NSIDC North Polar
-Stereographic) — appropriate for Arctic/Greenland projects; an Antarctic
-project would need EPSG:3031 instead (not currently a flag).
+source geodat's WGS84 lon/lat to the EPSG read from the project's
+`project.yaml` `regionFile`/`region` (`defaultRegionDefs().epsg()` — e.g.
+3413 for Greenland, 3031 for Antarctica), falling back to **EPSG:3413**
+(NSIDC North Polar Stereographic) when no region is configured.
 
 | Field | Type | Source |
 |---|---|---|

@@ -463,7 +463,7 @@ def simIceMask(geodat, params, outputDir='.', ompThreads=4):
     maskFile = f"{outputDir}/icemask"
     # run command
     args = f"-ompThreads {ompThreads} -mask {regionDef.dem()} " \
-        f"{regionDef.icemask()} {geodat} {maskFile}"
+        f"{regionDef.icemask()} {outputDir}/{geodat} {maskFile}"
     command = 'siminsar'
     u.callMyProg(command, myArgs=args.split(), screen=True)
     return True
@@ -559,6 +559,10 @@ def main():
     #
     geodat = \
         f'geodat{myRUNW.NumberRangeLooks}x{myRUNW.NumberAzimuthLooks}.geojson'
+    # Write the reference geodat now so siminsar (simIceMask/simPhase below)
+    # can read it on a fresh frame; interpPhase rewrites it later along with
+    # the secondary geodat.
+    myRUNW.writeGeodatGeojson(filename=geodat, path=params['outputDir'])
     # Remove all but the largest connected component.
     myRUNW.maskPhase(largest=True)
     t2 = time.perf_counter()

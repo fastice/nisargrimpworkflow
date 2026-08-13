@@ -122,12 +122,14 @@ estimateIonosphere.py RUNW offsets.vrt output.vrt [options]
 | `--regionFile YAML` | greenland | Region YAML for `defaultRegionDefs`; provides DEM and velocity map paths for `siminsar`. |
 | `--overWrite` | False | Force `siminsar` to regenerate `velSim` and `maskVel` even if they already exist. |
 | `--velThresh M/YR` | 100.0 | Velocity threshold (m/yr) for the `maskVel` `siminsar` call; pixels above this speed are excluded from the ionosphere fit. |
+| `--highVelThresh M/YR` | 1200.0 | Elevated `maskVel` threshold used only for **Antarctic** (EPSG 3031) frames whose largest connected component is ≥ `--largeCCFraction` of the scene. See "Antarctic fast-shelf maskVel gate" below. |
+| `--largeCCFraction FRAC` | 0.20 | Largest-connected-component fraction of the scene at/above which an Antarctic frame is treated as well-unwrapped and uses `--highVelThresh` instead of `--velThresh`. |
 | `--sigma-az PX` | 10.0 | Azimuth Gaussian σ for smoothing the raw ionosphere estimate (pixels). |
 | `--sigma-rg PX` | 30.0 | Range Gaussian σ (pixels). |
 | `--offset-geometry VRT` | `offsets.geom.vrt` | Offset geometry VRT containing the `RangeOffsets` band to subtract from the measured offsets before ionosphere estimation. |
 | `--maskFile FILE` | `None` (resolves to `<simDir>/maskVel.vrt` at runtime) | GeoTIFF or VRT mask; only mask=1 pixels contribute to the ionosphere fit. Created by `siminsar` if not supplied. |
 | `--verticalCorrection FILE` | None | xyDEM grid (m/yr) of submergence/emergence rate; passed to the `velSim` `siminsar` call so its DC anchor matches `correctedUnwrappedPhase`. |
-| `--sepIceRock` | off | Restrict the per-frame `(phase+offset_phase)/2` ionosphere estimate to ice pixels only (mask==2); rock/water excluded, since the estimate assumes nonzero velocity. The excluded rock pixels feed `SetupNISAR.globalFillIonosphere()`'s ice-anchored bias (see below). Requires `--iceRockMask` or an auto-detected `offsetSims/offsets.geom.mask.vrt`. |
+| `--sepIceRock` | off (default from nearest `project.yaml` `sepIceRock` key) | Restrict the per-frame `(phase+offset_phase)/2` ionosphere estimate to ice pixels only (mask==2); rock/water excluded, since the estimate assumes nonzero velocity. The excluded rock pixels feed `SetupNISAR.globalFillIonosphere()`'s ice-anchored bias (see below). Requires `--iceRockMask` or an auto-detected `offsetSims/offsets.geom.mask.vrt`. The default is read from the nearest `project.yaml` (`True` for Greenland, `False` for Antarctica); the flag forces it on. |
 | `--iceRockMask FILE` | None (auto-detects `offsetSims/offsets.geom.mask.vrt` in `--simDir`) | 3-value mask (0=water, 1=rock, 2=ice) for `--sepIceRock`. |
 | `--simOffsets VRT` | `offsets.vrt` if present | VRT of simulated range offsets (SLC pixels) for per-CC diagnostic columns in the ambiguity table. |
 | `--simDir DIR` | `.` (cwd) | Directory where `siminsar` outputs (`velSim.vrt`, `maskVel.vrt`) are written; created if absent. |
@@ -138,13 +140,44 @@ estimateIonosphere.py RUNW offsets.vrt output.vrt [options]
 | `--noPhaseThreshPass` | off | Disable the second-pass iono re-estimation (see below). By default, after Pass 1 converges a second pass re-estimates iono using the phase-residual mask instead of the velocity mask. |
 | `--outputAll` | off | Write all 5 intermediate bands to a multi-band VRT (`ionosphereCorrection`, `correctedUnwrappedPhase`, `ionosphereCorrectionUnfilled`, `offsetPhase`, `unwrappedPhase`). Default: write only the 3 standard outputs as separate single-band VRTs. |
 | `--debugIono` | off | Write extra diagnostic outputs to a `debug/` subdirectory alongside the main output: ambiguity-corrected unwrapped phase (`*.ambiguityCorrectedUnwrappedPhase.vrt`) and iono-corrected range offsets (`range.offsets.corrected.vrt`) in SLC pixel units. |
-| `--verbose` | off | Print progress messages to stdout. |
+| `--verbose` | off | Accepted for compatibility; progress messages are always printed. |
+| `--referencePhase VRT` / `--mask FILE` | None | **Not implemented** — accepted but ignored (a warning is printed). Use `--maskFile` to mask the iono fit. |
 | `--minTol M/YR` | None | Variable smoothing-radius map: m/yr floor for the adaptive tolerance `clip(percentSpeed/100*speed, minTol, maxTol)`, applied to `correctedUnwrappedPhase` as an additional pass on top of `intfloat` hole-filling. Required together with `--percentSpeed`/`--maxTol` to enable the map. |
 | `--percentSpeed PCT` | None | Percent of local speed (e.g. `1` = 1%) used in the adaptive tolerance. Required together with `--minTol`/`--maxTol`. |
 | `--maxTol M/YR` | None | m/yr ceiling for the adaptive tolerance. Required together with `--minTol`/`--percentSpeed`. |
 | `--maxSmoothRadius N` | 50 | Sweep cap, single-look pixels, clamped to ≤ 255 (byte output). |
 | `--smoothNIter N` | 3 | Repeated box-filter passes per sweep step (Gaussian-ish), used both by `run_vel_sim()`'s `siminsar` sweep and the `filterfloat` apply step. |
 | `--noVariableSmoothing` | off | Disable the variable smoothing-radius map even if `--minTol`/`--percentSpeed`/`--maxTol` (or `project.yaml`) supply values. |
+
+---
+
+## Antarctic fast-shelf maskVel gate
+
+`maskVel` selects "slow" pixels (speed `< velThresh`) to **anchor** the ionosphere-phase surface
+fit; everything else is pyramid-filled from those anchors. The default `velThresh=100` m/yr is a
+**Greenland heuristic**: there, fast flow means narrow, shearing outlet glaciers whose phase
+rarely unwraps, so excluding them is correct. **Antarctic ice shelves flow fast (~1000+ m/yr) but
+are smooth and unwrap cleanly**, so the same gate discards *every* anchor on an all-shelf frame →
+empty `maskVel` → the iono fit has no input → `iono` is all-NaN → `phase − iono = NaN` everywhere
+→ the entire `correctedUnwrappedPhase` product is discarded (0% valid).
+
+The discriminator for "did this unwrap into a reliable region" is not speed but the **size of the
+largest connected component**. So for Antarctic frames only (`region.epsg() == 3031`), if the
+largest connected component is at least `--largeCCFraction` (default 0.20) of the scene, the fit
+uses `--highVelThresh` (default 1200 m/yr) in place of `--velThresh`, letting the fast-but-well-
+unwrapped shelf pixels anchor the iono estimate. The phase (measured `(offset_phase + phase)/2`)
+carries no velocity-model dependence, so a smooth coherent shelf yields a clean iono estimate at
+any speed. Greenland/Columbia (EPSG 3413) always use `--velThresh`, and an Antarctic frame that
+did *not* unwrap into a large component also falls back to `--velThresh` (its fragmented phase is
+genuinely unreliable). A log line reports when the elevated threshold fires:
+
+```
+Antarctica: largest connected component is 99% of scene (>= 20%, well unwrapped) -- raising maskVel velThresh 100 -> 1200 m/yr
+```
+
+All three values are tunable from `project.yaml` (keys `velThresh`, `highVelThresh`,
+`largeCCFraction`), read by `SetupNISAR` and passed through `processFrameIonosphere` to
+`estimateIonosphere`; omit a key to use the default above.
 
 ---
 
@@ -236,7 +269,7 @@ write_geotiff() + write_output_vrt()
                            — single-band offset-grid VRT (ionosphereCorrection.offset.vrt)
 
 [if --debugIono]
-corrected = offset_slp − iono_offset_pix
+corrected = offset_slp + iono_offset_pix
 write_geotiff() + write_output_vrt()
                            — debug/range.offsets.corrected.vrt (SLC pixels)
 ```
@@ -270,7 +303,7 @@ Written to `debug/` alongside the main output directory.
 | File | Band | Units | Description |
 |------|------|-------|-------------|
 | `debug/<stem>.ambiguityCorrectedUnwrappedPhase.vrt` | 1 | rad | Unwrapped phase after ambiguity correction only (before iono subtraction); useful for diagnosing how much the ambiguity loop changed the phase. |
-| `debug/range.offsets.corrected.vrt` | 1 `RangeOffsetsCorrected` | SLC px | Raw range offsets minus the iono correction (`offset_slp − iono_offset_pix`); NaN/−2×10⁹ where either the measurement or the correction is missing. |
+| `debug/range.offsets.corrected.vrt` | 1 `RangeOffsetsCorrected` | SLC px | Raw range offsets plus the iono correction (`offset_slp + iono_offset_pix` — the correction is negative for positive ΔTEC, so consumers ADD it); NaN/−2×10⁹ where either the measurement or the correction is missing. |
 
 ---
 

@@ -11,11 +11,14 @@ import os
 import re
 
 import yaml
+import sarfunc
 import utilities as u
 from osgeo import ogr, osr
 from nisargrimpworkflow.FileNISARProducts import parseFileName
 
 defaultOutputDirName = 'frameInventory'
+sigmaRBaselineThresh = 1.0
+sigmaBaselineThresh = 20.0
 
 directionNames = {'A': 'ascending', 'D': 'descending'}
 
@@ -61,6 +64,40 @@ def loadFramePattern(projectDir):
         with open(projPath) as fp:
             proj = yaml.safe_load(fp) or {}
     return proj.get('framePattern', '00??')
+
+
+def loadEpsg(projectDir):
+    '''Read the output EPSG from the project.yaml regionFile (or region) via
+    defaultRegionDefs().epsg() -- same key convention as
+    RUNWtoGrimp._epsgFromProjectYaml: either key's value is treated as a
+    region-YAML file path when it exists on disk (relative paths resolved
+    against projectDir first, then cwd), otherwise as a region name.
+    Falls back to 3413 (Greenland) if project.yaml, the region keys, or
+    the region file are unavailable.'''
+    projPath = os.path.join(projectDir, 'project.yaml')
+    try:
+        with open(projPath) as fp:
+            proj = yaml.safe_load(fp) or {}
+        regionPath = proj.get('regionFile') or proj.get('region')
+        if regionPath is not None:
+            regionPath = str(regionPath)
+            if not os.path.isabs(regionPath):
+                candidate = os.path.join(projectDir, regionPath)
+                if os.path.isfile(candidate):
+                    regionPath = candidate
+            if os.path.isfile(regionPath):
+                epsg = sarfunc.defaultRegionDefs(
+                    None, regionFile=regionPath).epsg()
+            else:
+                # A region name (e.g. 'greenland'); defaultRegionDefs exits
+                # via myerror on unknown names, hence SystemExit below.
+                epsg = sarfunc.defaultRegionDefs(regionPath).epsg()
+            if epsg:
+                return int(epsg)
+    except (Exception, SystemExit) as e:
+        u.mywarning(f'loadEpsg: could not read EPSG from {projPath} ({e})')
+    print('loadEpsg: no region/regionFile EPSG found; defaulting to 3413')
+    return 3413
 
 
 def buildFrameGpkgArgs():
@@ -247,7 +284,7 @@ def groupByCycle(records):
     return byCycle
 
 
-def writeCycleGpkg(gpkgPath, recordsByDirection):
+def writeCycleGpkg(gpkgPath, recordsByDirection, epsg=3413):
     if os.path.exists(gpkgPath):
         os.remove(gpkgPath)
     driver = ogr.GetDriverByName('GPKG')
@@ -257,7 +294,7 @@ def writeCycleGpkg(gpkgPath, recordsByDirection):
     srcSRS.ImportFromEPSG(4326)
     srcSRS.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
     dstSRS = osr.SpatialReference()
-    dstSRS.ImportFromEPSG(3413)
+    dstSRS.ImportFromEPSG(epsg)
     dstSRS.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
     transform = osr.CoordinateTransformation(srcSRS, dstSRS)
     #
@@ -286,10 +323,11 @@ def main():
         u.myerror(f'No usable virtual frames found under {projectDir}')
     os.makedirs(outputDir, exist_ok=True)
     byCycle = groupByCycle(records)
-    print(f'\nOutput dir: {outputDir}  (EPSG:3413)')
+    epsg = loadEpsg(projectDir)
+    print(f'\nOutput dir: {outputDir}  (EPSG:{epsg})')
     for cycle in sorted(byCycle):
         gpkgPath = os.path.join(outputDir, f'cycle{cycle:02d}.gpkg')
-        writeCycleGpkg(gpkgPath, byCycle[cycle])
+        writeCycleGpkg(gpkgPath, byCycle[cycle], epsg=epsg)
         nAsc = len(byCycle[cycle]['ascending'])
         nDesc = len(byCycle[cycle]['descending'])
         print(f'  cycle{cycle:02d}.gpkg: {nAsc} ascending, {nDesc} descending')
@@ -301,6 +339,18 @@ def main():
         print(f'\nMotion directories missing/empty baseline files ({len(motionIssues)}):')
         for d, r in motionIssues:
             print(f'  {d}: {r}')
+
+    highSigmaFrames = [r for r in records
+                       if r['sigmaRBaseline'] > sigmaRBaselineThresh
+                       or r['sigmaBaseline'] > sigmaBaselineThresh]
+    if highSigmaFrames:
+        print(f'\nFrames with sigmaRBaseline > {sigmaRBaselineThresh} or '
+              f'sigmaBaseline > {sigmaBaselineThresh} ({len(highSigmaFrames)}):')
+        for r in highSigmaFrames:
+            print(f'  track-{r["track"]}/{r["virtualFrameId"]}: '
+                  f'sigmaBaseline={r["sigmaBaseline"]:.4f}, '
+                  f'sigmaRBaseline={r["sigmaRBaseline"]:.4f}')
+
     print(f'\nYou can now run buildFrameLayers --inventoryDir {outputDir} '
           'to create a QGIS .qlr file for browsing these in QGIS.')
 

@@ -15,6 +15,7 @@ from osgeo import ogr
 defaultInventoryDirName = 'frameInventory'
 defaultOffsetsSigmaThresh = 0.5
 highSigmaOutlineColor = '230,30,30,255'
+badOutlineColor = '0,0,0,255'
 
 sigmaFields = ['sigmaBaseline', 'sigmaRBaseline', 'sigmaAz']
 defaultSigmaField = 'sigmaRBaseline'
@@ -177,8 +178,8 @@ def buildFrameLayersArgs():
         description='\n\n\033[1mBuild a QGIS Layer Definition (.qlr) with '
         'a "Frames" group (sigma_field-switchable), an "rBaseline" group '
         '(fixed 10-class sigmaRBaseline coloring) -- both organized '
-        'ascending/descending > Cycle N -- and a flat high-sigma flag group '
-        '(ascending/descending only, not split by cycle) \033[0m\n\n'
+        'ascending/descending > Cycle N -- and flat high-sigma/"Bad" flag '
+        'groups (ascending/descending only, not split by cycle) \033[0m\n\n'
         'Reads the per-cycle GeoPackages written by buildFrameGpkg; run '
         'that first.\n\n')
     parser.add_argument('--projectDir', type=str, default='.',
@@ -407,12 +408,12 @@ def buildTopGroup(groupName, cycleGpkgs, rendererXml, fieldBlocks,
             f'      </layer-tree-group>\n')
 
 
-def buildFlatHighSigmaGroup(groupName, cycleGpkgs, inventoryDir, thresh,
-                            fieldBlocks, mapLayerBlocks):
+def buildFlatFilteredGroup(groupName, cycleGpkgs, inventoryDir, subsetFilter,
+                           outlineColor, fieldBlocks, mapLayerBlocks):
     '''A group with one layer per direction (no per-cycle nesting) showing
-    every frame across all cycles where sigmaRBaseline > thresh, via an OGR
-    VRT Union Layer + subset filter rather than per-cycle layers.'''
-    rendererXml = buildFixedOutlineRendererXml(highSigmaOutlineColor)
+    every frame across all cycles matching subsetFilter, via an OGR VRT
+    Union Layer + subset filter rather than per-cycle layers.'''
+    rendererXml = buildFixedOutlineRendererXml(outlineColor)
     layerTreeLines = []
     for direction in ('ascending', 'descending'):
         vrtPath = buildUnionVrt(
@@ -422,7 +423,6 @@ def buildFlatHighSigmaGroup(groupName, cycleGpkgs, inventoryDir, thresh,
         # are valid there. The XML-attribute-escaped form is needed
         # separately for <layer-tree-layer source="...">, since that's an
         # attribute value and a literal '"' would terminate it early.
-        subsetFilter = f'"sigmaRBaseline" > {thresh}'
         layerId, mapLayerXml = buildUnionMapLayer(
             vrtPath, direction, subsetFilter, rendererXml, fieldBlocks)
         mapLayerBlocks.append(mapLayerXml)
@@ -452,16 +452,21 @@ def main():
                                rBaselineClassColors),
         fieldBlocks, mapLayerBlocks)
     highSigmaGroupName = xmlAttrEscape(f'sigmaRBaseline > {offsetsSigmaThresh}')
-    highSigmaGroup = buildFlatHighSigmaGroup(
-        highSigmaGroupName, cycleGpkgs, inventoryDir, offsetsSigmaThresh,
+    highSigmaGroup = buildFlatFilteredGroup(
+        highSigmaGroupName, cycleGpkgs, inventoryDir,
+        f'"sigmaRBaseline" > {offsetsSigmaThresh}', highSigmaOutlineColor,
         fieldBlocks, mapLayerBlocks)
+    badGroup = buildFlatFilteredGroup(
+        'Bad', cycleGpkgs, inventoryDir,
+        '"sigmaRBaseline" = -1 AND "sigmaRBaselineWithoutIon" = -1',
+        badOutlineColor, fieldBlocks, mapLayerBlocks)
     #
     qlr = (
         "<!DOCTYPE qgis-layer-definition>\n<qlr>\n"
         '  <layer-tree-group checked="Qt::Checked" expanded="1" '
         'groupLayer="" name="">\n'
         '    <customproperties>\n      <Option/>\n    </customproperties>\n'
-        + framesGroup + rBaselineGroup + highSigmaGroup +
+        + framesGroup + rBaselineGroup + highSigmaGroup + badGroup +
         '  </layer-tree-group>\n  <maplayers>\n' + ''.join(mapLayerBlocks) +
         '  </maplayers>\n</qlr>\n')
     with open(output, 'w') as fp:
@@ -473,7 +478,7 @@ def main():
         lo, hi = sigmaRanges[f]
         print(f'  {f}: range [{lo:.4f}, {hi:.4f}]')
     print('\nIn QGIS: Layer > Add Layer > Add Layer Definition File... and '
-          'pick this .qlr -- you get three top-level groups:')
+          'pick this .qlr -- you get four top-level groups:')
     print('  "Frames" and "rBaseline" -- each organized '
           '"ascending"/"descending" > one "Cycle N" layer per cycle.')
     print('  "Frames" -- color driven by the sigma_field project variable '
@@ -488,6 +493,9 @@ def main():
           '"ascending"/"descending" layers (not split by cycle) flagging '
           'every frame across all cycles above the threshold. Change the '
           'threshold with --offsetsSigmaThresh.')
+    print('  "Bad" -- flat "ascending"/"descending" layers flagging frames '
+          'where rparams found no solution at all (sigmaRBaseline and '
+          'sigmaRBaselineWithoutIon both exactly -1).')
 
 
 if __name__ == '__main__':

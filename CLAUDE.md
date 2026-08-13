@@ -24,6 +24,25 @@ Scripts in this package:
 | `setupNISARTracks` | `setupNISARTracks.py:main()` | Initialise track dirs and refresh tie points across all tracks |
 | `buildFrameGpkg` | `buildFrameGpkg.py:main()` | Per-cycle QC GeoPackages of virtual frames (see [doc](Documents/buildFrameGpkg.md)) |
 | `buildFrameLayers` | `buildFrameLayers.py:main()` | QGIS `.qlr` layer tree for `buildFrameGpkg`'s output (see [doc](Documents/buildFrameLayers.md)) |
+| `estimateIonosphere` | `estimateIonosphere.py:main()` | Offset-based ionosphere estimation + corrected phase (see [doc](Documents/estimateIonosphere.md)) |
+| `custom_buildvrtWithOffsets` | `custom_buildvrtWithOffsets.py:main()` | gdalbuildvrt replacement that solves/applies per-frame DC offsets when merging |
+| `checkFrameInputs` | `checkFrameInputs.py:main()` | Scan virtual frames for missing offsets/phase/iono products (see [doc](Documents/checkFrameInputs.md)) |
+| `makeMaster` | `makeMaster.py:main()` | Assemble master input file lists (see [doc](Documents/makeMaster.md)) |
+| `autoupdateNISAR` | `autoupdate.py:main()` | Cron driver: search/download + one-day completion buffer + full processing chain (see [doc](Documents/autoupdate.md)) |
+
+---
+
+## autoupdateNISAR
+
+Daily cron driver. Searches ASF, downloads into a dated staging folder, holds each
+day's data one day so late-arriving frames of the same `(cycle, track)` pass can be
+merged in, then releases the completed passes and runs the chain:
+`FileNISARProducts` → per-orbit `SetupNISAR` (no `--new`, so virtual frames extended
+by late frames rebuild in place) → `setupNISARTracks --year` → `makeMaster`. Orbit is
+derived from the filename via `orbitFromCycleTrack(cycle, track) = 173*cycle + track
++ 618` (in `FileNISARProducts.py`), so no HDF5 read is needed to find the
+`track-<track>/<orbit1>_*` dirs. `--noDownload` runs the chain on already-staged
+folders. Full detail in [autoupdate.md](Documents/autoupdate.md).
 
 ---
 
@@ -35,11 +54,11 @@ Converts a single NISAR ROFF (range/azimuth offset) HDF5 product into the GrIMP 
 
 1. Opens ROFF HDF5 via `nisarhdf.nisarROFFHDF`
 2. Discards offsets below correlation peak thresholds (per layer: default 0.07, 0.05, 0.025)
-3. Writes `.dat` metadata files (`offsets.dat`, `offsets.geom.dat`) for use by `simoffsets`
-4. Calls `simoffsets` (GIT64 C binary, two threads):
+3. Writes `.dat` metadata files (`offsets.velocity.dat`, `offsets.geom.dat`) into `offsetSims/` for use by `simoffsets`
+4. Calls `simoffsets` (GIT64 C binary, two threads); outputs land in `offsetSims/`:
    - geometry-only simulation (no velocity): `offsets.geom.*`
-   - full simulation (geometry + velocity): `offsets.*`
-5. Optionally applies a mask (`offsets.mask.vrt`) from the simulation to fast-moving areas (layer 3)
+   - full simulation (geometry + velocity): `offsets.velocity.*`
+5. Optionally applies a mask (`workingDir/offsets.velocity.mask.vrt`) from the simulation to fast-moving areas (layer 3)
 6. Writes per-layer binary flat files to `workingDir/`:
    - `NISARoffsets.layer{N}.dr` — range offsets (big-endian float32)
    - `NISARoffsets.layer{N}.da` — azimuth offsets
@@ -61,9 +80,15 @@ The VRTs carry metadata that `mosaic3d` reads via GDAL:
 ROFFtoGrimp [--outputDir DIR] [--noMask] [--verbose] [--mergeOnly]
             [--correlationThresholds T1 T2 T3]
             [--boxSize N] [--nGood N] [--maxR F] [--maxA F] [--sr N] [--sa N]
-            [--interpThresh N] [--islandThresh N] ROFF_HDF5
+            [--interpThresh N] [--islandThresh N]
+            [--geodat1 F] [--geodat2 F] [--DEM F] [--region R] [--regionFile YAML]
+            [--verticalCorrection F] [--ompThreads N] [--byteOrder MSB|LSB]
+            [--minTol F --percentSpeed F --maxTol F] [--maxSmoothRadius N]
+            [--smoothNIter N] [--noVariableSmoothing] [--debugIono] ROFF_HDF5
 ```
 `--mergeOnly` skips simulation/culling/interpolation and only re-runs the final merge step.
+The `--minTol/--percentSpeed/--maxTol` trio (all three required together) enables the variable
+smoothing-radius map applied on top of the fixed `--sr/--sa` smoothing.
 
 ---
 
@@ -73,13 +98,25 @@ Converts a single NISAR RUNW (unwrapped interferogram) HDF5 product into VRT fil
 
 ### Output files (in `outputDir/orbit1_frame/`)
 
-- `{orbit1}_{frame}.{orbit2}_{frame}.{NLR}x{NLA}.uw.interp.vrt` — unwrapped phase
-- `{orbit1}_{frame}.{orbit2}_{frame}.{NLR}x{NLA}.cor.vrt` — coherence
-- `{orbit1}_{frame}.{orbit2}_{frame}.{NLR}x{NLA}.ion.filt.vrt` — ionosphere correction (filtered)
-- `{orbit1}_{frame}.{orbit2}_{frame}.{NLR}x{NLA}.ion.filt.rangeOffset.vrt` — iono as range offset
-- `{orbit1}_{frame}.{orbit2}_{frame}.{NLR}x{NLA}.ion.unfilt.rangeOffset.vrt` — unfiltered iono
+**Default pipeline path** (`SetupNISAR` invokes it with `--noPhase --noIon`): only
 
-Also writes `geodat{NLR}x{NLA}.geojson` and `geodat{NLR}x{NLA}.secondary.geojson` for both reference and secondary orbits.
+- `{orbit1}_{frame}.{orbit2}_{frame}.{NLR}x{NLA}.nisar.cor` (+ `.vrt`) — coherence
+- `geodat{NLR}x{NLA}.geojson` / `geodat{NLR}x{NLA}.secondary.geojson`
+
+The interpolated/corrected phase and ionosphere products are produced downstream by
+`estimateIonosphere` (`*.correctedUnwrappedPhase.vrt`, `*.ionosphereCorrection*.vrt`).
+
+**Legacy `--phaseDerivedIonosphere` path** additionally writes:
+
+- `{orbit1}_{frame}.{orbit2}_{frame}.{NLR}x{NLA}.nisar.uw.interp.vrt` — unwrapped phase (band description `Phase`)
+- `{orbit1}_{frame}.{orbit2}_{frame}.{NLR}x{NLA}.nisar.ion.filt.rangeOffset.vrt` — filtered iono as range offset
+- `{orbit1}_{frame}.{orbit2}_{frame}.{NLR}x{NLA}.nisar.ion.unfilt.rangeOffset.vrt` — unfiltered iono
+
+The `radiansToPixels = −λ/(4π·slp)` scale here converts the ionosphere phase screen to a
+*correction* (correction = −ionosphere), so like the `estimateIonosphere` products it is
+ADDed by consumers — the opposite-looking sign vs `estimateIonosphere`'s `+λ/(4π·slp)` is
+not a discrepancy (that scale applies to an already-negative iono estimate). See
+`Documents/estimateIonosphere.md` "Background and equations".
 
 ---
 
@@ -90,20 +127,23 @@ Orchestrates multi-frame conversion for a full orbit pass and assembles per-fram
 ### Directory structure assumed
 
 ```
-{orbit1}_{frame}/
-    NISAR*RUNW*.h5
-    NISAR*ROFF*.h5
+{orbit1}_{frame}/          ← frame suffix unpadded (e.g. 1830_35)
+    H5/
+        NISAR*RUNW*.h5
+        NISAR*ROFF*.h5
+        NISAR*RIFG*.h5
 ```
-Multiple frame directories for the same `orbit1`.
+Multiple frame directories for the same `orbit1`. (HDF5s at the frame-dir root
+are still found as a fallback.)
 
 ### Processing flow
 
-1. Discovers frame directories (`{orbit1}_{NN}`) matching the orbit number
-2. Determines secondary orbit and bandwidth from the first RUNW/ROFF found
-3. For each frame: calls `processFrameRUNW` → `ROFFtoGrimp` → `processFrameROFF`
+1. Discovers frame directories (`{orbit1}_{NN}`) matching the orbit number and splits them into contiguous groups (with secondary-epoch/bandwidth splitting)
+2. Determines secondary orbit and bandwidth per group (majority vote across the group's frames)
+3. For each frame: calls `processFrameRUNW` → `ROFFtoGrimp` → `processFrameROFF`, then `estimateIonosphere` per frame (unless `--phaseDerivedIonosphere`)
 4. Copies `sensor.NISAR{bw}.yaml` into the virtual-frame directory and updates `intLooksR`/`intLooksA`
 5. Calls `createVirtualFrameRUNW`:
-   - Runs `custom_buildvrtWithOffsets.py` for each product type: `uw.interp`, `cor`, `ion.filt`, `ion.filt.rangeOffset`, `ion.unfilt.rangeOffset`
+   - Runs `custom_buildvrtWithOffsets.py` per product type: `correctedUnwrappedPhase`, `cor`, `ionosphereCorrection`, `ionosphereCorrection.offset` (with global fill: the `Unfilled` variants instead, filled later by `globalFillIonosphere()`; with `--phaseDerivedIonosphere`: the legacy `uw.interp` / `ion.*.rangeOffset` products)
    - Writes merged geodat GeoJSONs (merging corners and state vectors across frames)
 6. Calls `createVirtualFrameROFF`:
    - Runs `custom_buildvrtWithOffsets.py` for all ROFF VRT types
@@ -112,7 +152,10 @@ Multiple frame directories for the same `orbit1`.
 
 ### Virtual frame naming
 
-Frame `0000` (default `--virtualFrame`) is the virtual merged product. Individual frames are `orbit1_NN`. A virtual-frame directory `orbit1_0000/` holds all merged VRTs.
+`--virtualFrame` defaults to `None`: virtual-frame numbers are assigned automatically per
+contiguous frame group (`assignVirtualFrameNumbers`), with `0000` the canonical full group and
+higher suffixes for straggler/fragment groups. Individual frames are `orbit1_NN` (unpadded).
+Pass `--virtualFrame VVVV` to force a specific suffix.
 
 ### Mixed mode
 
@@ -122,9 +165,18 @@ NISAR products where the SLC granule name contains `_M_` are mixed mode. By defa
 
 ```
 SetupNISAR orbit1 [--virtualFrame VVVV] [--firstFrame N] [--lastFrame N]
+           [--firstDate YYYY-MM-DD] [--lastDate YYYY-MM-DD]
            [--overWrite] [--overWritePhase] [--allowMixedMode]
-           [--RUNWOnly] [--noMask] [--verbose]
+           [--RUNWOnly] [--noMask] [--verbose] [--ompThreads N]
+           [--phaseDerivedIonosphere] [--sepIceRock] [--noGlobalFillIono]
+           [--retainIntermediateIono] [--debugIono]
+           [--phaseThresh RAD] [--noPhaseThreshPass] [--outputAll]
+           [--sigmaAz PX] [--sigmaRg PX]
+           [--correlationOnly | --corrOnly] [--geodatsOnly] [--bakeOnly]
+           [--new] [--clean] [--cleanDebug] [--noPrompt]
 ```
+See `SetupNISAR --help` (or [Documents/SetupNISAR.md](Documents/SetupNISAR.md)) for details;
+production runs use `--sepIceRock` (which also enables the global ionosphere fill).
 
 ---
 
@@ -140,6 +192,47 @@ The `.geojson` files carry per-image geometry. Key `properties` fields:
 - `SV_Pos_N`, `SV_Vel_N` — state vectors (ECEF, metres and m/s)
 
 When merging frames, corners are updated to span first-to-last, and state vectors are merged by sorting, deduplicating, and cubic interpolating onto a uniform time grid.
+
+### Squint (residual Doppler) — extracted, merged, and applied as an opt-in `mosaic3d` correction
+
+3-stage rollout (see `~/progs/GIT64/mosaicSource/CLAUDE.md` "Squint (residual Doppler)
+sensitivity" for why the underlying analysis concluded no `mosaic3d` fix is currently needed, and
+`~/PycharmProjects/packages/nisarErrors/Documents/plotSquintError.md` for the full derivation):
+1. **Done** — `RUNWtoGrimp`/`nisarhdf` measures squint per RUNW sub-frame from the
+   `geolocationGrid` cube and writes a 6-parameter polynomial fit into each per-frame geodat's
+   `squintAnglePolynomial` key (see `nisarhdf/CLAUDE.md`). `None` for the secondary image.
+2. **Done** — `SetupNISAR.mergedGeodat()` combines per-sub-frame fits into one polynomial for
+   the virtual frame, via the new `mergeSquintAnglePolynomial(geos, geoMerged)` helper (defined
+   just above `mergedGeodat()`, called right after the existing
+   `MLNearRange`/`MLFarRange`/`MLCenterRange` recompute block). Each sub-frame's polynomial is
+   only valid over its own local azimuth window, so the per-frame coefficients can't be averaged
+   directly — instead each sub-frame's fitted surface is resampled onto a grid spanning the
+   *merged* range bounds (shared swath geometry across sub-frames of one pass) and *that
+   sub-frame's own* reconstructed azimuth bounds, every sub-frame's samples are pooled, and a
+   single polynomial is refit over the combined domain (the same "redistribute onto one common
+   reference" idea `mergeStateVectors()` already uses). A sub-frame's azimuth span isn't stored
+   directly in the geodat schema but is exactly reconstructable from fields that are:
+   `azimuthSpan = (MLAzimuthSize - 1) * (NumberAzimuthLooks / PRF)`, centered on
+   `squintAnglePolynomial['refAzimuthTime']`. No-op (stays `None`) for the secondary image —
+   detected via `geoMerged['properties']['squintAnglePolynomial'] is None`, no need to check the
+   `secondary` flag explicitly. Verified on real data (track-25, orbit 3757, frames 51-55): merged
+   `c0` = 1.4825° sits sensibly among the per-frame values (1.470°-1.501°, a smooth ~0.03°
+   frame-to-frame drift matching the analysis doc's documented noise floor); re-evaluating the
+   merged fit against each sub-frame's own fitted surface gives residual std ~0.0002°. Also
+   writes flat top-level `squintCoefficients`/`squintRefRange`/`squintRefAzimuthTime` fields
+   alongside the nested `squintAnglePolynomial` dict — needed because `mosaic3d`'s C-side reader
+   (GDAL's OGR GeoJSON driver) can't read a nested object, only flat scalars/lists.
+3. **Done** — `mosaic3d` consumes the merged polynomial, phase path only (`make3DMosaic.c`, not
+   `make3DOffsets.c`), behind `-useSquint` (default off). See `mosaicSource/CLAUDE.md`'s squint
+   section for the C-side implementation and verification (a real `mosaic3d` run on an actual
+   overlapping ascending/descending pair confirmed both the rotation magnitude and sign).
+
+**End-to-end plumbing** (opt-in, off by default): `project.yaml` key `applySquintCorrection`
+(default `false`) → `setupNISARTracks --useSquint`/`--noUseSquint` (CLI overrides the project
+default) → `refreshties.py --useSquint` → `makeframetie.py --useSquint` → `tie_script
+--useSquint`, which appends `-useSquint` to the `mosaic3d` call and to both `tiepoints -motion`
+call sites. See `mosaicworkflow/CLAUDE.md` and `insarworkflow/CLAUDE.md` for those packages'
+squint entries.
 
 ## Bandwidth → sensor YAML mapping
 
@@ -198,11 +291,12 @@ outputPath/
       NISAR_L1_PR_ROFF_....h5   (symlink)
       NISAR_L1_PR_RIFG_....h5   (symlink)
       NISAR_L1_PR_RSLC_....h5   (symlink, if present)
-    12345_010/                   ← SetupNISAR reads from here
-      NISAR_L1_PR_RUNW_....h5   (symlink)
-      NISAR_L1_PR_ROFF_....h5   (symlink)
-      NISAR_L1_PR_RIFG_....h5   (symlink)
-    12345_020/
+    12345_10/                    ← SetupNISAR reads from here (frame unpadded)
+      H5/
+        NISAR_L1_PR_RUNW_....h5 (symlink)
+        NISAR_L1_PR_ROFF_....h5 (symlink)
+        NISAR_L1_PR_RIFG_....h5 (symlink)
+    12345_20/
       ...
     unfiled/                     ← duplicate products not selected
       NISAR_L1_PR_RUNW_....h5   (symlink)
@@ -260,12 +354,14 @@ they never write into `track-N/`. Full detail in
    missing a required input is skipped with a printed reason, not silently
    patched over.
 2. **`buildFrameLayers`** reads that GeoPackage directory and writes a QGIS
-   `.qlr` with three groups: `Frames` (sigma field switchable via a QGIS
+   `.qlr` with four groups: `Frames` (sigma field switchable via a QGIS
    project variable) and `rBaseline` (fixed 10-class `sigmaRBaseline`
-   coloring), both organized `ascending`/`descending` → `Cycle N`; and a flat
-   `sigmaRBaseline > <thresh>` group (`--offsetsSigmaThresh`, default `0.5`)
-   with just `ascending`/`descending` — no per-cycle split — built from an
-   OGR VRT Union Layer across all cycles' GeoPackages plus a subset filter.
+   coloring), both organized `ascending`/`descending` → `Cycle N`; plus two
+   flat groups with just `ascending`/`descending` — no per-cycle split —
+   built from an OGR VRT Union Layer across all cycles' GeoPackages plus a
+   subset filter: `sigmaRBaseline > <thresh>` (`--offsetsSigmaThresh`,
+   default `0.5`) and `Bad` (frames with `sigmaRBaseline = -1 AND
+   sigmaRBaselineWithoutIon = -1`, i.e. no baseline solution).
 
 Both are general — they work on any directory laid out as `track-N/*_0000/`,
 not just one specific project.

@@ -54,6 +54,8 @@ import subprocess
 import sys
 import threading
 import time
+
+import yaml
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
 from scipy import ndimage
@@ -90,7 +92,7 @@ class _Spinner:
         self._thread = threading.Thread(target=self._spin, daemon=True)
 
     def _spin(self):
-        for ch in itertools.cycle(r'|/-\\'):
+        for ch in itertools.cycle('|/-\\'):
             if self._stop.is_set():
                 break
             print(f'\r  {self._msg} {ch}', end='', flush=True)
@@ -120,17 +122,59 @@ def load_runw(path, frame):
     return runw
 
 
+# Fallback only: apply_runw_mask() decides the mask encoding primarily from the
+# stored data type (8-bit = legacy, 32-bit = new), which is self-describing. The
+# processor CRID (the number in the P#####/X##### granule-name token) is consulted
+# only if the dtype is ambiguous. This is the CRID at/above which the new 32-bit
+# subswath/anomaly encoding (seen in P05023) is assumed vs the legacy 2-bit
+# encoding (P05012 and earlier). Boundary is approximate — no intermediate product
+# was on hand to test; adjust if a version between 5012 and 5023 uses either scheme.
+NEW_MASK_MIN_CRID = 5020
+
+# maskVel slow-pixel gate for the ionosphere fit. The default velThresh (100 m/yr)
+# is a Greenland heuristic: there, fast flow means narrow, shearing outlet glaciers
+# whose phase rarely unwraps, so gating them out is right. Antarctic ice shelves flow
+# fast (~1000+ m/yr) but are smooth and unwrap cleanly, so that gate discards every
+# anchor on all-shelf frames and the iono fit degenerates to all-NaN (whole scene
+# lost). For Antarctic regions, when the phase has unwrapped into one large connected
+# component (a big coherent region => reliable phase), raise the threshold so those
+# fast-but-well-unwrapped shelf pixels can anchor the fit.
+ANTARCTIC_EPSG = 3031
+LARGE_CC_FRACTION = 0.20            # largest connected component >= this fraction of scene
+ANTARCTIC_HIGH_VELTHRESH = 1200.0  # m/yr, used in place of --velThresh for qualifying Antarctic frames
+
+
+def _runw_crid(runw):
+    """Return the integer processor CRID (e.g. 5023 for P05023) parsed from the
+    granule filename, or None if it can't be determined. The CRID is the single
+    letter+5-digit token in a NISAR granule name, e.g.
+    NISAR_L1_PR_RUNW_..._<secStop>_P05023_N_F_J_001.h5 -> 5023."""
+    name = os.path.basename(getattr(runw, 'hdfFile', '') or '')
+    for tok in name.split('_'):
+        m = re.fullmatch(r'[A-Za-z](\d{5})', tok)
+        if m:
+            return int(m.group(1))
+    return None
+
+
 def apply_runw_mask(phase, runw):
-    """The RUNW interferogram mask is not a boolean -- it encodes per-RSLC
-    subswath validity in its two lowest bits: bit 1 = reference RSLC valid,
-    bit 0 = secondary RSLC valid; a pixel is only valid if both are set
-    (mask & 0b11 == 0b11). (Working interpretation as of 2026-06-22, pending
-    confirmation from the algorithm team on the official product spec.) A
-    plain `mask == 0` check matches almost nothing in practice -- e.g.
-    mask=1 (bit1=0) means the reference sample is invalid even though the
-    value isn't literally 0 -- and lets large invalid regions (e.g.
-    swath-edge pixels with passable-looking coherence but no valid subswath
-    in one RSLC) through unmasked.
+    """Mask invalid RUNW pixels (set to NaN) from the interferogram 'mask'
+    dataset, whose encoding differs by processor version -- here we only mask
+    samples with no valid subswath in one RSLC; anomaly / iono-fill bits ignored.
+
+    Which encoding applies is decided primarily from the mask's stored data type,
+    which is self-describing: the new (P05023+) mask is a 32-bit uint, the legacy
+    (P05012) mask is 8-bit. The processor CRID from the granule name is used only
+    as a fallback when the dtype is ambiguous (neither 1- nor >=4-byte).
+
+    Legacy 8-bit: the two low bits are per-RSLC subswath validity -- bit 1 =
+    reference valid, bit 0 = secondary valid; valid only if both are set
+    (mask & 0b11 == 0b11).
+
+    New 32-bit: the low byte (bits 0-7) is a decimal subswath code -- tens digit =
+    reference RSLC subswath number, ones digit = secondary RSLC subswath number;
+    a 0 in either digit means that RSLC sample is invalid. (Bits 8-23 are per-RSLC
+    anomaly flags and bit 24 an ionospheric-fill flag, all ignored for now.)
     """
     try:
         mask_ds = runw.h5[runw.product][runw.bands][runw.frequency][runw.productType]['mask']
@@ -138,10 +182,27 @@ def apply_runw_mask(phase, runw):
         print("  No interferogram mask found — skipping.")
         return phase
     mask = np.asarray(mask_ds)
-    invalid = (mask & 0b11) != 0b11
+    itemsize = mask.dtype.itemsize
+    if itemsize >= 4:
+        new_format, basis = True, f"{8 * itemsize}-bit dtype"
+    elif itemsize == 1:
+        new_format, basis = False, "8-bit dtype"
+    else:
+        crid = _runw_crid(runw)
+        new_format = crid is not None and crid >= NEW_MASK_MIN_CRID
+        basis = f"{8 * itemsize}-bit dtype, CRID " + (f"P{crid:05d}" if crid is not None else "unknown")
+    if new_format:
+        subswath = mask & 0xFF
+        ref_subswath = (subswath // 10) % 10
+        sec_subswath = subswath % 10
+        invalid = (ref_subswath == 0) | (sec_subswath == 0)
+        scheme = f"32-bit subswath ({basis})"
+    else:
+        invalid = (mask & 0b11) != 0b11
+        scheme = f"legacy 2-bit ({basis})"
     n_bad = int(invalid.sum())
     n_total = mask.size
-    print(f"  Interferogram mask: {n_bad:,} / {n_total:,} pixels masked "
+    print(f"  Interferogram mask ({scheme}): {n_bad:,} / {n_total:,} pixels masked "
           f"({100.0 * n_bad / n_total:.2f}%)")
     phase[invalid] = np.nan
     return phase
@@ -503,8 +564,25 @@ def parse_args():
                         'correctedUnwrappedPhase [None]')
     p.add_argument('--overWrite', action='store_true',
                    help='Force siminsar to run even if velSim/maskVel already exists')
+    p.add_argument('--overWriteMask', action='store_true',
+                   help='Regenerate maskVel even if it exists, without rebuilding '
+                        'the (more expensive) velSim. Use when the maskVel gate '
+                        'params (velThresh/highVelThresh/largeCCFraction) or the '
+                        'connected-component threshold decision may have changed '
+                        'since maskVel was last written (implied by --overWrite).')
     p.add_argument('--velThresh', type=float, default=100.0, metavar='M/YR',
                    help='Velocity threshold for maskVel siminsar call (default: 100 m/yr)')
+    p.add_argument('--highVelThresh', type=float, default=ANTARCTIC_HIGH_VELTHRESH,
+                   metavar='M/YR',
+                   help='Elevated maskVel threshold used for Antarctic (EPSG 3031) '
+                        'frames whose largest connected component is at least '
+                        '--largeCCFraction of the scene (smooth fast shelves unwrap '
+                        f'well). Default: {ANTARCTIC_HIGH_VELTHRESH:g} m/yr')
+    p.add_argument('--largeCCFraction', type=float, default=LARGE_CC_FRACTION,
+                   metavar='FRAC',
+                   help='Largest-connected-component fraction of scene at/above which '
+                        'an Antarctic frame is treated as well-unwrapped and uses '
+                        f'--highVelThresh. Default: {LARGE_CC_FRACTION:g}')
     p.add_argument('--sigma-az', type=float, default=10.0, metavar='PX',
                    help='Azimuth Gaussian sigma for iono smoothing (default: 10 px)')
     p.add_argument('--sigma-rg', type=float, default=30.0, metavar='PX',
@@ -516,7 +594,9 @@ def parse_args():
                    help='GeoTIFF/VRT mask; only mask=1 pixels used for iono estimation '
                         '(default: maskVel.vrt, created by siminsar if absent)')
     p.add_argument('--sepIceRock', action='store_true', default=False,
-                   help='Restrict the per-frame (phase+offset_phase)/2 ionosphere '
+                   help='(Default from the nearest project.yaml sepIceRock key if '
+                        'present; this flag forces it on.) '
+                        'Restrict the per-frame (phase+offset_phase)/2 ionosphere '
                         'estimate to ice pixels only (rock/water excluded, since '
                         'the estimate assumes nonzero velocity). The excluded rock '
                         'pixels provide an absolute "actual vs simulated offset" '
@@ -544,9 +624,12 @@ def parse_args():
                    help='intfloat: maximum isolated-island area to remove '
                         'after filling (pixels) [20]')
     p.add_argument('--referencePhase', default=None, metavar='VRT',
-                   help='Simulated reference phase VRT (e.g. from SetupNISAR siminsar output)')
+                   help='NOT IMPLEMENTED -- accepted but ignored (a warning '
+                        'is printed). Reserved for a simulated reference '
+                        'phase VRT.')
     p.add_argument('--mask', default=None, metavar='FILE',
-                   help='Mask file (GeoTIFF/VRT) to apply during processing')
+                   help='NOT IMPLEMENTED -- accepted but ignored (a warning '
+                        'is printed). Use --maskFile to mask the iono fit.')
     p.add_argument('--phaseThresh', type=float, default=14.0 * np.pi, metavar='RAD',
                    help='Mask correctedUnwrappedPhase where '
                         '|correctedPhase - simPhase| >= THRESH radians. '
@@ -566,7 +649,8 @@ def parse_args():
                         'to a debug/ subdirectory alongside the main outputs. '
                         'Intended to be set by SetupNISAR --debugIono.')
     p.add_argument('--verbose', action='store_true',
-                   help='Print progress messages')
+                   help='Accepted for compatibility; progress messages are '
+                        'always printed.')
     p.add_argument('--minTol', type=float, default=None,
                    help='Variable smoothing-radius map (additional pass on top of the '
                    'intfloat hole-filling above), applied to correctedUnwrappedPhase: '
@@ -620,23 +704,76 @@ def run_intfloat(phase_tif, phase_vrt, thresh, island_thresh):
     subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
 
 
+def _removeSimFiles(base):
+    '''Remove every on-disk form of a siminsar output `base` (raw binary,
+    .tif, .vrt, .simdat) so a regeneration starts from a clean slate.'''
+    for suffix in ('', '.tif', '.vrt', '.simdat'):
+        p = base + suffix
+        if os.path.exists(p):
+            os.remove(p)
+
+
+def _binaryVrtToTiff(base):
+    '''Convert a siminsar raw-binary output (`base`+'.vrt' backed by the flat
+    binary `base`) into a self-contained GeoTIFF (`base`+'.tif') and repoint
+    the VRT at it, then delete the raw binary. Geotransform, nodata, and all
+    dataset/band metadata are preserved. No-op if `base`+'.vrt' is missing or
+    already tif-backed.'''
+    vrt = base + '.vrt'
+    tif = base + '.tif'
+    if not os.path.exists(vrt):
+        return
+    ds = gdal.Open(vrt)
+    if ds is None:
+        return
+    rawSources = [f for f in ds.GetFileList()
+                  if os.path.abspath(f) != os.path.abspath(vrt)]
+    # Already tif-backed (nothing raw to migrate) -> leave as is.
+    if all(os.path.abspath(f) == os.path.abspath(tif) for f in rawSources):
+        ds = None
+        return
+    gdal.Translate(tif, ds, format='GTiff',
+                   creationOptions=['COMPRESS=LZW', 'BIGTIFF=IF_SAFER'])
+    ds = None
+    # Rebuild the .vrt as a thin relativeToVRT wrapper around the .tif, so every
+    # velSim.vrt / maskVel.vrt / velSim.smr.vrt reader keeps working unchanged.
+    wrap = gdal.Translate(vrt, tif, format='VRT')
+    wrap = None
+    # Drop the now-orphaned raw binary source(s).
+    for f in rawSources:
+        if os.path.abspath(f) != os.path.abspath(tif) and os.path.exists(f):
+            os.remove(f)
+
+
 def run_vel_sim(runw, region, simDir='.', overwrite=False, verticalCorrection=None,
-                smoothParams=None):
+                smoothParams=None, migrateBinary=False):
     '''
     smoothParams : dict or None
         If given, {'minTol', 'percentSpeed', 'maxTol', 'maxSmoothRadius', 'smoothNIter'}
         passed through to siminsar to additionally produce velSim.smr(.vrt), the variable
         smoothing-radius map applied to correctedUnwrappedPhase later in main().
+    migrateBinary : bool
+        When True (reprocess modes: --overWrite/--overWritePhase), regenerate a
+        legacy raw-binary velSim so it is rewritten as a GeoTIFF, even though
+        velSim itself is otherwise unchanged.
     '''
     geodat = f'geodat{runw.NumberRangeLooks}x{runw.NumberAzimuthLooks}.geojson'
     velSimPath = os.path.join(simDir, 'velSim')
+    # velSim exists in either the legacy raw-binary or the newer .tif form.
+    haveVelSim = os.path.exists(velSimPath) or os.path.exists(velSimPath + '.tif')
+    # Legacy raw-binary output (no .tif) -- migrate to .tif on any reprocess.
+    isOldBinary = os.path.exists(velSimPath) and not os.path.exists(velSimPath + '.tif')
     # Re-run if velSim is missing, or if a radius map is now wanted but wasn't produced
     # by an earlier (pre-smoothing) run.
     smrMissing = smoothParams is not None and not os.path.exists(velSimPath + '.smr.vrt')
-    if os.path.exists(velSimPath) and not overwrite and not smrMissing:
+    if (haveVelSim and not overwrite and not smrMissing
+            and not (migrateBinary and isOldBinary)):
         print(f"  {velSimPath} already exists — skipping")
         return
     os.makedirs(simDir, exist_ok=True)
+    # Clear every old form (raw binary, .tif, .vrt, .simdat) before regenerating.
+    _removeSimFiles(velSimPath)
+    _removeSimFiles(velSimPath + '.smr')
     dT = runw.dT
     # siminsar requires its last 4 tokens to be demFile/displacementFile/sceneFile/
     # outputFile -- all optional flags must come before them, never after.
@@ -654,25 +791,62 @@ def run_vel_sim(runw, region, simDir='.', overwrite=False, verticalCorrection=No
         subprocess.run(cmd, check=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     updateSimVrtGeotransforms(os.path.join(simDir, 'velSim*.vrt'), runw)
+    # Rewrite siminsar's raw-binary output(s) as self-contained GeoTIFF(s).
+    _binaryVrtToTiff(velSimPath)
+    if smoothParams is not None:
+        _binaryVrtToTiff(velSimPath + '.smr')
 
 
 def run_mask_vel(runw, region, vel_thresh, simDir='.', overwrite=False):
-    maskVelVrt = os.path.join(simDir, 'maskVel.vrt')
-    if os.path.exists(maskVelVrt) and not overwrite:
-        print(f"  {maskVelVrt} already exists — skipping")
+    maskVelPath = os.path.join(simDir, 'maskVel')
+    # maskVel exists in either the legacy raw-binary or the newer .tif form.
+    haveMask = os.path.exists(maskVelPath) or os.path.exists(maskVelPath + '.tif')
+    if haveMask and not overwrite:
+        print(f"  {maskVelPath}(.tif) already exists — skipping")
         return
     os.makedirs(simDir, exist_ok=True)
+    # Clear every old form (raw binary, .tif, .vrt, .simdat) before regenerating.
+    _removeSimFiles(maskVelPath)
     geodat = f'geodat{runw.NumberRangeLooks}x{runw.NumberAzimuthLooks}.geojson'
     cmd = ['siminsar', '-velThresh', str(vel_thresh), '-velocity',
-           region.dem(), region.velMap(), geodat, os.path.join(simDir, 'maskVel')]
+           region.dem(), region.velMap(), geodat, maskVelPath]
     with _Spinner('Creating maskVel'):
         subprocess.run(cmd, check=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     updateSimVrtGeotransforms(os.path.join(simDir, 'maskVel*.vrt'), runw)
+    # Rewrite siminsar's raw-binary output as a self-contained GeoTIFF.
+    _binaryVrtToTiff(maskVelPath)
+
+
+def _sepIceRockFromProjectYaml(startDir='.'):
+    '''Return the sepIceRock bool from the nearest project.yaml at or above
+    startDir, or False if none is found or the key is absent. Lets a standalone
+    estimateIonosphere run honor the region's project-level sepIceRock setting
+    the same way SetupNISAR does (SetupNISAR also passes --sepIceRock explicitly
+    when it invokes this program, so the two always agree).'''
+    d = os.path.abspath(startDir)
+    while True:
+        p = os.path.join(d, 'project.yaml')
+        if os.path.isfile(p):
+            with open(p) as fp:
+                return bool((yaml.safe_load(fp) or {}).get('sepIceRock', False))
+        parent = os.path.dirname(d)
+        if parent == d:
+            return False
+        d = parent
 
 
 def main():
     args = parse_args()
+
+    if not args.sepIceRock and _sepIceRockFromProjectYaml():
+        args.sepIceRock = True
+        print('estimateIonosphere: sepIceRock enabled from project.yaml')
+
+    if args.referencePhase is not None or args.mask is not None:
+        print('WARNING: --referencePhase/--mask are accepted but not '
+              'implemented in estimateIonosphere and will be ignored; '
+              'use --maskFile to mask the iono fit.')
 
     runw = load_runw(args.runw, args.frame)
     simDir = args.simDir
@@ -687,8 +861,25 @@ def main():
                         'maxTol': args.maxTol, 'maxSmoothRadius': args.maxSmoothRadius,
                         'smoothNIter': args.smoothNIter}
     run_vel_sim(runw, region, simDir=simDir, overwrite=args.overWrite,
-               verticalCorrection=args.verticalCorrection, smoothParams=smoothParams)
-    run_mask_vel(runw, region, args.velThresh, simDir=simDir, overwrite=args.overWrite)
+               verticalCorrection=args.verticalCorrection, smoothParams=smoothParams,
+               migrateBinary=args.overWriteMask)
+
+    # For Antarctic frames dominated by one large (well-unwrapped) connected
+    # component, raise the maskVel slow-pixel threshold so smooth fast shelves can
+    # still anchor the ionosphere fit (see ANTARCTIC_HIGH_VELTHRESH note above).
+    vel_thresh = args.velThresh
+    if region.epsg() == ANTARCTIC_EPSG:
+        cc_arr = runw.connectedComponents
+        _labels, _counts = np.unique(cc_arr[cc_arr != 0], return_counts=True)
+        largest_cc_frac = (_counts.max() / cc_arr.size) if len(_counts) else 0.0
+        if largest_cc_frac >= args.largeCCFraction:
+            vel_thresh = args.highVelThresh
+            print(f"  Antarctica: largest connected component is "
+                  f"{largest_cc_frac:.0%} of scene (>= {args.largeCCFraction:.0%}, well "
+                  f"unwrapped) -- raising maskVel velThresh "
+                  f"{args.velThresh:g} -> {vel_thresh:g} m/yr")
+    run_mask_vel(runw, region, vel_thresh, simDir=simDir,
+                 overwrite=args.overWrite or args.overWriteMask)
 
     phase = runw.unwrappedPhase.astype(np.float32)
     print("Applying RUNW interferogram mask...")
@@ -741,23 +932,28 @@ def main():
     # ------------------------------------------------------------------
     ice_mask_sr = None
     if args.sepIceRock:
-        _mask_path = args.iceRockMask
-        if _mask_path is None:
-            _mask_path = os.path.join(simDir, 'offsets.geom.mask.vrt')
-            if not os.path.exists(_mask_path):
-                _mask_path = os.path.join(os.path.dirname(simDir), 'offsetSims',
-                                          'offsets.geom.mask.vrt')
-        if not os.path.exists(_mask_path):
-            sys.exit(f'--sepIceRock: cannot find ice/rock mask at {_mask_path}. '
-                     f'Supply --iceRockMask.')
-        ice_mask_sr, _rock_mask_sr = load_ice_rock_mask(_mask_path, runw)
-        # Restrict ice estimation to velocity mask AND ice pixels.  The
-        # rock-anchored DC correction (using the rock pixels excluded here)
-        # is applied once, globally, in SetupNISAR.globalFillIonosphere().
-        if user_mask is not None:
-            user_mask = user_mask & ice_mask_sr
+        if args.iceRockMask is None and region.iceRockWaterMask() is None:
+            print("--sepIceRock: icerockwatermask not defined for this region -- "
+                  "not applicable, continuing without ice/rock separation")
         else:
-            user_mask = ice_mask_sr
+            _mask_path = args.iceRockMask
+            if _mask_path is None:
+                _mask_path = os.path.join(simDir, 'offsets.geom.mask.vrt')
+                if not os.path.exists(_mask_path):
+                    _mask_path = os.path.join(os.path.dirname(simDir), 'offsetSims',
+                                              'offsets.geom.mask.vrt')
+            if not os.path.exists(_mask_path):
+                print(f"--sepIceRock: cannot find ice/rock mask at {_mask_path} -- "
+                      f"not applicable, continuing without ice/rock separation")
+            else:
+                ice_mask_sr, _rock_mask_sr = load_ice_rock_mask(_mask_path, runw)
+                # Restrict ice estimation to velocity mask AND ice pixels.  The
+                # rock-anchored DC correction (using the rock pixels excluded here)
+                # is applied once, globally, in SetupNISAR.globalFillIonosphere().
+                if user_mask is not None:
+                    user_mask = user_mask & ice_mask_sr
+                else:
+                    user_mask = ice_mask_sr
 
     # ------------------------------------------------------------------
     # Iterative ambiguity correction + ionosphere estimation

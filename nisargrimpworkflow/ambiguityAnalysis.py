@@ -217,7 +217,6 @@ def ambiguity_table(corrected_phase: np.ndarray,
     # ------------------------------------------------------------------
     # 5. Print table
     # ------------------------------------------------------------------
-    c_m = c  # radians; could convert to cycles: c / TWO_PI
     print(f"\nReference CC: {ref_cc}  ({int(ref_mask.sum()):,} finite pixels in velSim overlap)")
     print(f"Global bias c = {c:+.4f} rad  ({c / TWO_PI:+.4f} cycles)  "
           "[mean(corrected_phase − velSim) over reference CC]\n")
