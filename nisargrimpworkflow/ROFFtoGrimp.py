@@ -24,6 +24,16 @@ import yaml
 from pathlib import Path
 
 
+# libgdal pulls in libopenblas, whose constructor builds a machine-sized thread
+# pool before main() runs; no GrIMP binary calls BLAS, so those threads only
+# spin (~6 s of CPU per process, and these run many-at-a-time).  The cap has to
+# be in the environment before the process starts -- setenv() or
+# openblas_set_num_threads() inside the program are both too late.
+# OPENBLAS_NUM_THREADS, never OMP_NUM_THREADS: the latter would serialise the
+# genuinely OpenMP-parallel binaries here (siminsar/simoffsets, cullst).
+BLAS_ENV = dict(os.environ, OPENBLAS_NUM_THREADS='1')
+
+
 def parseArgs():
     '''
     Handle command line args
@@ -131,6 +141,15 @@ def parseArgs():
     parser.add_argument('--maxSmoothRadius', type=int, default=50,
                         help='Variable smoothing-radius map: sweep cap in single-look '
                         'pixels, clamped to <= 255 (byte output) [50]')
+    parser.add_argument('--maxSmoothRadiusA', type=int, default=None,
+                        help='Variable smoothing-radius map: azimuth sweep cap, if it is '
+                        'to differ from the range cap --maxSmoothRadius. Offsets grids are '
+                        'resampled to square pixels, so the default (same as '
+                        '--maxSmoothRadius, an isotropic sweep) is normally right [None]')
+    parser.add_argument('--smoothThreads', type=int, default=2,
+                        help='Variable smoothing-radius map: threads for the smoothradius '
+                        'binary simoffsets runs. Memory is ~0.9 GB + 0.3 GB per thread on '
+                        'a 13 Mpixel grid [2]')
     parser.add_argument('--smoothNIter', type=int, default=3,
                         help='Variable smoothing-radius map: repeated box-filter passes '
                         'per sweep step (Gaussian-ish) [3]')
@@ -147,10 +166,13 @@ def parseArgs():
                   args.maxTol is not None]
     if any(smoothFlags) and not all(smoothFlags):
         u.myerror('ROFFtoGrimp: --minTol/--percentSpeed/--maxTol must be given together')
-    if args.maxSmoothRadius > 255:
-        print(f'WARNING: --maxSmoothRadius {args.maxSmoothRadius} exceeds byte range, '
-              'clamping to 255')
-        args.maxSmoothRadius = 255
+    if args.maxSmoothRadiusA is None:
+        args.maxSmoothRadiusA = args.maxSmoothRadius
+    for radiusArg in ['maxSmoothRadius', 'maxSmoothRadiusA']:
+        if getattr(args, radiusArg) > 255:
+            print(f'WARNING: --{radiusArg} {getattr(args, radiusArg)} exceeds byte range, '
+                  'clamping to 255')
+            setattr(args, radiusArg, 255)
     if not os.path.exists(args.ROFF[0]) and 's3' not in args.ROFF[0]:
         u.myerror(f'ROFF file {args.ROFF[0]} does not exist')
     ROFFPath = os.path.dirname(args.ROFF[0])
@@ -174,7 +196,8 @@ def parseArgs():
                   'islandThresh', 'noMask', 'DEM', 'byteOrder', 'regionFile',
                   'mergeOnly', 'ompThreads', 'verticalCorrection',
                   'minTol', 'percentSpeed', 'maxTol', 'maxSmoothRadius',
-                  'smoothNIter', 'noVariableSmoothing', 'debugIono']:
+                  'maxSmoothRadiusA', 'smoothThreads', 'smoothNIter',
+                  'noVariableSmoothing', 'debugIono']:
         params[param] = getattr(args, param)
     # Assemble cull params
     params['cullParams'] = {}
@@ -253,7 +276,8 @@ def callSim(outputDir, baseName, params,
         If True, pass --tiff to simoffsets so siminsar writes lat/lon as
         GeoTIFF and offsets are written as .dr.tif/.da.tif. Default False.
     smoothParams : dict or None
-        If given, {'minTol', 'percentSpeed', 'maxTol', 'maxSmoothRadius', 'smoothNIter'}
+        If given, {'minTol', 'percentSpeed', 'maxTol', 'maxSmoothRadius',
+        'maxSmoothRadiusA', 'smoothThreads', 'smoothNIter'}
         passed through to simoffsets to produce a variable smoothing-radius map (.smr.tif).
         Only meaningful (and only ever passed by simulateOffsets) for the velocity-included
         simulation, since the map is speed-based.
@@ -281,6 +305,8 @@ def callSim(outputDir, baseName, params,
             f'--percentSpeed {smoothParams["percentSpeed"]} ' \
             f'--maxTol {smoothParams["maxTol"]} ' \
             f'--maxSmoothRadius {smoothParams["maxSmoothRadius"]} ' \
+            f'--maxSmoothRadiusA {smoothParams["maxSmoothRadiusA"]} ' \
+            f'--smoothThreads {smoothParams["smoothThreads"]} ' \
             f'--smoothNIter {smoothParams["smoothNIter"]} '
     command += f'-offsetsDat={outputDir}/{simDir}/{baseName}.dat '
     command += f'-azOffsets={outputDir}/{simDir}/{baseName}.da -syncDat '
@@ -290,7 +316,7 @@ def callSim(outputDir, baseName, params,
     command += f'-secondGeodatFile={outputDir}/{simDir}/{geodat2} '
     print(command)
     # , executable='/bin/csh'
-    call(command, shell=True, stderr=stderr, stdout=stdout)
+    call(command, shell=True, stderr=stderr, stdout=stdout, env=BLAS_ENV)
 
 
 
@@ -407,7 +433,7 @@ def simulateOffsets(outputDir, baseName, params,
     if params.get('minTol') is not None and not params.get('noVariableSmoothing'):
         smoothParams = {k: params[k] for k in
                         ['minTol', 'percentSpeed', 'maxTol', 'maxSmoothRadius',
-                         'smoothNIter']}
+                         'maxSmoothRadiusA', 'smoothThreads', 'smoothNIter']}
     # Velocity with mask — named .velocity to mirror the .geom convention
     threads.append(threading.Thread(target=callSim,
                                     args=[outputDir, f'{baseName}.velocity',
@@ -484,7 +510,7 @@ def runCull(outputDir, baseLayerName, boxSize=9, maxA=3, maxR=3, nGood=17,
 
     # Run command
     # , executable='/bin/csh'
-    call(command, shell=True, stderr=stderr, stdout=stdout)
+    call(command, shell=True, stderr=stderr, stdout=stdout, env=BLAS_ENV)
 
 
 def cullst(outputDir, baseName, boxSize=7, maxA=3, maxR=3, nGood=10,
@@ -683,7 +709,7 @@ def runInterp(outputDir, inputFile, outputFile, nr, na, ratThresh=1,
     #
     # Run command
     # , executable='/bin/csh'
-    call(command, shell=True, stderr=stderr, stdout=stdout)
+    call(command, shell=True, stderr=stderr, stdout=stdout, env=BLAS_ENV)
 
 
 def interpOffsets(outputDir, baseName, ratThresh=1, thresh=20, islandThresh=20,
@@ -988,7 +1014,7 @@ def applyVariableSmoothing(outputDir, params, nr, na, geoTransform, simDir='offs
             f'-nIterations {params["smoothNIter"]} -minValue -2.0e9 ' \
             f'< {realInFile} > {tmpFile}'
         print(command)
-        call(command, shell=True, stderr=stderr, stdout=stdout)
+        call(command, shell=True, stderr=stderr, stdout=stdout, env=BLAS_ENV)
         os.replace(tmpFile, realInFile)
     return True
 

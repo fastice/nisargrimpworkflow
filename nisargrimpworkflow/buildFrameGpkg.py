@@ -103,6 +103,7 @@ def loadEpsg(projectDir):
 def buildFrameGpkgArgs():
     ''' Handle command line args'''
     parser = argparse.ArgumentParser(
+        epilog='Part of the nisargrimpworkflow package.',
         description='\n\n\033[1mBuild per-cycle GeoPackages (ascending + '
         'descending layers) of NISAR virtual frames found under '
         "track-N/*_<framePattern> directories (framePattern from "

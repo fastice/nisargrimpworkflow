@@ -42,7 +42,21 @@ by late frames rebuild in place) → `setupNISARTracks --year` → `makeMaster`.
 derived from the filename via `orbitFromCycleTrack(cycle, track) = 173*cycle + track
 + 618` (in `FileNISARProducts.py`), so no HDF5 read is needed to find the
 `track-<track>/<orbit1>_*` dirs. `--noDownload` runs the chain on already-staged
-folders. Full detail in [autoupdate.md](Documents/autoupdate.md).
+folders.
+
+`setupNISARTracks --year` is passed `--tieTracks` naming only the tracks with new
+granules. Ties/baselines are per-track, so re-tying an untouched track recomputes the
+same answer — the unrestricted call cost 1.5–2 h nightly across ~170 tracks. The
+autoclean-mask scan stays project-wide and any track whose mask is rebuilt is added
+back to the tie list (a fresh mask changes the fit); with no orbits derived at all the
+flag is omitted and everything is tied, and `retieAllTracks: true` forces that always.
+
+The run summary's `TRACK ERRORS` section splits into `NEW` and `RECURRING` against
+`dailyDownloadLogs/knownTrackErrors.json` (state keyed on `(normalised message,
+track)`), and only new errors trigger the notification mail. A pair is forgotten only
+when that track's log was re-read this run and came back clean; pairs from tracks the
+run never touched are carried forward, since `collectTrackErrors` reads only logs
+rewritten since the run start. Full detail in [autoupdate.md](Documents/autoupdate.md).
 
 ---
 
@@ -193,6 +207,42 @@ The `.geojson` files carry per-image geometry. Key `properties` fields:
 
 When merging frames, corners are updated to span first-to-last, and state vectors are merged by sorting, deduplicating, and cubic interpolating onto a uniform time grid.
 
+### `mergedGeodat()` and the secondary's `MLAzimuthSize` (fixed 2026-08-31)
+
+The secondary branch used to assign `MLAzimuthSize = na`, the **primary's** merged azimuth size.
+That is a co-registration-grid quantity, but `azparams`' `svInitAzParams` (`common/svBase.c`) uses
+the field as a bound on an azimuth index computed from the secondary's own `CorrectedTime`. Two
+conventions, one comparison — identical when the pair starts together, divergent when it does not.
+For a 19 s offset the secondary's true extent exceeds the primary's by ~1805 ML lines, every
+candidate point falls outside the bound, and `azparams` hits its fatal `error()` and writes a
+**zero-byte `az.est.yaml`** — which later aborts a whole `mosaic3d` sector. 75 of 4,736 Antarctic
+frames tripped it; Greenland's pairs are symmetric so it never appeared there.
+
+Now derived from the secondary's own sub-frames' `CorrectedTime` span, with three guards, all
+load-bearing:
+
+- **`max(_mlAz, na)`** — the bound may only ever grow, so a symmetric merge keeps `na` exactly and
+  healthy frames stay bit-identical.
+- **`_unwrap()`** — `CorrectedTime` is *seconds of day*, so a merge spanning midnight has values on
+  both sides of the wrap. Without unwrapping onto a continuous axis, `max - min` returns ~86,400
+  instead of ~1,200. This is not hypothetical: the first version of the fix gave
+  `track-112/5055_0001` a secondary `MLAzimuthSize` of 8,208,190 against a primary of 9,405,
+  overflowed `azparams`' `ySize`, and **segfaulted a frame that previously worked**.
+- **`_mlAz > na * 5` → fall back to `na`** — real asymmetric frames land at 2.2–4.5x, so 5x clears
+  every legitimate case while catching any future time pathology.
+
+**Only `azparams` is affected — no offsets need regenerating.** The secondary geodat reaches
+`simoffsets` through exactly one path, `simInSAR/simInSARBaselineFromSV.c`, which reads
+`cpAll.sTime` and the state vectors and nothing else; `azimuthSize` appears in `simInSAR/` only as
+`scene->I.azimuthSize`, always the primary. `rparams` never calls `svInitAzParams` (measured: σ
+identical to 1e-5 on both an asymmetric frame and a symmetric control).
+
+**`CorrectedTime`, not `NominalTime`, is what the C reads** (`parseInputFile.c:616` →
+`par.hr/min/sec` → `cpAll.sTime`). An earlier round of this investigation edited `NominalTime`,
+which nothing consumes, and had to be discarded.
+
+Full record: `~/progs/GIT64/mosaicSource/Documents/asymmetricPairPlan.md`.
+
 ### Squint (residual Doppler) — extracted, merged, and applied as an opt-in `mosaic3d` correction
 
 3-stage rollout (see `~/progs/GIT64/mosaicSource/CLAUDE.md` "Squint (residual Doppler)
@@ -226,6 +276,39 @@ sensitivity" for why the underlying analysis concluded no `mosaic3d` fix is curr
    `make3DOffsets.c`), behind `-useSquint` (default off). See `mosaicSource/CLAUDE.md`'s squint
    section for the C-side implementation and verification (a real `mosaic3d` run on an actual
    overlapping ascending/descending pair confirmed both the rotation magnitude and sign).
+
+## Azimuth ionosphere correction (`azIonoCorrection`)
+
+Builds `<stem>.ionosphereCorrection.azimuthOffset.tif/.vrt` from the along-track derivative of
+the merged range ionosphere screen and names it in `azimuth.offsets.vrt` under
+`ionosphereAzimuthOffsetCorrection`. It only PRODUCES; `azparams` decides whether to use it and
+`mosaic3d -useAzIonosphere` applies that decision -- exactly the division of labour
+`estimateIonosphere` / `rparams` already have on the range side.
+
+**Two independent project.yaml switches**, and the separation is deliberate:
+
+| key | effect |
+|---|---|
+| `computeAzimuthIonosphereCorrection` | `SetupNISAR.createVirtualFrameROFF` calls `makeAzimuthIonosphereCorrection()` after stamping the range key. Changes no product on its own. |
+| `applyAzimuthIonosphereCorrection` | `setupNISARTracks --useAzIonosphere` -> `refreshties` -> `makeframetie` -> `tieScript`, which drops `-noIonosphere` from `azparams_flags` and adds `-useAzIonosphere` to mosaic3d's `extra_flags`. Also resolved for the mosaic stage by `setupquarters.resolveBooleanBaseFlag`. |
+
+**When apply is off, `azparams` is given `-noIonosphere` EXPLICITLY.** azparams defaults to
+ION_AUTO, so without that flag any frame merely carrying the VRT key would silently start using
+the correction. Off must mean bit-identical to a build with no correction present.
+
+**Two derivations that are easy to get backwards:**
+- The derivative is taken from MEASURED pixels only (normalised convolution) and filled
+  afterwards. Filling first fabricates gradients inside the gaps, and the median Greenland
+  screen is only ~66% real data; getting this backwards roughly halves the benefit.
+- A screen shorter than the offsets grid (a dual-bandwidth partial sub-frame has no 7700 MHz
+  phase, hence no ionosphere estimate) is placed by geotransform with the uncovered part **NaN,
+  never zero** -- a zero fill puts a step at the coverage edge that the derivative reads as an
+  enormous gradient. Outside the footprint the correction is forced to zero rather than
+  pyramid-filled.
+
+`defaultSigmaMetres()` must match `estimateIonosphere`'s shipped smoothing exactly, and the
+26x16 grid is named RANGE looks first (26 range, 16 azimuth). Transposing them changes the
+raster.
 
 **End-to-end plumbing** (opt-in, off by default): `project.yaml` key `applySquintCorrection`
 (default `false`) → `setupNISARTracks --useSquint`/`--noUseSquint` (CLI overrides the project

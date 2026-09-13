@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import sys
 import glob
 import fnmatch
 import re
@@ -24,7 +25,9 @@ def parse_args():
             'ensures tiepoints/ exists and creates velocityStats/ subdirectories\n'
             'derived from existing virtual-frame directories, then runs\n'
             'refreshties.py across all tracks for the requested\n'
-            'years. Use --tracks to restrict processing to specific tracks.\n\n'
+            'years. Use --tracks to restrict processing to specific tracks, or\n'
+            '--tieTracks to restrict only the tiepointing pass (leaving the\n'
+            'autoclean-mask scan project-wide).\n\n'
             'Optional flags enable first-time setup (--copyFiles), product\n'
             'checking (--check), and thumbnail generation (--runVelThumbs).\n\n'
             '--runVelstatsregions recomputes velocity-stats regions, and since that\n'
@@ -40,12 +43,30 @@ def parse_args():
                         help='Restrict processing to these track directories '
                              '(e.g. --tracks track-12 track-64). '
                              'Default: all track-* directories under the project root')
+    parser.add_argument('--tieTracks', nargs='+', metavar='track-N',
+                        help='Restrict only the final tiepointing pass to these '
+                             'tracks -- the autoclean-mask scan still covers every '
+                             'track in --tracks, and any track whose mask is '
+                             '(re)built is added to this list automatically (a '
+                             'refreshed mask changes the tie fit). Use from a '
+                             'nightly update to re-tie just the tracks that got new '
+                             'data, instead of all of them. Default: tiepoint every '
+                             'track')
     parser.add_argument('--tiesOnly', action='store_true',
                         help='Run refreshties.py without computing velocity mosaics')
     parser.add_argument('--copyFiles', action='store_true',
                         help='Instantiate tie_plan_header and vel_thumb_plan from '
                              'templates/ into every track tiepoints/ directory '
                              '(substituting <TRACK> and <DEM>); skip if already present')
+    parser.add_argument('--migrateVelStatsRegions', action='store_true',
+                        help='Switch the selected tracks to the track-wide velocityStats '
+                             'range (project.yaml velocityStatsRegions: track): move the '
+                             'legacy per-frame-number bins to velocityStats/old/ and their '
+                             'tiepoints headers/plans to tiepoints/old/, then create the new '
+                             'range. Nothing is deleted. Follow with --runVelstatsregions '
+                             '--noUpdateVelStats and --updateAutoclean to regenerate.')
+    parser.add_argument('--dryRun', action='store_true',
+                        help='With --migrateVelStatsRegions: list what would move')
     parser.add_argument('--runVelThumbs', action='store_true',
                         help='Run "vel_thumbs vel_thumb_plan" in each tiepoints/ dir')
     parser.add_argument('--runVelstatsregions', action='store_true',
@@ -70,10 +91,19 @@ def parse_args():
                              'ones whose frames already have an autoclean mask embedded in '
                              'range.offsets.vrt. Default: only run it for tracks missing masks')
     parser.add_argument('--nThreads', type=int, default=32, metavar='N',
-                        help='Parallelism for the heavy steps: passed as '
+                        help='Parallelism for the per-track steps: passed as '
                              '-nThreads to refreshties.py (tracks in parallel) '
-                             'and as -threads to autocleanNISAR.py --tracks '
-                             '(frame pool) [32]')
+                             'and to velocityStats [32]')
+    parser.add_argument('--autocleanThreads', type=int, default=None, metavar='N',
+                        help='Parallelism for autocleanNISAR.py --tracks (frame pool), '
+                             'separately from --nThreads because the two have completely '
+                             'different memory profiles: refreshties parallelises cheap '
+                             'per-track work, while one autoclean frame job holds ~25 GB '
+                             '(a virtual frame is ~3500x24000, so each of the ~10 rasters '
+                             'it reads is ~0.6 GB, before numpy temporaries). At 32 that is '
+                             '~810 GB and the run is reliably SIGKILLed part-way, losing '
+                             'both the remaining frames and every autocleanSummary.yaml. '
+                             'Default: autocleanThreads in project.yaml, else 8 (~200 GB)')
     parser.add_argument('--noUpdateVelStats', action='store_true',
                         help='Skip the "velocityStats.py --doRA" rebuild step in this invocation, '
                              'reusing the existing velStats reference. Use to avoid rebuilding '
@@ -99,6 +129,14 @@ def parse_args():
     parser.add_argument('--quadFit', action='store_true',
                         help='Enable the -deltaBQ quadratic baseline correction estimate '
                              '(default: NISAR uses --noQuadFit)')
+    parser.add_argument('--useAzIonosphere', dest='useAzIonosphere', action='store_true', default=None,
+                        help='Use the azimuth ionosphere correction where one exists '
+                             '(azparams keeps the better sigma, mosaic3d applies its '
+                             'choice), overriding project.yaml '
+                             'applyAzimuthIonosphereCorrection')
+    parser.add_argument('--noUseAzIonosphere', dest='useAzIonosphere', action='store_false',
+                        help='Never use the azimuth ionosphere correction, overriding '
+                             'project.yaml applyAzimuthIonosphereCorrection')
     parser.add_argument('--useSquint', dest='useSquint', action='store_true', default=None,
                         help='Apply the squint heading correction (mosaic3d -useSquint and '
                              'tiepoints -motion), overriding project.yaml applySquintCorrection '
@@ -122,7 +160,8 @@ def get_track_dirs(tracks=None):
 
 def _load_project_config():
     """Return (proj dict, dem string, velMap string, template_content dict,
-    frame_pattern string) read from project.yaml."""
+    frame_pattern string) read from project.yaml. autocleanThreads is read from
+    proj by main() rather than returned here."""
     proj_path = os.path.join(PROJECT_DIR, 'project.yaml')
     proj = {}
     if os.path.exists(proj_path):
@@ -167,16 +206,26 @@ def _apply_substitutions(content, track_num, dem, tiepoint_file):
                     .replace('<TIEFILE>', tiepoint_file))
 
 
-def _vel_stats_dirs_for_track(track_dir, frame_pattern):
+def _vel_stats_dirs_for_track(track_dir, frame_pattern, regions='frameBins'):
     """Return sorted list of velocityStats dir names derived from existing virtual-frame dirs.
 
-    Groups virtual-frame directories (matching *_{frame_pattern}) by the first
-    variable digit (M), giving one velocityStats dir per M-group spanning
-    {prefix}{M}0...0 – {prefix}{M}9...9.
+    regions='frameBins' (default): groups virtual-frame directories (matching
+    *_{frame_pattern}) by the first variable digit (M), giving one velocityStats
+    dir per M-group spanning {prefix}{M}0...0 – {prefix}{M}9...9.
+
+    regions='track' (project.yaml velocityStatsRegions: track): ONE range per
+    track spanning the whole frame pattern ({prefix}0..0 – {prefix}9..9, e.g.
+    0000-0099). velocityStats.py then assembles every product of the track on
+    the master grid (see velocityStats.assembleTrackStats); the single range
+    keeps every '<F1>-<F2>' / '<F1>dash<F2>' parser downstream unchanged.
     """
     prefix = frame_pattern.split('?')[0]          # e.g. '00' from '00??'
     variable_len = frame_pattern.count('?')        # e.g. 2
     tail_len = variable_len - 1                    # digits after M
+    if regions == 'track':
+        if not glob.glob(os.path.join(track_dir, f'*_{frame_pattern}')):
+            return []
+        return [f"{prefix}{'0' * variable_len}-{prefix}{'9' * variable_len}"]
 
     groups = set()
     for d in glob.glob(os.path.join(track_dir, f'*_{frame_pattern}')):
@@ -186,6 +235,52 @@ def _vel_stats_dirs_for_track(track_dir, frame_pattern):
         end   = prefix + m_digit + '9' * tail_len   # e.g. '0039'
         groups.add(f'{start}-{end}')
     return sorted(groups)
+
+
+def migrate_velstats_regions(track_dirs, dry_run=False):
+    """Switch tracks from per-frame-number velocityStats bins to the single
+    track-wide range (project.yaml velocityStatsRegions: track). Nothing is
+    deleted: velocityStats/<F1>-<F2> bins go to velocityStats/old/, and the
+    per-bin tiepoints files (vel_thumb_header_<F1>dash<F2>, tie_plan<year>.<F1>dash<F2>,
+    vel_thumb_plan_all<year>dash<F1>dash<F2>) go to tiepoints/old/. The next
+    setup_track_dirs() call then creates the track-wide range and its header
+    (sentinel resolution; velThumbs computes each product's box itself in
+    track mode). Re-run the tie stage afterwards so products are regenerated on
+    the master grid and velocityStats/autoclean rebuild from them."""
+    proj, _, _, _, frame_pattern = _load_project_config()
+    regions = str(proj.get('velocityStatsRegions', 'frameBins')).lower()
+    if regions != 'track':
+        sys.exit('--migrateVelStatsRegions: set velocityStatsRegions: track in project.yaml first')
+    keep = set(_vel_stats_dirs_for_track('.', frame_pattern, 'track')
+               or [f"{frame_pattern.split('?')[0]}{'0' * frame_pattern.count('?')}-"
+                   f"{frame_pattern.split('?')[0]}{'9' * frame_pattern.count('?')}"])
+    for track_dir in track_dirs:
+        vsd = os.path.join(track_dir, 'velocityStats')
+        tpd = os.path.join(track_dir, 'tiepoints')
+        bins = [d for d in sorted(glob.glob(os.path.join(vsd, '*-*')))
+                if os.path.basename(d) not in keep]
+        files = []
+        for pat in ('vel_thumb_header_*dash*', 'tie_plan20??.*dash*', 'vel_thumb_plan_all20??dash*'):
+            files += [f for f in sorted(glob.glob(os.path.join(tpd, pat)))
+                      if not any(f.endswith(k.replace('-', 'dash')) for k in keep)]
+        if not bins and not files:
+            print(f'{track_dir}: nothing to migrate')
+            continue
+        print(f'{track_dir}: {len(bins)} bin dir(s) -> velocityStats/old/, '
+              f'{len(files)} tiepoints file(s) -> tiepoints/old/'
+              f'{"  (dry run)" if dry_run else ""}')
+        if dry_run:
+            for x in bins + files:
+                print(f'    {x}')
+            continue
+        for d in bins:
+            dest = os.path.join(vsd, 'old')
+            os.makedirs(dest, exist_ok=True)
+            shutil.move(d, os.path.join(dest, os.path.basename(d)))
+        for f in files:
+            dest = os.path.join(tpd, 'old')
+            os.makedirs(dest, exist_ok=True)
+            shutil.move(f, os.path.join(dest, os.path.basename(f)))
 
 
 def setup_track_dirs(track_dirs, copy_files, overwrite=False):
@@ -225,7 +320,25 @@ def setup_track_dirs(track_dirs, copy_files, overwrite=False):
                     print(f'Created {dest}')
                     n_created += 1
 
-        for dir_name in _vel_stats_dirs_for_track(track_dir, frame_pattern):
+        regions = str(proj.get('velocityStatsRegions', 'frameBins')).lower()
+        regions = 'track' if regions == 'track' else 'frameBins'
+        if regions == 'track':
+            # Legacy per-digit bins would make the range lookup ambiguous
+            # (autocleanNISAR scans velocityStats/*-*); refuse until they are
+            # moved aside (setupNISARTracks --migrateVelStatsRegions).
+            legacy = [d for d in glob.glob(os.path.join(track_dir, 'velocityStats', '*-*'))
+                      if os.path.basename(d) not in _vel_stats_dirs_for_track(track_dir, frame_pattern, 'track')]
+            if legacy:
+                # Not migrated yet: keep its legacy bins (velocityStats still
+                # assembles each bin's members on the master grid and
+                # autocleanNISAR scans whatever ranges exist), just do not add
+                # the track-wide range beside them.
+                print(f'{track_dir}: velocityStatsRegions is "track" but legacy frame-bin '
+                      f'dirs remain ({[os.path.basename(d) for d in legacy]}); run '
+                      f'setupNISARTracks --migrateVelStatsRegions --tracks '
+                      f'{os.path.basename(track_dir)} to switch this track')
+                continue
+        for dir_name in _vel_stats_dirs_for_track(track_dir, frame_pattern, regions):
             vel_dir = os.path.join(track_dir, 'velocityStats', dir_name)
             if not os.path.isdir(vel_dir):
                 os.makedirs(vel_dir)
@@ -536,6 +649,14 @@ def run_vel_stats(track_dirs, region_path, vel_map, n_threads=None):
         subprocess.run(['csh', '-c', cmd], cwd=vsd)
 
     maxWorkers = n_threads if n_threads else len(jobs)
+    # Track-mode composites (velocityStatsRegions: track) hold the full
+    # regional velocity map plus one 8-Mpx strip of accumulators per process
+    # (~12 GB peak measured on Antarctica40/track-82), so cap the parallelism
+    # separately from the tie stage's --nThreads; velStatsThreads in
+    # project.yaml overrides the default of 8 (~100 GB).
+    proj, _, _, _, _ = _load_project_config()
+    if str(proj.get('velocityStatsRegions', 'frameBins')).lower() == 'track':
+        maxWorkers = min(maxWorkers, int(proj.get('velStatsThreads', 8)))
     with ThreadPoolExecutor(max_workers=maxWorkers) as executor:
         list(executor.map(_run, jobs))
 
@@ -588,9 +709,48 @@ def run_autoclean(track_dirs, frame_pattern, n_threads=None, new=True):
     subprocess.run(['csh', '-c', cmd], cwd=PROJECT_DIR)
 
 
+def autoclean_threads(proj, args):
+    """Frame-pool size for autocleanNISAR: --autocleanThreads, else project.yaml's
+    autocleanThreads, else 8. Kept apart from --nThreads because one autoclean frame job
+    holds ~25 GB of rasters -- at 32 threads that is ~810 GB, more than either machine has,
+    and the run is SIGKILLed part-way through."""
+    if args.autocleanThreads is not None:
+        return args.autocleanThreads
+    return int(proj.get('autocleanThreads', 8))
+
+
+def tie_track_dirs(track_dirs, needs_autoclean, tie_tracks):
+    """
+    Track dirs for the final tiepointing pass.
+
+    Without --tieTracks this is every track in track_dirs -- the historical
+    behaviour, where a nightly run re-tied all ~170 tracks even when only a
+    handful had new data. With it, only the named tracks, unioned with the
+    tracks whose autoclean mask was just (re)built: a refreshed mask changes
+    the tie fit, so those have to be redone whether or not they carry new
+    data.
+
+    Named tracks that are not in track_dirs (not in this project, or dropped
+    for having no virtual-frame data) are reported and skipped rather than
+    failing the run -- unlike --tracks, this list is generated upstream from
+    released granules, so a stale name should not abort the nightly update.
+    """
+    if not tie_tracks:
+        return track_dirs
+    byName = {os.path.basename(d): d for d in track_dirs}
+    wanted = set(tie_tracks)
+    missing = sorted(wanted - set(byName))
+    if missing:
+        print(f'--tieTracks: skipping {len(missing)} track(s) not in the '
+              f'project or with no virtual-frame data: {missing}')
+    keep = (wanted & set(byName)) | {os.path.basename(d)
+                                     for d in needs_autoclean}
+    return [d for d in track_dirs if os.path.basename(d) in keep]
+
+
 def run_refresh_ties(track_dirs, ties_only, over_write, keep_vz, year,
                       phase_and_offsets=True, no_quad_fit=True, use_yaml=False,
-                      use_squint=False, n_threads=None):
+                      use_squint=False, use_az_ionosphere=False, n_threads=None):
     tracks_str = str([os.path.basename(d) for d in track_dirs]).replace(' ', '')
     tiesOnly = '-tiesOnly ' if ties_only else ''
     overWrite = '--overWrite ' if over_write else ''
@@ -599,11 +759,19 @@ def run_refresh_ties(track_dirs, ties_only, over_write, keep_vz, year,
     noQuadFit = '--noQuadFit ' if no_quad_fit else ''
     useYaml = '--yaml ' if use_yaml else ''
     useSquint = '--useSquint ' if use_squint else ''
+    useAzIon = '--useAzIonosphere ' if use_az_ionosphere else ''
     nThreadsFlag = f'-nThreads {n_threads} ' if n_threads else ''
     years_str = ' '.join(str(y) for y in year)
-    cmd = f'refreshties.py {tiesOnly}{overWrite}{keepVz}{phaseAndOffsets}{noQuadFit}{useYaml}{useSquint}{nThreadsFlag}-toRun="{tracks_str}" {years_str} -noPrompt'
+    cmd = f'refreshties.py {tiesOnly}{overWrite}{keepVz}{phaseAndOffsets}{noQuadFit}{useYaml}{useSquint}{useAzIon}{nThreadsFlag}-toRun="{tracks_str}" {years_str} -noPrompt'
     print(f'Running: {cmd}')
-    subprocess.run(['csh', '-c', cmd], cwd=PROJECT_DIR)
+    r = subprocess.run(['csh', '-c', cmd], cwd=PROJECT_DIR)
+    # Surface a failing tie stage rather than continuing to makeMaster as if it
+    # had worked -- refreshties now exits non-zero when a track's tie chain
+    # fails, and swallowing it here would keep it out of the nightly summary.
+    if r.returncode != 0:
+        u.mywarning(f'setupNISARTracks: refreshties.py exited '
+                    f'{r.returncode} -- see the per-track stderr files')
+    return r.returncode
 
 
 def main():
@@ -631,13 +799,20 @@ def main():
         print(f'Skipping {len(empty)} track(s) with no virtual-frame data: {empty}')
     track_dirs = have_data
 
+    if args.migrateVelStatsRegions:
+        migrate_velstats_regions(track_dirs, dry_run=args.dryRun)
+        if args.dryRun:
+            return
+
     setup_track_dirs(track_dirs, args.copyFiles, overwrite=args.overWrite)
 
-    if args.copyFiles:
+    if args.copyFiles or args.migrateVelStatsRegions:
         return
 
     projectUseSquint = bool(proj.get('applySquintCorrection', False))
     useSquint = projectUseSquint if args.useSquint is None else args.useSquint
+    projectUseAzIon = bool(proj.get('applyAzimuthIonosphereCorrection', False))
+    useAzIonosphere = projectUseAzIon if args.useAzIonosphere is None else args.useAzIonosphere
 
     if args.runVelThumbs:
         run_vel_thumbs(track_dirs, over_write=args.overWrite)
@@ -659,6 +834,7 @@ def main():
                          no_quad_fit=not args.quadFit,
                          use_yaml=True,
                          use_squint=useSquint,
+                         use_az_ionosphere=useAzIonosphere,
                          n_threads=args.nThreads)
         # velocityStats aggregates from those same source mosaics, so its
         # own reference (velocity.vr/.va/.er/.ea/.navg) is now stale too --
@@ -675,9 +851,11 @@ def main():
         return
 
     # velStats+autoclean only for tracks that don't already have an autoclean
-    # mask embedded (or all of them, with --updateAutoclean) -- tiepointing
-    # below always runs for every track regardless, since it's what actually
-    # benefits from the (possibly just-refreshed) masks.
+    # mask embedded (or all of them, with --updateAutoclean). The mask scan
+    # stays project-wide even under --tieTracks, since a track can need a
+    # first-time mask without having new data this run; the tiepointing below
+    # then covers every track that got one, because a fresh mask changes the
+    # tie fit.
     needs_autoclean = [d for d in track_dirs
                        if args.updateAutoclean or not _track_has_autoclean_mask(d, frame_pattern)]
     if needs_autoclean:
@@ -686,16 +864,31 @@ def main():
         if not args.noUpdateVelStats:
             run_vel_stats(needs_autoclean, region_path, vel_map,
                           n_threads=args.nThreads)
-        run_autoclean(needs_autoclean, frame_pattern, n_threads=args.nThreads,
+        # Deliberately NOT args.nThreads -- see --autocleanThreads: a frame job here
+        # holds ~25 GB, so the tie-stage thread count over-subscribes memory and the
+        # run gets killed.
+        run_autoclean(needs_autoclean, frame_pattern,
+                      n_threads=autoclean_threads(proj, args),
                       new=not args.updateAutoclean)
 
-    run_refresh_ties(track_dirs, args.tiesOnly, args.overWrite, args.keepVz, args.year,
-                     phase_and_offsets=not args.noPhase,
-                     no_quad_fit=not args.quadFit,
-                     use_yaml=True,
-                     use_squint=useSquint,
-                     n_threads=args.nThreads)
+    tie_dirs = tie_track_dirs(track_dirs, needs_autoclean, args.tieTracks)
+    if not tie_dirs:
+        print('Nothing to tiepoint: --tieTracks named no track with data, and '
+              'no track needed an autoclean mask')
+        return 0
+    if len(tie_dirs) != len(track_dirs):
+        print(f'Tiepointing {len(tie_dirs)} of {len(track_dirs)} track(s) '
+              f'(--tieTracks + {len(needs_autoclean)} needing autoclean)')
+
+    return run_refresh_ties(tie_dirs, args.tiesOnly, args.overWrite,
+                            args.keepVz, args.year,
+                            phase_and_offsets=not args.noPhase,
+                            no_quad_fit=not args.quadFit,
+                            use_yaml=True,
+                            use_squint=useSquint,
+                            use_az_ionosphere=useAzIonosphere,
+                            n_threads=args.nThreads)
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main() or 0)

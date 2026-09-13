@@ -81,8 +81,11 @@ SetupNISAR <orbit>      per affected orbit (derived from the released granules),
 setupNISARTracks --copyFiles   prime new tracks: instantiate tie_plan_header/
                         vel_thumb_plan from the project templates (idempotent;
                         only matters the first time a track appears)
-setupNISARTracks --year tie points / velocity for the year(s) of the new data
-makeMaster              update Release/masterInput/inputFile
+setupNISARTracks --year tie points / velocity for the year(s) of the new data,
+                        restricted with --tieTracks to the tracks that got new
+                        granules (plus any whose autoclean mask was rebuilt)
+makeMaster              update Release/masterInput/inputFile (or the master named
+                        by masterInputPaths/masterOutputPath)
 ```
 
 `--noDownload` skips `searchGranules`/`downloadGranules` and starts at
@@ -131,6 +134,30 @@ Notes:
 - The `cron.log` redirect is a catch-all for search/download/staging output and
   tracebacks; the per-run `summary_<date>.txt` files (below) are the primary record.
 
+## Which tracks get tiepointed
+
+Step 6 used to run `setupNISARTracks --year` with no track restriction, and
+`setupNISARTracks` tiepoints every track it discovers. So a night that filed 8 new
+orbits still re-tied all ~170 tracks: with `-nThreads 32` that is a 1.5–2 hour stage,
+and for a track with no new frames it recomputes the identical answer, because ties and
+baselines are per-track quantities that depend on nothing outside their own track.
+
+Step 6 now passes `--tieTracks` naming the tracks with new granules — the same
+`orbitsFromReleased()` list that drove step 5. Two things are deliberately *not*
+restricted:
+
+- The **autoclean-mask scan** still covers every track. A track can need a first-time
+  mask without having new data this run, and `setupNISARTracks` adds any track whose
+  mask it (re)builds back into the tie list, since a fresh mask changes the tie fit.
+- **With no orbits at all** (granules released but no `track-<N>/<orbit>_*` dirs — see
+  the `orbitsFromReleased` warning), the flag is omitted and every track is tied. The
+  conservative default: an anomalous run should not silently skip the tie stage.
+
+The summary's `Tracks tiepointed:` line lists the restricted set; its absence means all
+tracks were tied. Set `retieAllTracks: true` in `autoupdate.yaml` to force the old
+behaviour without a code change, or run `setupNISARTracks --year <yyyy>` by hand — with
+no `--tieTracks`, that still tiepoints everything.
+
 ## Run summary logs
 
 After each run, `processReleased` writes a human-readable summary to
@@ -145,6 +172,90 @@ output as the failure reason. Each orbit's full stdout+stderr is captured to
 `dailyDownloadLogs/orbitLogs_<MM-DD-YYYY>_<HHMMSS>/orbit_<orbit>_track-<track>.log`
 (also avoids the interleaving you'd get from up to `nThreads` orbits printing to
 one console at once).
+
+Between the overview and the per-orbit breakdown sits a **`TRACK ERRORS`** section
+aggregating what the tie stage wrote to two sets of log files:
+
+| path | holds |
+|---|---|
+| `track-N/stderr` | the per-track tie chain (`maketies` → `makeframetie.py`) |
+| `track-N/<frame>/motion/*stderr` | per-frame `azparams`/`rparams` (`azest_stderr`, `estr_stderr`) |
+
+Four error formats are recognised: `myerror` banners, argparse rejections, traceback
+final lines, and the C binaries' own `error()` output — `clib/standard.c` prints a bare
+`error:  <msg>` with no colour and no program prefix, so it matches none of the others
+and needs its own pattern. Messages are normalised (directory prefixes stripped, long
+digit runs collapsed, parenthesised counts collapsed to `(N)`) so one failure hitting
+every track becomes a single line with a count and a few example tracks, rather than
+hundreds of near-identical ones. The parenthesised-count rule is what merges
+`tiepoints: Insufficient Number (0|1|2|3) of Valid tie points` — one failure mode, four
+spellings — into a single kind; the exact count is still in `track-N/stderr`. Only files modified since the run started are read, so a run
+that aborts before the tie stage cannot report yesterday's errors as today's. It is
+capped at 15 distinct messages × 5 example tracks to keep the mail bounded.
+
+### Screening out errors you have already seen
+
+Several standing failures are benign and permanent. The commonest is
+`tiepoints: Insufficient Number (0) of Valid tie points`: a frame whose phase never
+ties, where `tiepoints` writes the `sigma: -1` no-solution sentinel into
+`motion/baseline.NxM.yaml`, `mosaic3d` skips the phase for that frame, and the frame
+still contributes through its (perfectly good) range offsets. Nothing is broken and
+nothing needs doing — but reported in full every night it buries the errors that do.
+
+So the section splits into **`NEW`** and **`RECURRING`**, keyed on the
+(normalised message, track) pair:
+
+```
+TRACK ERRORS  (2 new, 3 recurring; 40 track(s) affected)
+  NEW
+  [   1] readgeodat : could not open file
+         track-12
+  [   1] tiepoints: Insufficient Number (N) of Valid tie points
+         track-107
+  RECURRING  (already reported; per-track detail in dailyDownloadLogs/knownTrackErrors.json)
+  [  19] tiepoints: Insufficient Number (N) of Valid tie points   since 08-24-2026
+  [   8] svInitAzParams : insufficient points to fit              since 08-24-2026
+  [   6] No output because no data in range, check dates          since 08-25-2026
+```
+
+New pairs get the full message + example-tracks block; recurring ones collapse to one
+line carrying the count and the date that message was first seen. A known message
+spreading to a **new** track appears in both sections — that track is news even though
+the message is not.
+
+The state lives in `dailyDownloadLogs/knownTrackErrors.json`
+(`{message: {track: first-seen}}`), rewritten every run:
+
+- a pair still failing keeps its original first-seen date;
+- a pair is **forgotten** only when that track's log was actually re-read this run and
+  no longer carries the message — so it will be reported as new if it ever comes back;
+- a pair from a track the run never touched is **carried forward** untouched.
+  `collectTrackErrors` only reads logs rewritten since the run started, so a track with
+  no new granules contributes nothing this run; pruning on that absence would make it
+  report "new" again the next time it genuinely fails.
+
+Delete the file to re-report everything once; an unreadable or corrupt file reads as
+empty, which does the same (over-report rather than silently swallow). The first run
+after this feature was added therefore reports the whole standing backlog once, and is
+quiet from the next run on.
+
+`notifyOnTrackErrors` now triggers the mail on **new** errors only — a night whose only
+errors are recurring sends nothing, while the summary file still records both sections
+in full. A failed step, a failed orbit, or a crash still mails regardless.
+
+This section is the reason the whole thing exists: nothing was reading either set of
+logs, so a tie stage that failed on every track for eleven consecutive nights (see
+*Pointing the nightly master at a multi-project master* for the related master-path bug)
+produced summaries where every step still said `OK`. Aggregated, that failure is two
+lines. The per-frame logs matter for the same reason: when `azparams` dies it leaves a
+zero-byte `az.est.yaml`, which `mosaic3d` reads as all zeros and then fails on obscurely
+much later — the useful message (`svInitAzParams : insufficient points to fit`, naming
+the frame) only ever existed in `motion/azest_stderr`.
+
+Nothing here changes any failure behaviour — every one of these steps already exited
+non-zero (C `error()` exits 1, `myerror` now does too). They were simply never reported.
+There is still exactly **one** mail per run: `notifyOnErrors` sends the whole summary, so
+the new section rides along in it rather than adding another message.
 
 ## Orbit derivation (no HDF5 read)
 
@@ -190,6 +301,10 @@ frame (a gap) correctly becomes its own virtual frame instead.
 | `setupFlags` | (optional) extra flags forwarded to `SetupNISAR` per orbit; default empty. Region-dependent processing choices are NOT put here — see `sepIceRock` below |
 | `nThreads` | (optional) number of `SetupNISAR` orbit jobs to run in parallel in step 5; default 20 |
 | `ompThreads` | (optional) OpenMP width passed to each orbit's `SetupNISAR` (`-ompThreads`); default = SetupNISAR's own (6). Balance `nThreads * ompThreads` against core count |
+| `retieAllTracks` | (optional, default `false`) tiepoint **every** track in step 6 instead of only the ones with new data. See *Which tracks get tiepointed* below |
+| `masterInputPaths` | (optional) directories `makeMaster` scans for `track-N` subdirs (its `--inputPaths`); a single value, a space-separated string, or a YAML list. Relative entries are anchored to `projectDir`. Default: `projectDir` alone |
+| `masterOutputPath` | (optional) directory `makeMaster` writes `inputFile` into (its `--outputPath`), anchored to `projectDir` when relative; default `Release/masterInput` |
+| `notifyOnTrackErrors` | (optional, default `true`) let aggregated per-track errors trigger the notification mail on their own — **new** ones only, per *Screening out errors you have already seen*. The `TRACK ERRORS` section is written to the summary file either way; set `false` to keep it out of the mail trigger entirely while you work through a known recurring error |
 | `notifyEmail` | (optional) address mailed the run summary **only when the run hits errors** (a failed step, a failed `SetupNISAR` orbit, or a crash). Silent on a clean run; with no key set, no mail is ever sent (opt-in). Best effort via the local MTA (`mail`/`mailx`) — a host with no working mailer just logs a warning and continues |
 
 Region-dependent processing choices live in **`project.yaml`**, read by `SetupNISAR`
@@ -197,6 +312,29 @@ itself, not in `setupFlags`. In particular `sepIceRock` (the ice-anchored/rock-s
 ionosphere path + global fill) is a `project.yaml` key — `True` for Greenland, `False`
 for Antarctica for now. `SetupNISAR`, `processTrack` (via SetupNISAR), and a standalone
 `estimateIonosphere` all honor it; the `--sepIceRock` CLI flag only forces it on.
+
+### Pointing the nightly master at a multi-project master
+
+By default step 7 rewrites `<projectDir>/Release/masterInput/inputFile`. That is the
+file the mosaics read only when the project dir *is* the mosaic root, as for
+Greenland. Antarctica splits the season by bandwidth (`Antarctica2026/Antarctica40`,
+`Antarctica2026/Antarctica80`), each with its own `autoupdate.yaml`, while the
+mosaics read one combined master at `Antarctica2026/Release/track-all/inputFile`.
+Without these keys the nightly run happily refreshes `Antarctica40`'s own master and
+the combined one silently goes stale. In `Antarctica40/autoupdate.yaml`:
+
+```yaml
+masterInputPaths:              # scan both bandwidth trees (relative to projectDir)
+  - .
+  - ../Antarctica80
+masterOutputPath: ../Release/track-all
+```
+
+List **every** tree the master should cover, not just the ones being updated. No new
+80 MHz data is being collected and `Antarctica80` has no `autoupdate.yaml`, but its
+already-processed frames are the majority of the combined master (2471 of 4380 data
+lines as of 2026-08-24); leaving it out of `masterInputPaths` would quietly drop
+them from the mosaic input. A static tree simply re-emits the same lines each night.
 
 The driver passes `--inputPath <archiveDir>` to `FileNISARProducts` explicitly, so
 the run does not depend on `projectDir` containing an `autoupdate.yaml` with the

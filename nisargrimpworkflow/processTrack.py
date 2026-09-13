@@ -26,8 +26,16 @@ def parseArgs():
     parser.add_argument('track', type=str, nargs=1,
                        help='Path to input products')
     
-    parser.add_argument('--overWrite', action="store_true",
-                        help='Overwrite if products already exist')
+    parser.add_argument('--overWrite', type=str, default=None,
+                        metavar='all|ORBITS',
+                        help='Rebuild existing products. REQUIRES an explicit scope: '
+                        'either the word "all" (every orbit in the track) or a '
+                        'comma/space separated list of orbits, e.g. "--overWrite 5430" '
+                        'or "--overWrite 5430,5431". With a list, ONLY those orbits are '
+                        'processed, and each is done in full (every virtual-frame '
+                        'section of the orbit). Without --overWrite the default is '
+                        '--new: every orbit is visited but only virtual frames that do '
+                        'not already have a product VRT are built.')
     parser.add_argument('--RUNWOnly', action="store_true",
                         help='RUNWonly')    
     parser.add_argument('--overWritePhase', action="store_true",
@@ -55,8 +63,10 @@ def parseArgs():
                         help='Pass --bakeOnly to SetupNISAR: just bake existing '
                         'virtual-frame VRTs into flat GeoTIFFs, skip all reprocessing')
     parser.add_argument('--new', action='store_true',
-                        help='Pass --new to SetupNISAR: skip any virtual frame whose '
-                        'product VRT already exists; only build new virtual frames')
+                        help='DEPRECATED and now the default: only build virtual frames '
+                        'whose product VRT does not already exist. Accepted so existing '
+                        'command lines keep working; it changes nothing. Use --overWrite '
+                        'to rebuild existing products.')
     parser.add_argument('-noPrompt', '--noPrompt', action='store_true',
                         help='Pass --noPrompt to SetupNISAR: skip the confirmation '
                         'prompt for --clean/--cleanDebug')
@@ -77,9 +87,22 @@ def parseArgs():
                         '(orbits run one at a time)')
     args = parser.parse_args()
     #
-    return args.track[0], args.overWrite, args.overWritePhase, args.RUNWOnly, \
-        args.correlationOnly, args.debugIono, args.sepIceRock, args.geodatsOnly, \
-        args.clean, args.cleanDebug, args.noPrompt, args.bakeOnly, args.new, \
+    # --overWrite is scoped rather than a bare switch: it is either "all" or an explicit
+    # orbit list. overWriteAll says whether every orbit is rebuilt; overWriteOrbits, when
+    # non-empty, restricts the run to exactly those orbits. Neither set means the default,
+    # which is --new (build only virtual frames that have no product VRT yet).
+    overWriteAll, overWriteOrbits = False, []
+    if args.overWrite is not None:
+        if args.overWrite.strip().lower() == 'all':
+            overWriteAll = True
+        else:
+            overWriteOrbits = [o for o in args.overWrite.replace(',', ' ').split() if o]
+            if not overWriteOrbits:
+                parser.error('--overWrite needs "all" or a list of orbits, '
+                             f"got '{args.overWrite}'")
+    return args.track[0], overWriteAll, overWriteOrbits, args.overWritePhase, \
+        args.RUNWOnly, args.correlationOnly, args.debugIono, args.sepIceRock, \
+        args.geodatsOnly, args.clean, args.cleanDebug, args.noPrompt, args.bakeOnly, \
         args.threads, args.firstDate, args.lastDate
 
 
@@ -94,23 +117,46 @@ def main():
 
     '''
     # Get args
-    track, overWrite, overWritePhase, RUNWOnly, correlationOnly, debugIono, \
-        sepIceRock, geodatsOnly, clean, cleanDebug, noPrompt, bakeOnly, new, \
+    track, overWriteAll, overWriteOrbits, overWritePhase, RUNWOnly, correlationOnly, \
+        debugIono, sepIceRock, geodatsOnly, clean, cleanDebug, noPrompt, bakeOnly, \
         threads, firstDate, lastDate = parseArgs()
     orbitDirs =  glob.glob(f'{track}/*_*')
-    print(orbitDirs)
     orbits = sorted(list(set([x.split('/')[-1].split('_')[0] for x in orbitDirs])))
-    print(orbits)
+    orbits = [o for o in orbits if 'tie' not in o]
+    #
+    # An explicit orbit list restricts the run to those orbits, so --overWrite cannot
+    # reach healthy orbits by accident. Every section of a listed orbit is rebuilt,
+    # because SetupNISAR works a whole orbit at a time.
+    if overWriteOrbits:
+        unknown = [o for o in overWriteOrbits if o not in orbits]
+        if unknown:
+            print(f'processTrack: WARNING orbit(s) not found in {track}: '
+                  f'{", ".join(unknown)}')
+        orbits = [o for o in orbits if o in overWriteOrbits]
+        if not orbits:
+            print(f'processTrack: none of the requested orbits exist in {track}, '
+                  'nothing to do')
+            return
+    if overWriteAll:
+        mode = 'overWrite ALL orbits'
+    elif overWriteOrbits:
+        mode = f'overWrite orbits {",".join(overWriteOrbits)}'
+    else:
+        mode = 'new only (default -- existing products are left alone)'
+    print(f'processTrack: {track}  orbits {",".join(orbits)}  mode: {mode}')
+    if firstDate or lastDate:
+        print(f'processTrack: date window [{firstDate or "-inf"}, {lastDate or "+inf"}]'
+              ' -- orbits outside it are skipped by SetupNISAR')
     orbitThreads = []
     for orbit in orbits:
-        if 'tie' in orbit:
-            continue
-        print(track)
         command =['SetupNISAR', f'{orbit}']
         if RUNWOnly:
             command += ['--RUNWOnly']
-        if overWrite:
+        if overWriteAll or orbit in overWriteOrbits:
             command += ['--overWrite']
+        else:
+            # default: only build virtual frames that have no product VRT yet
+            command += ['--new']
         if overWritePhase:
             command += ['--overWritePhase']
         if correlationOnly:
@@ -129,8 +175,6 @@ def main():
             command += ['--noPrompt']
         if bakeOnly:
             command += ['--bakeOnly']
-        if new:
-            command += ['--new']
         if firstDate:
             command += ['--firstDate', firstDate]
         if lastDate:

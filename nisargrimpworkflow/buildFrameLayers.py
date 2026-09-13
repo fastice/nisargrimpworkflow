@@ -175,6 +175,7 @@ maplayerTemplate = '''    <maplayer geometry="Polygon" autoRefreshTime="0" legen
 def buildFrameLayersArgs():
     ''' Handle command line args'''
     parser = argparse.ArgumentParser(
+        epilog='Part of the nisargrimpworkflow package.',
         description='\n\n\033[1mBuild a QGIS Layer Definition (.qlr) with '
         'a "Frames" group (sigma_field-switchable), an "rBaseline" group '
         '(fixed 10-class sigmaRBaseline coloring) -- both organized '

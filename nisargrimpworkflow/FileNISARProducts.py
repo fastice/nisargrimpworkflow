@@ -8,6 +8,8 @@ Created on Sat Mar  7 08:58:04 2026
 
 import argparse
 import os
+
+from nisargrimpworkflow import unpairedProducts
 import sys
 import glob
 import multiprocessing
@@ -94,6 +96,11 @@ def parseArgs():
                         'symlinks already exist. Use when source/ was created '
                         'by a previous run but the orbit_frame subdirectories '
                         'still need to be built')
+    parser.add_argument('--preferNonMixed', action='store_true', default=False,
+                        help='When several RUNW products exist for the same orbit/frame, '
+                             'rank mixed-mode ones last so a non-mixed partial is filed '
+                             'instead of a mixed full frame being skipped. Off by default: '
+                             'in Antarctica40 this brings in ~500 extra partial frames.')
     parser.add_argument('--verbose', action='store_true', default=False,
                         help='Print per-file detail: filenames, orbit info, '
                         'already-filed and unfiled messages. Without this flag '
@@ -112,10 +119,23 @@ def parseArgs():
     #
     params = {}
     for param in ['firstOrbit', 'lastOrbit', 'outputPath',
-                  'reFile', 'verbose', 'ignoreMissingROFF', 'nThreads']:
+                  'reFile', 'verbose', 'ignoreMissingROFF', 'nThreads', 'preferNonMixed']:
         params[param] = getattr(args, param)
         if 'Path' in param and params[param] == '.':
             params[param] = os.getcwd()
+    # Project-level switch (Ian, 2026-09-12): a project can ask for the
+    # non-mixed preference permanently via project.yaml `preferNonMixed: true`
+    # in the output (project) directory, so the nightly gets it without a
+    # command-line change. The flag or the key turns it on; neither = off.
+    if not params['preferNonMixed']:
+        projYaml = os.path.join(params['outputPath'], 'project.yaml')
+        try:
+            with open(projYaml) as fp:
+                params['preferNonMixed'] = bool((yaml.safe_load(fp) or {}).get('preferNonMixed', False))
+        except Exception:
+            pass
+    if params['preferNonMixed']:
+        print('preferNonMixed: on -- mixed-mode products rank last among duplicates')
     # Resolve inputPath: an explicit CLI argument always wins; otherwise fall
     # back to archiveDir from an autoupdate.yaml sitting in the output tree
     # (the autoupdate workflow runs from the project dir where it lives).
@@ -202,7 +222,40 @@ def _coverageSeconds(pDict):
             (pDict['date2End'] - pDict['date2Sstart']).total_seconds())
 
 
-def selectBestRUNW(candidates):
+def _mixedModeCached(RUNW):
+    '''
+    isMixedMode() for one RUNW, memoised in <RUNW dir>/.mixedModeCache.json
+    (granule basename -> bool) so the duplicate selection opens each HDF5
+    once ever rather than on every run. Unreadable files are treated as not
+    mixed (the later per-winner read reports them). The cache is best-effort:
+    a write failure only costs a re-read next time.
+    '''
+    import json
+    cachePath = os.path.join(os.path.dirname(RUNW), '.mixedModeCache.json')
+    name = os.path.basename(RUNW)
+    cache = {}
+    try:
+        with open(cachePath) as fp:
+            cache = json.load(fp)
+    except Exception:
+        cache = {}
+    if name in cache:
+        return bool(cache[name])
+    meta = readRUNWMeta(RUNW)
+    value = bool(meta.get('mixed'))
+    if meta.get('error') is None:
+        cache[name] = value
+        try:
+            tmp = cachePath + '.tmp'
+            with open(tmp, 'w') as fp:
+                json.dump(cache, fp, indent=0, sort_keys=True)
+            os.replace(tmp, cachePath)
+        except Exception:
+            pass
+    return value
+
+
+def selectBestRUNW(candidates, preferNonMixed=False):
     '''
     Select the best RUNW from a list of candidates for the same track/frame.
 
@@ -215,12 +268,28 @@ def selectBestRUNW(candidates):
     Returns (winner, losers, reasons) where reasons is a dict mapping each
     loser path to a human-readable string explaining why it was not selected.
     '''
+    # Mixed-mode products lose to any non-mixed candidate. The mixed-mode test
+    # normally runs on the WINNER only (after selection, from its HDF5), so a
+    # mixed full-frame product used to beat a non-mixed partial of the same
+    # (orbit, frame) on coverage and then be skipped -- losing the frame even
+    # though a usable pair sat in the archive (Antarctica40 track-36 cycle 019
+    # frame 134, 2026-09-12). This is the only place the selection opens an
+    # HDF5, and only for the few groups that actually have duplicates.
+    # Opt-in (--preferNonMixed): a 2026-09-12 census found the old rule shadows
+    # 502 non-mixed partial frames in Antarctica40 alone, so switching it on
+    # files hundreds of new frames -- a scale decision, not a default.
+    if preferNonMixed:
+        mixed = {RUNW: (1 if _mixedModeCached(RUNW) else 0) for RUNW in candidates}
+    else:
+        mixed = {RUNW: 0 for RUNW in candidates}
+
     def rankKey(RUNW):
         pDict, _ = parseFileName(RUNW)
         baseline = abs((pDict['date2Sstart'] - pDict['date1Sstart']).days)
         mtime = os.path.getmtime(RUNW)
-        # shortest baseline first, newest mtime first, longest coverage first
-        return (baseline, -mtime, -_coverageSeconds(pDict))
+        # non-mixed first, shortest baseline first, newest mtime first,
+        # longest coverage first
+        return (mixed[RUNW], baseline, -mtime, -_coverageSeconds(pDict))
 
     ranked = sorted(candidates, key=rankKey)
     winner = ranked[0]
@@ -238,7 +307,10 @@ def selectBestRUNW(candidates):
         loser_baseline = abs((pDict['date2Sstart'] - pDict['date1Sstart']).days)
         loser_mtime = os.path.getmtime(loser)
         loser_coverage = _coverageSeconds(pDict)
-        if loser_baseline > winner_baseline:
+        if mixed[loser] and not mixed[winner]:
+            reasons[loser] = ('mixed-mode acquisition (a non-mixed product of the '
+                              'same orbit/frame is available)')
+        elif loser_baseline > winner_baseline:
             reasons[loser] = (f'longer temporal baseline '
                               f'({loser_baseline}d vs {winner_baseline}d)')
         elif loser_mtime < winner_mtime:
@@ -548,7 +620,7 @@ def main():
             winners.append(candidates[0])
             continue
         #
-        winner, losers, reasons = selectBestRUNW(candidates)
+        winner, losers, reasons = selectBestRUNW(candidates, preferNonMixed=params.get('preferNonMixed', False))
         winners.append(winner)
         #
         trackDir = f'{params["outputPath"]}/track-{track}'
@@ -653,7 +725,10 @@ def main():
     #
     filed_rslcs = set()   # track RSLCs filed via RUNW companion search
     nFiled = 0
+    nUnlinked = 0
+    missingMates = []          # (presentProduct, missingType) seen this run
     nMixed = 0
+    mixedSkipped = []   # 'orbit_frame  RUNW granule' per mixed-mode skip
     nRange = 0
     nError = 0
     for i, RUNW in enumerate(toProcess):
@@ -714,6 +789,12 @@ def main():
             continue
         if res['mixed']:
             nMixed += 1
+            # Always remember WHICH frame was skipped: the summary count alone
+            # ("1 mixed-mode") leaves no trace in track-N/unfiled or the
+            # unpaired registry, so a frame that is present in the archive but
+            # absent from the project could not be explained without re-reading
+            # the HDF5 (Antarctica40 track-36 cycle 019 frame 132, 2026-09-12).
+            mixedSkipped.append(f"{orbit1}_{frame}  {os.path.basename(res['RUNW'])}")
             if verbose:
                 printWarning(f'mixed-mode frame {orbit1}_{frame} — skipping',
                              verbose, i, total)
@@ -723,17 +804,44 @@ def main():
             print(f'  orbit1={orbit1}  orbit2={orbit2}  frame={frame}')
         orbitFrameDir = f'{trackDir}/{orbit1}_{frame}'
         h5Dir = f'{orbitFrameDir}/H5'
-        os.makedirs(h5Dir, exist_ok=True)
         #
-        # Symlink requested L2 products (RUNW, ROFF, RIFG) into H5/.
-        # RSLC is source-only (wrapH5WithVRT does not handle it).
+        # Decide what to link BEFORE creating the directory.  A pass restricted
+        # to one product type (e.g. --products ROFF) on a frame whose mate has
+        # not been delivered yet used to create H5/ and then link nothing,
+        # leaving an empty directory that looked like a processing failure.
+        toLink = []
         for pt, product in [('RUNW', RUNW)] + [
                 (pt, getCompanion(RUNW, params['inputPath'], pt))
                 for pt in ['ROFF', 'RIFG']]:
             if product is not None and (products is None or pt in products):
-                symlink_file(product,
-                             f'{h5Dir}/{os.path.basename(product)}',
-                             relative=True, overwrite=False)
+                toLink.append(product)
+            elif product is None and pt in unpairedProducts.TRACKED_PAIR.values():
+                # RUNW present, mate absent: record it so the gap is explicit
+                # and re-checked on later runs instead of being invisible.
+                missingMates.append((RUNW, pt))
+        #
+        if not toLink:
+            nUnlinked += 1
+            # Do not leave (or keep) an empty H5 behind.
+            if os.path.isdir(h5Dir) and not os.listdir(h5Dir):
+                try:
+                    os.rmdir(h5Dir)
+                    if not os.listdir(orbitFrameDir):
+                        os.rmdir(orbitFrameDir)
+                except OSError:
+                    pass
+            if verbose:
+                printWarning(f'no product to link for {orbit1}_{frame} — '
+                             f'not creating H5/', verbose, i, total)
+            continue
+        #
+        # Symlink requested L2 products (RUNW, ROFF, RIFG) into H5/.
+        # RSLC is source-only (wrapH5WithVRT does not handle it).
+        os.makedirs(h5Dir, exist_ok=True)
+        for product in toLink:
+            symlink_file(product,
+                         f'{h5Dir}/{os.path.basename(product)}',
+                         relative=True, overwrite=False)
         nFiled += 1
     #
     # Clear the status line and print a single final summary.
@@ -748,6 +856,8 @@ def main():
         extras.append(f'{nRecovered} previously-unpaired restored')
     if skipped:
         extras.append(f'{skipped} skipped (already exist)')
+    if nUnlinked:
+        extras.append(f'{nUnlinked} with no product to link (no H5 created)')
     if nMixed:
         extras.append(f'{nMixed} mixed-mode')
     if nRange:
@@ -757,6 +867,37 @@ def main():
     if extras:
         summary += '; ' + ', '.join(extras)
     print(summary)
+    if mixedSkipped:
+        print('  mixed-mode products skipped (excluded by policy; only SetupNISAR '
+              '--allowMixedMode admits them):')
+        for entry in mixedSkipped:
+            print(f'    {entry}')
+    #
+    # Unpaired-product registry.  Three jobs, all non-fatal: record any mate
+    # that was missing this run, re-check every previously-open entry to see
+    # whether the mate has since been delivered, and write the result back.
+    # The registry lives beside the archive so it travels with the data.
+    try:
+        archiveDir = params['inputPath']
+        registry = unpairedProducts.load(archiveDir)
+        for presentPath, missingType in missingMates:
+            unpairedProducts.record(registry, presentPath, missingType)
+        resolved, stillOpen = unpairedProducts.checkResolved(
+            archiveDir, registry, verbose=verbose)
+        written = unpairedProducts.save(archiveDir, registry)
+        if resolved:
+            # The loop above already filed these -- getCompanion found the mate
+            # this time -- so this is a notice, not an action item.
+            print(f'{len(resolved)} previously-unpaired product(s) had their '
+                  f'mate delivered and were filed this run')
+        print(unpairedProducts.summarise(registry))
+        if written is None and registry.get('unreadable'):
+            printWarning(f'{unpairedProducts.REGISTRY_NAME} could not be parsed'
+                         f' -- left untouched', True, 0, 0)
+    except Exception as exc:                                   # noqa: BLE001
+        # An audit aid must never take down a filing run.
+        print(f'WARNING: unpaired-product registry skipped: '
+              f'{type(exc).__name__}: {exc}')
     #
     # --- Standalone RSLC pass: file RSLCs with no companion RUNW ---
     # findRSLC only runs inside the RUNW loop, so RSLCs without a matching RUNW

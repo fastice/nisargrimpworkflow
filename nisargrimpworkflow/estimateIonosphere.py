@@ -51,6 +51,12 @@ import os
 import re
 import shutil
 import subprocess
+
+
+# Cap the idle OpenBLAS pool that libgdal drags in; see the fuller note in
+# ROFFtoGrimp.py.  Must be in the environment before the process starts, and
+# must be OPENBLAS_NUM_THREADS (OMP_NUM_THREADS would serialise siminsar).
+BLAS_ENV = dict(os.environ, OPENBLAS_NUM_THREADS='1')
 import sys
 import threading
 import time
@@ -701,7 +707,8 @@ def run_intfloat(phase_tif, phase_vrt, thresh, island_thresh):
                '-islandThresh', str(island_thresh),
                phase_tif]
     print(f"  {' '.join(command)}")
-    subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(command, check=True, stdout=subprocess.DEVNULL,
+                   env=BLAS_ENV)
 
 
 def _removeSimFiles(base):
@@ -788,7 +795,7 @@ def run_vel_sim(runw, region, simDir='.', overwrite=False, verticalCorrection=No
                '-smoothNIter', str(smoothParams['smoothNIter'])]
     cmd += [region.dem(), region.velMap(), geodat, velSimPath]
     with _Spinner('Creating velSim'):
-        subprocess.run(cmd, check=True,
+        subprocess.run(cmd, check=True, env=BLAS_ENV,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     updateSimVrtGeotransforms(os.path.join(simDir, 'velSim*.vrt'), runw)
     # Rewrite siminsar's raw-binary output(s) as self-contained GeoTIFF(s).
@@ -811,7 +818,7 @@ def run_mask_vel(runw, region, vel_thresh, simDir='.', overwrite=False):
     cmd = ['siminsar', '-velThresh', str(vel_thresh), '-velocity',
            region.dem(), region.velMap(), geodat, maskVelPath]
     with _Spinner('Creating maskVel'):
-        subprocess.run(cmd, check=True,
+        subprocess.run(cmd, check=True, env=BLAS_ENV,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     updateSimVrtGeotransforms(os.path.join(simDir, 'maskVel*.vrt'), runw)
     # Rewrite siminsar's raw-binary output as a self-contained GeoTIFF.
@@ -1125,7 +1132,8 @@ def main():
                       '-radiusMap', radiusMap, '-pixRatio', str(pixRatio),
                       '-nIterations', str(args.smoothNIter), '-minValue', '-2.0e9']
             print(f"  {' '.join(command)}")
-            subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(command, check=True, stdout=subprocess.DEVNULL,
+                           env=BLAS_ENV)
             if args.debugIono:
                 debugDir = os.path.join(os.path.dirname(os.path.abspath(phase_tif)), 'debug')
                 os.makedirs(debugDir, exist_ok=True)

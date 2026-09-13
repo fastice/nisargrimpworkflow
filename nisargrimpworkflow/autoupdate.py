@@ -14,7 +14,9 @@ notifyEmail key no mail is ever sent (opt-in, best effort via the local MTA).
 import argparse
 import datetime
 import glob
+import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -136,6 +138,37 @@ def searchBandwidths(config):
         bandwidths = [bandwidths]
     return ['77' if str(bw).strip() == '80' else str(bw).strip()
             for bw in bandwidths]
+
+
+def masterInputPaths(config, projectDir):
+    '''
+    Return the makeMaster --inputPaths list from config, or None when the key
+    is unset (makeMaster then falls back to --projectDir). Accepts a single
+    value, a space-separated string, or a YAML list. Relative entries are
+    anchored to projectDir so the config reads the same from any cwd.
+    '''
+    paths = config.get('masterInputPaths')
+    if paths is None:
+        return None
+    if isinstance(paths, str):
+        paths = paths.split()
+    elif not isinstance(paths, (list, tuple)):
+        paths = [paths]
+    return [os.path.normpath(path if os.path.isabs(path)
+                             else os.path.join(projectDir, path))
+            for path in (str(p).strip() for p in paths)]
+
+
+def masterOutputPath(config, projectDir):
+    '''
+    Return the absolute directory makeMaster writes inputFile into. Defaults to
+    projectDir/Release/masterInput (makeMaster's own default); masterOutputPath
+    in autoupdate.yaml overrides it, anchored to projectDir when relative.
+    '''
+    path = config.get('masterOutputPath') or 'Release/masterInput'
+    if not os.path.isabs(path):
+        path = os.path.join(projectDir, path)
+    return os.path.normpath(path)
 
 
 def readUrlList(urlListFile):
@@ -506,6 +539,185 @@ def mailReport(recipient, subject, body):
     return False
 
 
+# Error signatures worth surfacing out of a track's stderr: a myerror banner
+# (utilities.myerror / its local copies), an argparse rejection, the last line
+# of a traceback, or the C binaries' own error() format (clib/standard.c prints
+# a bare "error:  <msg>" -- no ANSI colour, no program prefix, so it matches
+# none of the others).
+_MYERROR_RE = re.compile(r'\x1b\[1;31m\s*\*\*\*\s+(.*?)\s+\*\*\*')
+_ARGPARSE_RE = re.compile(r'^(\S+): error: (.+)$')
+_TRACEBACK_RE = re.compile(r'^(\w*(?:Error|Exception)): (.+)$')
+_CERROR_RE = re.compile(r'^error:\s+(.+)$')
+
+# Keep the mailed summary bounded no matter how badly a run goes.
+MAX_ERROR_KINDS = 15
+MAX_EXAMPLE_TRACKS = 5
+
+# Per-project state remembering which (error, track) pairs are already known,
+# so a long-standing failure stops re-reporting in full every night. Lives in
+# dailyDownloadLogs beside the summaries; delete it to re-report everything.
+KNOWN_ERRORS_FILE = 'knownTrackErrors.json'
+
+
+def normalizeError(message):
+    '''
+    Collapse the run-specific parts of an error message (directory prefixes,
+    long digit runs like orbit/frame numbers, parenthesised counts) so the same
+    failure hitting 150 tracks aggregates to one line instead of 150
+    near-identical ones.
+
+    The parenthesised-count rule is what keeps "tiepoints: Insufficient Number
+    (0|1|2|3) of Valid tie points" -- one failure mode, four spellings -- from
+    occupying four lines and four separate entries in the known-error state.
+    The count is the detail, not the identity; the exact value is still in
+    track-N/stderr.
+    '''
+    message = re.sub(r'(/\S+)+/', '', message)
+    message = re.sub(r'\d{3,}', 'N', message)
+    message = re.sub(r'\((\d+)\)', '(N)', message)
+    return ' '.join(message.split())[:120]
+
+
+def trackStderrLabel(path):
+    ''' track-N/stderr -> "track-N". '''
+    return os.path.basename(os.path.dirname(path))
+
+
+def frameStderrLabel(path):
+    ''' track-N/<frame>/motion/azest_stderr -> "track-N/<frame> (azest)". '''
+    frameDir = os.path.dirname(os.path.dirname(path))
+    tool = os.path.basename(path).replace('_stderr', '').replace('stderr', '')
+    label = (f'{os.path.basename(os.path.dirname(frameDir))}/'
+             f'{os.path.basename(frameDir)}')
+    return f'{label} ({tool})' if tool else label
+
+
+def collectTrackErrors(projectDir, since=None, scanned=None):
+    '''
+    Aggregate error lines out of the log files the tie stage writes, keyed by
+    normalised message -> [where it happened]:
+
+      track-N/stderr                       the per-track tie chain
+      track-N/<frame>/motion/*stderr       azparams/rparams per frame
+
+    The second set is where azest/estr failures land ("svInitAzParams :
+    insufficient points to fit"), and nothing was reading it -- a frame whose
+    azparams dies leaves a zero-byte az.est.yaml that makes mosaic3d fail
+    obscurely much later. Both are rewritten on every run, so restrict to
+    files touched since `since` (the run start) -- otherwise a run that
+    aborted before the tie stage would report yesterday's errors as today's.
+    Each distinct message is counted once per file, however often it repeats.
+
+    If a set is passed as `scanned`, every label whose log WAS read this run is
+    added to it -- saveKnownErrors needs that to tell "this track was checked
+    and is clean now" from "this track was not touched this run".
+    '''
+    errors = {}
+    sources = [(os.path.join(projectDir, 'track-*', 'stderr'),
+                trackStderrLabel),
+               (os.path.join(projectDir, 'track-*', '*', 'motion', '*stderr'),
+                frameStderrLabel)]
+    paths = [(p, label) for pattern, label in sources
+             for p in sorted(glob.glob(pattern))]
+    for path, label in paths:
+        try:
+            if since is not None and datetime.datetime.fromtimestamp(
+                    os.path.getmtime(path)) < since:
+                continue
+            with open(path, errors='replace') as fp:
+                text = fp.read()
+        except OSError:
+            continue
+        track = label(path)
+        if scanned is not None:
+            scanned.add(track)
+        found = set()
+        for match in _MYERROR_RE.finditer(text):
+            found.add(normalizeError(match.group(1)))
+        for line in text.splitlines():
+            match = _CERROR_RE.match(line.strip())
+            if match:
+                found.add(normalizeError(match.group(1)))
+                continue
+            for regex in (_ARGPARSE_RE, _TRACEBACK_RE):
+                match = regex.match(line.strip())
+                if match:
+                    found.add(normalizeError(
+                        f'{match.group(1)}: {match.group(2)}'))
+        for message in found:
+            errors.setdefault(message, []).append(track)
+    return errors
+
+
+def loadKnownErrors(logDir):
+    '''
+    Read the known-error state written by saveKnownErrors:
+    {normalised message: {track label: first-seen MM-DD-YYYY}}. A missing or
+    unreadable file reads as empty, which makes every error look new -- the
+    safe direction (over-report rather than silently swallow).
+    '''
+    path = os.path.join(logDir, KNOWN_ERRORS_FILE)
+    try:
+        with open(path) as fp:
+            data = json.load(fp)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {message: dict(tracks) for message, tracks in data.items()
+            if isinstance(tracks, dict)}
+
+
+def splitTrackErrors(trackErrors, known):
+    '''
+    Partition this run's errors into (message, track) pairs never seen before
+    and pairs that were already failing. Returns (new, recurring, firstSeen):
+    new and recurring map message -> sorted tracks, firstSeen maps message ->
+    the earliest date any of its recurring tracks started failing. A message
+    with both new and old tracks appears in both, listing only its own tracks
+    in each -- a known failure spreading to a new track is news.
+    '''
+    new, recurring, firstSeen = {}, {}, {}
+    for message, tracks in trackErrors.items():
+        seen = known.get(message, {})
+        for track in sorted(set(tracks)):
+            if track in seen:
+                recurring.setdefault(message, []).append(track)
+            else:
+                new.setdefault(message, []).append(track)
+        if message in recurring:
+            firstSeen[message] = min(seen[t] for t in recurring[message])
+    return new, recurring, firstSeen
+
+
+def saveKnownErrors(logDir, trackErrors, known, scanned, today):
+    '''
+    Rewrite logDir/knownTrackErrors.json so it matches what is currently
+    failing: pairs still failing keep their original first-seen date, pairs
+    seen for the first time get today's.
+
+    A pair is forgotten only when that track's log was actually re-read this
+    run (`scanned`) and no longer carries the message. Pairs from tracks the
+    run never touched are carried forward untouched -- collectTrackErrors only
+    reads logs rewritten since the run start, so a track with no new granules
+    contributes nothing, and pruning on that absence would make it report
+    "new" again the next time it does fail.
+    '''
+    stamp = today.strftime(STAGING_DATE_FMT)
+    current = {message: set(tracks) for message, tracks in trackErrors.items()}
+    updated = {}
+    for message, tracks in known.items():
+        for track, first in tracks.items():
+            if track in current.get(message, ()) or track not in scanned:
+                updated.setdefault(message, {})[track] = first
+    for message, tracks in current.items():
+        for track in tracks:
+            updated.setdefault(message, {}).setdefault(track, stamp)
+    with open(os.path.join(logDir, KNOWN_ERRORS_FILE), 'w') as fp:
+        json.dump(updated, fp, indent=1, sort_keys=True)
+    return updated
+
+
 def runHadErrors(summary):
     '''
     True if the run recorded any failure worth emailing: a step with a non-zero
@@ -517,6 +729,13 @@ def runHadErrors(summary):
     if any(rc not in (None, 0) for rc in summary['steps'].values()):
         return True
     if any(e['status'] == 'FAILED' for e in summary['orbitResults']):
+        return True
+    # Per-track errors are always written to the summary file; whether they are
+    # worth waking someone up is a config choice (notifyOnTrackErrors). Only
+    # errors NOT seen in an earlier run count -- a known long-standing failure
+    # (e.g. a frame whose phase never ties but whose offsets are fine) would
+    # otherwise mail every night forever and train the reader to ignore it.
+    if summary.get('notifyOnTrackErrors') and summary.get('newTrackErrors'):
         return True
     return False
 
@@ -542,6 +761,10 @@ def notifyOnErrors(config, summary, projectDir, body):
         parts.append(f'{len(stepFails)} step(s) failed')
     if summary.get('exception'):
         parts.append('crashed')
+    newErrors = summary.get('newTrackErrors') or {}
+    if newErrors:
+        nTracks = len({t for tracks in newErrors.values() for t in tracks})
+        parts.append(f'{len(newErrors)} new error kind(s) on {nTracks} track(s)')
     subject = (f'autoupdate {os.path.basename(projectDir)}: '
                f'{", ".join(parts) or "errors"} on {host}')
     mailReport(recipient, subject, body or '(run summary unavailable)')
@@ -562,7 +785,9 @@ def processReleased(config, released, projectDir, pendingFile=None):
     stamp = start.strftime('%m-%d-%Y_%H%M%S')
     summary = {'start': start, 'stamp': stamp, 'released': released,
                'steps': {}, 'orbitResults': [], 'orbitLogDir': None,
-               'years': []}
+               'years': [], 'tieTracks': [],
+               'trackErrors': {}, 'newTrackErrors': {},
+               'recurringTrackErrors': {}, 'trackErrorFirstSeen': {}}
     try:
         # Step 4: file released RUNW/ROFF into track-<N>/<orbit>_<frame>/H5/.
         # archiveDir passed explicitly so the run does not depend on
@@ -643,19 +868,44 @@ def processReleased(config, released, projectDir, pendingFile=None):
             r = subprocess.run(['setupNISARTracks', '--copyFiles'],
                                cwd=projectDir)
             summary['steps']['setupNISARTracks --copyFiles'] = r.returncode
+            # Tie only the tracks that actually got new data. Ties and
+            # baselines are per-track quantities, so re-tying a track with no
+            # new frames reproduces the same answer -- across ~170 tracks that
+            # was 1.5-2 h of redundant work every night. setupNISARTracks adds
+            # back any track whose autoclean mask it rebuilds. With no orbits
+            # (nothing filed) the flag is omitted, keeping the old all-tracks
+            # pass rather than silently skipping the tie stage; set
+            # retieAllTracks: true in autoupdate.yaml to force that always.
+            tieTracks = sorted({os.path.basename(td) for td, _ in orbits},
+                               key=lambda t: int(t.split('-')[1]))
+            restrictTies = bool(tieTracks) and not config.get('retieAllTracks',
+                                                              False)
+            summary['tieTracks'] = tieTracks if restrictTies else []
             command = ['setupNISARTracks', '--year'] + years
+            if restrictTies:
+                command += ['--tieTracks'] + tieTracks
             print(f'processReleased: {" ".join(command)}  (cwd={projectDir})')
             r = subprocess.run(command, cwd=projectDir)
             summary['steps']['setupNISARTracks'] = r.returncode
 
-        # Step 7: update the master input file. makeMaster writes into
-        # Release/masterInput and errors if the Release/ parent is missing, so
-        # ensure it exists first (idempotent).
-        os.makedirs(os.path.join(projectDir, 'Release', 'masterInput'),
-                    exist_ok=True)
-        print('processReleased: makeMaster')
-        r = subprocess.run(['makeMaster', '--projectDir', projectDir],
-                           cwd=projectDir)
+        # Step 7: update the master input file. By default makeMaster scans
+        # projectDir and writes projectDir/Release/masterInput/inputFile. A
+        # project whose mosaics read a master assembled from several project
+        # dirs (e.g. Antarctica40 + Antarctica80 -> Antarctica2026/Release/
+        # track-all) points this step at that master instead via
+        # masterInputPaths/masterOutputPath in autoupdate.yaml -- otherwise the
+        # nightly run refreshes a master nothing downstream reads. makeMaster
+        # errors if the output directory's parent is missing, so create it
+        # first (idempotent).
+        outputPath = masterOutputPath(config, projectDir)
+        inputPaths = masterInputPaths(config, projectDir)
+        os.makedirs(outputPath, exist_ok=True)
+        command = ['makeMaster', '--projectDir', projectDir,
+                   '--outputPath', outputPath]
+        if inputPaths:
+            command += ['--inputPaths'] + inputPaths
+        print(f'processReleased: {" ".join(command)}')
+        r = subprocess.run(command, cwd=projectDir)
         summary['steps']['makeMaster'] = r.returncode
     except Exception:
         # Record a crash so notifyOnErrors mails even when a step raised rather
@@ -664,6 +914,26 @@ def processReleased(config, released, projectDir, pendingFile=None):
         raise
     finally:
         summary['end'] = datetime.datetime.now()
+        # Gather per-track errors here rather than after the tie step, so they
+        # are still collected when a step above raised.
+        try:
+            summary['notifyOnTrackErrors'] = bool(
+                config.get('notifyOnTrackErrors', True))
+            scanned = set()
+            summary['trackErrors'] = collectTrackErrors(
+                projectDir, since=summary['start'], scanned=scanned)
+            # Split into new vs already-known so the summary (and the mail
+            # trigger) surface what changed rather than the whole standing
+            # backlog again.
+            known = loadKnownErrors(logDir)
+            (summary['newTrackErrors'],
+             summary['recurringTrackErrors'],
+             summary['trackErrorFirstSeen']) = splitTrackErrors(
+                summary['trackErrors'], known)
+            saveKnownErrors(logDir, summary['trackErrors'], known, scanned,
+                            summary['start'])
+        except Exception as e:                 # never let logging break a run
+            u.mywarning(f'processReleased: could not collect track errors: {e}')
         body = None
         try:
             body = writeRunSummary(logDir, summary)
@@ -673,6 +943,27 @@ def processReleased(config, released, projectDir, pendingFile=None):
             notifyOnErrors(config, summary, projectDir, body)
         except Exception as e:                 # never let mailing break a run
             u.mywarning(f'processReleased: could not send notify email: {e}')
+
+
+def trackErrorLines(errors, indent='  '):
+    '''
+    Render {message: [tracks]} as the detailed two-line-per-kind block: a
+    count-prefixed message and a few example tracks, worst first, capped so a
+    bad night cannot produce an unmailable summary.
+    '''
+    lines = []
+    ranked = sorted(errors.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+    for message, tracks in ranked[:MAX_ERROR_KINDS]:
+        shown = sorted(set(tracks))
+        examples = ', '.join(shown[:MAX_EXAMPLE_TRACKS])
+        if len(shown) > MAX_EXAMPLE_TRACKS:
+            examples += f', +{len(shown) - MAX_EXAMPLE_TRACKS} more'
+        lines.append(f'{indent}[{len(shown):4d}] {message}')
+        lines.append(f'{indent}       {examples}')
+    if len(ranked) > MAX_ERROR_KINDS:
+        lines.append(f'{indent}... and {len(ranked) - MAX_ERROR_KINDS} more '
+                     'distinct message(s)')
+    return lines
 
 
 def writeRunSummary(logDir, summary):
@@ -715,13 +1006,56 @@ def writeRunSummary(logDir, summary):
              f'({nRUNW} RUNW, {nROFF} ROFF)']
     if summary['years']:
         lines.append(f'  Tie/velocity year(s): {" ".join(summary["years"])}')
+    # Only set when the tie stage was restricted to the tracks with new data;
+    # absent means every track was tiepointed (the pre-restriction behaviour).
+    if summary.get('tieTracks'):
+        lines.append(f'  Tracks tiepointed: {len(summary["tieTracks"])} '
+                     f'({" ".join(summary["tieTracks"])})')
     lines += [f'  FileNISARProducts : {stepStr("FileNISARProducts")}',
               f'  setupNISARTracks --copyFiles : '
               f'{stepStr("setupNISARTracks --copyFiles")}',
               f'  setupNISARTracks  : {stepStr("setupNISARTracks")}',
-              f'  makeMaster        : {stepStr("makeMaster")}',
-              '',
-              'ORBITS  (failures first)']
+              f'  makeMaster        : {stepStr("makeMaster")}']
+
+    # Per-track errors, aggregated. These come from track-*/stderr, which is
+    # where a failing tie chain reports and where nothing else was looking --
+    # a broken tie stage went unnoticed for 11 nights because every step above
+    # still said OK.
+    trackErrors = summary.get('trackErrors') or {}
+    if trackErrors:
+        nTracks = len({t for tracks in trackErrors.values() for t in tracks})
+        newErrors = summary.get('newTrackErrors') or {}
+        recurring = summary.get('recurringTrackErrors') or {}
+        firstSeen = summary.get('trackErrorFirstSeen') or {}
+        if not newErrors and not recurring:
+            # Split never ran (state unreadable, or an older summary dict):
+            # report everything in full rather than showing an empty section.
+            newErrors = {message: sorted(set(tracks))
+                         for message, tracks in trackErrors.items()}
+        lines += ['',
+                  f'TRACK ERRORS  ({len(newErrors)} new, {len(recurring)} '
+                  f'recurring; {nTracks} track(s) affected)']
+        if newErrors:
+            lines.append('  NEW')
+            lines += trackErrorLines(newErrors)
+        # Recurring kinds collapse to one line each: the count and how long
+        # they have been failing is all that is actionable once the tracks
+        # behind them have been looked at (they are all in the state file).
+        if recurring:
+            lines.append(f'  RECURRING  (already reported; per-track detail in '
+                         f'dailyDownloadLogs/{KNOWN_ERRORS_FILE})')
+            ranked = sorted(recurring.items(),
+                            key=lambda kv: (-len(kv[1]), kv[0]))
+            for message, tracks in ranked[:MAX_ERROR_KINDS]:
+                since = firstSeen.get(message)
+                sinceStr = f'   since {since}' if since else ''
+                lines.append(f'  [{len(tracks):4d}] {message}{sinceStr}')
+            if len(ranked) > MAX_ERROR_KINDS:
+                lines.append(f'  ... and {len(ranked) - MAX_ERROR_KINDS} more '
+                             'recurring message(s)')
+        lines.append('  (full text: <projectDir>/track-<N>/stderr)')
+
+    lines += ['', 'ORBITS  (failures first)']
     if not results:
         lines.append('  (none)')
     # Failures first, then by orbit number.

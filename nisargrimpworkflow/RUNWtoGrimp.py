@@ -12,6 +12,12 @@ import utilities as u
 import nisarhdf
 import sarfunc
 from subprocess import call, DEVNULL
+
+
+# Cap the idle OpenBLAS pool that libgdal drags in; see the fuller note in
+# ROFFtoGrimp.py.  Must be in the environment before the process starts, and
+# must be OPENBLAS_NUM_THREADS (OMP_NUM_THREADS would serialise siminsar).
+BLAS_ENV = dict(os.environ, OPENBLAS_NUM_THREADS='1')
 import sys
 import numpy as np
 import yaml
@@ -215,7 +221,7 @@ def runInterp(outputDir, inputVRT, outputFile, ratThresh=1,
                f'> {outputDir}/{outputFile}')
     print(command)
     # Run command
-    call(command, shell=True, stderr=stderr, stdout=stdout)
+    call(command, shell=True, stderr=stderr, stdout=stdout, env=BLAS_ENV)
 
 
 def writePairInfo(myRUNW, outputDir):
@@ -398,7 +404,7 @@ def interpPhase(outputDir, myRUNW, phaseDerivedIonosphere=False,
                 f'-nIterations {smoothNIter} -minValue -2.0e9 ' \
                 f'< {interpFile} > {tmpFile}'
             print(command)
-            call(command, shell=True, stderr=stderr, stdout=stdout)
+            call(command, shell=True, stderr=stderr, stdout=stdout, env=BLAS_ENV)
             os.replace(tmpFile, interpFile)
     #
     vrtInputs, vrtOutputs, vrtDescriptions, scales, noDataValues = \

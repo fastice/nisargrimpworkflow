@@ -16,6 +16,7 @@ from nisargrimpworkflow.custom_buildvrtWithOffsets import bakeVrtInPlace
 import geojson
 import copy
 import glob
+import re
 import numpy as np
 from subprocess import run, DEVNULL
 import os
@@ -373,6 +374,95 @@ def splitGroupsBySecondaryEpoch(groups, frameSecondaryInfo):
             splitGroups.append([f])
         if subGroup:
             splitGroups.append(subGroup)
+    return splitGroups
+
+
+def frameAvailableBandwidths(frameDir):
+    '''
+    The bandwidths a frame actually has RUNW granules for, from the granule names
+    (..._<frame>_<bandwidth>_SH_...), e.g. {4000, 7700}.  Empty set if none are visible.
+
+    A frame at a mode transition is often acquired BOTH ways seconds apart -- track-17 frame
+    123 has a 4000 and a 7700 RUNW -- and which one a run happens to pick must not decide
+    whether its group gets split.  See splitGroupsByMode().
+    '''
+    bandwidths = set()
+    for h5 in glob.glob(f'{frameDir}/*.h5') + glob.glob(f'{frameDir}/H5/*.h5'):
+        name = os.path.basename(h5)
+        if 'RUNW' not in name:
+            continue
+        m = re.search(r'_(\d{4})_[A-Z]{2}_\d{8}T', name)
+        if m:
+            bandwidths.add(int(m.group(1)))
+    return bandwidths
+
+
+def splitGroupsByMode(groups, frameSecondaryInfo, frameDirOf=None):
+    '''
+    Further split each group wherever a frame's acquisition MODE -- (NumberRangeLooks,
+    NumberAzimuthLooks, bandwidth) from frameSecondaryInfo -- differs from the group's
+    majority, so a virtual frame never spans a 40/80 MHz transition.
+
+    The group's mode is chosen by majority vote at SetupNISAR.py's per-group refresh, and that
+    vote is silent: a group holding both 13x16 and 26x16 frames is processed wholesale as
+    whichever mode wins, and only the winning frames end up in the VRT.  The losing frames stay
+    in the group's frame list, so the list and the raster disagree from then on.  Everything
+    downstream inherits that disagreement -- mergedGeodat unions the secondary range over frames
+    that are not in the raster (a 166 km swath where the product is 76 km, which becomes a
+    ~2.8 km range-offset error through offsets->rConst), and re-merging later re-sources the
+    geodat from a frame the raster does not start on (measured: 228 s of azimuth time origin).
+
+    Audited 2026-09-03: 59 virtual frames across 9 Antarctic tracks (15, 17, 23, 34, 48, 77, 96,
+    164) mix 13x16 with 26x16.  Greenland has none.
+
+    Mirrors splitGroupsBySecondaryEpoch(), including its treatment of frames with no info
+    (kept with the current subgroup, since they cannot be classified).
+
+    NOT the same check as isMixedMode()/--allowMixedMode, which asks whether ONE granule is
+    itself mixed-mode ("_M_" in the SLC granule name) and skips that frame outright.  This is
+    a group of individually single-mode frames whose modes differ from each other.
+    '''
+    splitGroups = []
+    for group in groups:
+        available = {}
+        for f in group:
+            bw = frameAvailableBandwidths(frameDirOf(f)) if frameDirOf else set()
+            if not bw and f in frameSecondaryInfo:
+                # No granules visible -- fall back to the one mode this run picked.
+                bw = {frameSecondaryInfo[f][4]}
+            available[f] = bw
+        definite = {f: next(iter(bw)) for f, bw in available.items() if len(bw) == 1}
+        if len(set(definite.values())) <= 1:
+            # One mode serves every frame (wildcards included) -- nothing to split.
+            splitGroups.append(group)
+            continue
+        u.mywarning(
+            f'Frames {sorted(group)} span a bandwidth transition: '
+            f'{ {f: sorted(bw) for f, bw in available.items()} } -- splitting so no virtual '
+            f'frame crosses it.  Merged, the minority frames would be processed as the '
+            f'majority mode and left in the frame list but out of the raster.')
+        # Runs are delimited by changes between DEFINITE modes.  A frame available at several
+        # bandwidths is a wildcard: inside a run it takes that run's mode, and at a boundary it
+        # goes to the higher-bandwidth side, which is the mode the existing products use.
+        subGroups, subGroup, runMode, pending = [], [], None, []
+        for f in group:
+            if f not in definite:
+                pending.append(f)
+                continue
+            mode = definite[f]
+            if runMode is not None and mode != runMode:
+                # Boundary: give the wildcards to whichever side has the higher bandwidth.
+                if mode > runMode:
+                    subGroups.append(subGroup)
+                    subGroup = pending + [f]
+                else:
+                    subGroups.append(subGroup + pending)
+                    subGroup = [f]
+            else:
+                subGroup += pending + [f]
+            pending, runMode = [], mode
+        subGroups.append(subGroup + pending)
+        splitGroups += [g for g in subGroups if g]
     return splitGroups
 
 
@@ -896,13 +986,51 @@ def getProductH5(product,  frame, myArgs):
         u.mywarning(f'There are no {product} products in {productDir}')
         return None
     if len(myProduct) > 1:
-        best = min(myProduct, key=_pairBaselineDays)
+        shortest = _pairBaselineDays(min(myProduct, key=_pairBaselineDays))
+        tied = [p for p in myProduct if _pairBaselineDays(p) == shortest]
+        best = _preferNeighbourBandwidth(tied, frame, myArgs) if len(tied) > 1 \
+            else min(myProduct, key=_pairBaselineDays)
         u.mywarning(
             f'More than one {product} product in {productDir}; using the '
             f'shortest-baseline pair ({_pairBaselineDays(best)} d) '
             f'{os.path.basename(best)}')
         return best
     return myProduct[0]
+
+
+def _preferNeighbourBandwidth(tied, frame, myArgs):
+    '''
+    Break a shortest-baseline tie by BANDWIDTH, preferring the one this frame's neighbours are
+    acquired at, and the higher bandwidth when they are evenly split.
+
+    At a 40/80 MHz transition a frame is often acquired BOTH ways seconds apart (track-17 frame
+    135: 4000 at 09:56:34 and 7700 at 09:56:54).  Both are the same 12-day pair, so the tie fell
+    through to sort order and picked _4000_ -- which then set the merged geodat's time origin
+    20 s away from the VRT built out of its neighbours' 7700 products.  Choosing the bandwidth
+    the neighbours use keeps every frame of a virtual frame on one mode by construction, which
+    is also what splitGroupsByMode() assumes.
+    '''
+    byBandwidth = {}
+    for p in tied:
+        m = re.search(r'_(\d{4})_[A-Z]{2}_\d{8}T', os.path.basename(p))
+        if m:
+            byBandwidth.setdefault(int(m.group(1)), p)
+    if len(byBandwidth) < 2:
+        return min(tied, key=_pairBaselineDays)
+    votes = Counter()
+    for f in myArgs.get('frames', []):
+        if f == frame:
+            continue
+        bw = frameAvailableBandwidths(f'{myArgs["outputDir"]}/{myArgs["orbit1"]}_{f}')
+        if len(bw) == 1:                      # only unambiguous neighbours get a vote
+            votes[next(iter(bw))] += 1
+    candidates = sorted(byBandwidth)
+    best = max(candidates, key=lambda bw: (votes.get(bw, 0), bw))
+    u.mywarning(
+        f'Frame {frame} is acquired at more than one bandwidth {candidates} on the same '
+        f'{ _pairBaselineDays(tied[0]) }-day pair; neighbour votes {dict(votes)} -> using '
+        f'{best}.  (Ties go to the higher bandwidth, matching the existing products.)')
+    return byBandwidth[best]
 
 
 def _secondaryDate(s):
@@ -966,13 +1094,18 @@ def _clearStaleFrameProducts(frameDir):
                 pass
 
 
-def variableSmoothingArgs(myArgs):
+def variableSmoothingArgs(myArgs, offsetsOnly=False):
     '''
     Build the --minTol/--percentSpeed/--maxTol/--maxSmoothRadius/--smoothNIter/
     --noVariableSmoothing CLI args to pass through to ROFFtoGrimp/RUNWtoGrimp, from values
     already resolved (project.yaml or CLI) into myArgs by main(). Returns [] when the
     feature isn't configured (minTol is None) -- same opt-in convention as ROFFtoGrimp/
     RUNWtoGrimp themselves.
+
+    offsetsOnly adds --maxSmoothRadiusA/--smoothThreads, which only ROFFtoGrimp accepts:
+    the offsets map is computed by the smoothradius binary simoffsets runs, while the
+    phase map comes from siminsar, whose sweep is tied to the pixel aspect ratio and is
+    already threaded by -ompThreads.
     '''
     if myArgs.get('minTol') is None:
         return []
@@ -981,6 +1114,10 @@ def variableSmoothingArgs(myArgs):
            '--maxTol', str(myArgs['maxTol']),
            '--maxSmoothRadius', str(myArgs['maxSmoothRadius']),
            '--smoothNIter', str(myArgs['smoothNIter'])]
+    if offsetsOnly:
+        args += ['--maxSmoothRadiusA',
+                str(myArgs['maxSmoothRadiusA'] or myArgs['maxSmoothRadius']),
+                '--smoothThreads', str(myArgs['smoothThreads'])]
     if myArgs.get('noVariableSmoothing'):
         args += ['--noVariableSmoothing']
     return args
@@ -1024,7 +1161,7 @@ def processFrameROFF(frame, myArgs):
             command += ['--regionFile', myArgs['regionFile']]
         if myArgs.get('verticalCorrection'):
             command += ['--verticalCorrection', myArgs['verticalCorrection']]
-        command += variableSmoothingArgs(myArgs)
+        command += variableSmoothingArgs(myArgs, offsetsOnly=True)
         if myArgs['noMask'] is True:
             command += ['--noMask']
         if myArgs.get('debugIono'):
@@ -1320,8 +1457,129 @@ def mergeSquintAnglePolynomial(geos, geoMerged, nRangeSamples=9,
     geoMerged['properties']['squintRefAzimuthTime'] = refAzimuthTime
 
 
-def mergedGeodat(geodatFiles, vrtFile, secondary=False):
-    # Save first and last frame
+def _frameStartSeconds(geodat):
+    '''Seconds of day of a frame's own first line, from CorrectedTime ("h m s" or "h:m:s").'''
+    parts = re.split(r'[: ]+', str(geodat['properties']['CorrectedTime']).strip())
+    return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+
+
+def _framesSpanningVrt(geodats, gt, na, firstFrame, lastFrame, vrtFile):
+    '''
+    The frames the VRT actually starts and ends on, by azimuth time.  The VRT's geotransform
+    carries the azimuth origin in seconds of day (gt[3]) and the line spacing in seconds
+    (gt[5]), so the frame the raster begins with is the one whose own start time matches gt[3],
+    and the frame it ends with is the latest one starting before the raster ends.
+
+    Falls back to the caller's provisional values -- and warns -- if the times cannot be read or
+    nothing lines up, so a geodat that lacks CorrectedTime still merges as it always did.
+    '''
+    try:
+        starts = {frame: _frameStartSeconds(geo) for frame, geo in geodats.items()}
+    except (KeyError, IndexError, ValueError, TypeError) as e:
+        u.mywarning(f'mergedGeodat: cannot read frame start times ({e}) -- keeping the '
+                    f'file-order first/last frame ({firstFrame}, {lastFrame}) for {vrtFile}')
+        return firstFrame, lastFrame
+    y0, dy = gt[3], gt[5]
+    yEnd = y0 + na * dy
+    # A pass crossing UTC midnight keeps counting in the VRT (86556 s) while CorrectedTime
+    # wraps (00:02:36).  Unwrap the frame times onto the VRT's clock before comparing --
+    # 4 Antarctic virtual frames on track-112 sit either side of midnight.
+    if y0 >= 86400.0:
+        starts = {frame: (t + 86400.0 if t < y0 - 43200.0 else t)
+                  for frame, t in starts.items()}
+    newFirst = min(starts, key=lambda frame: abs(starts[frame] - y0))
+    inSpan = [frame for frame in starts if starts[frame] <= yEnd + abs(dy)]
+    newLast = max(inSpan, key=lambda frame: starts[frame]) if inSpan else lastFrame
+    # One line spacing of slop: the origin is a pixel edge, the frame time a first line centre.
+    if abs(starts[newFirst] - y0) > max(abs(dy), 1.0):
+        u.mywarning(
+            f'mergedGeodat: no frame starts at the VRT azimuth origin ({y0:.3f} s; closest is '
+            f'frame {newFirst} at {starts[newFirst]:.3f} s) -- keeping the file-order first '
+            f'frame {firstFrame} for {vrtFile}')
+        return firstFrame, lastFrame
+    if newFirst != firstFrame or newLast != lastFrame:
+        u.mywarning(
+            f'mergedGeodat: the frame list does not match the VRT -- by azimuth time the '
+            f'raster spans frames {newFirst}..{newLast}, not {firstFrame}..{lastFrame} '
+            f'(list: {sorted(geodats)}).  Using the VRT.  The virtual frame should be rebuilt '
+            f'if the extra frames are meant to be in it.')
+    return newFirst, newLast
+
+
+def _secondaryNearRangeOffsets(secondaryGeodats, primaryGeodatFiles, mlNearRange,
+                               mlPixelSpacing):
+    '''
+    (near-range offset, range size) for the merged secondary -- see the CORRECTED 2026-09-03
+    comment in mergedGeodat().  The offset is secondary minus primary in metres, to be added to
+    the primary's merged near range.  Returns None when primaryGeodatFiles is None, i.e. when
+    the caller has not been updated and the old union rule should stand.
+
+    Per physical frame the offset is a real physical quantity (the two acquisitions' own start
+    ranges).  Normally every frame in a merge reports the same one -- 0 for a symmetric pair,
+    or a genuine constant for a different-geometry secondary.  When they DISAGREE the merge
+    spans a swath-mode change, no single value is right, and the honest choice is the offset
+    of the frames that set the primary's merged near range: those are the frames whose geometry
+    the merged grid actually has.
+
+    The size comes from the SAME frames, so near range and size describe one coherent geometry.
+    Deliberately the secondary's own size rather than the primary's nr: for a real single frame
+    the two genuinely differ (track-16/3748_0001 reports 2118 against the primary's 1898) and
+    that value is what the pipeline has been running on -- this fix is aimed at the union across
+    a mode change, not at cases that work.
+    '''
+    if primaryGeodatFiles is None:
+        return None
+    primaryGeodats = {}
+    for geoFile in primaryGeodatFiles:
+        frame = geoFile.split('/')[-2].split('_')[-1]
+        with open(geoFile) as fp:
+            primaryGeodats[frame] = geojson.load(fp)
+    offsets = {}
+    for frame, geo in secondaryGeodats.items():
+        if frame not in primaryGeodats:
+            u.mywarning(f'mergedGeodat: no primary geodat for frame {frame} -- cannot place '
+                        f'the merged secondary on the primary grid; using the union rule')
+            return None
+        offsets[frame] = (geo['properties']['MLNearRange']
+                          - primaryGeodats[frame]['properties']['MLNearRange'])
+    def sizeOver(frames):
+        return max(secondaryGeodats[frame]['properties']['MLRangeSize'] for frame in frames)
+
+    # The frames that define the merged grid: those whose own PRIMARY near range is the one the
+    # VRT came out at.  Offset AND size both come from them, so the two describe one coherent
+    # geometry.  Selecting on the primary (not the secondary) matters: track-96/4001_0030's
+    # frames all have secondary == primary per frame, so the offsets agree at 0 and only the
+    # WIDTH disagrees -- a max over all frames would rebuild the very union this fixes.
+    onGrid = [frame for frame, geo in primaryGeodats.items()
+              if frame in offsets
+              and abs(geo['properties']['MLNearRange'] - mlNearRange) <= 0.5 * mlPixelSpacing]
+    if not onGrid:
+        onGrid = sorted(offsets)
+        source = 'all frames (none matched the merged near range)'
+    else:
+        source = 'the frames that set the merged near range'
+    chosen, chosenSize = offsets[onGrid[0]], sizeOver(onGrid)
+    values = list(offsets.values())
+    sizes = [geo['properties']['MLRangeSize'] for geo in secondaryGeodats.values()]
+    if max(values) - min(values) > 1.0 or max(sizes) != min(sizes):
+        u.mywarning(
+            f'mergedGeodat: the merged frames do not share one primary/secondary geometry '
+            f'(near-range offset {min(values):.3f} to {max(values):.3f} m, secondary size '
+            f'{min(sizes)} to {max(sizes)}, over frames {sorted(offsets)}) -- this merge '
+            f'crosses a swath/mode change.  Using offset {chosen:.3f} m and size {chosenSize}, '
+            f'from {source}.')
+    return chosen, chosenSize
+
+
+def mergedGeodat(geodatFiles, vrtFile, secondary=False, primaryGeodatFiles=None):
+    '''
+    primaryGeodatFiles (secondary=True only): the matching PRIMARY per-frame geodats, used to
+    put the merged secondary's range fields on the primary's merged grid -- see the long
+    comment in the secondary branch.  Optional so old callers keep working; without it the
+    range fields fall back to the pre-2026-09-03 union rule.
+    '''
+    # Save first and last frame.  Provisional: replaced below by the frames the VRT actually
+    # starts and ends on, once its geotransform has been read.
     firstFrame = sorted(list(geodatFiles))[0].split('/')[-2].split('_')[-1]
     #
     # Get merged image size
@@ -1349,6 +1607,18 @@ def mergedGeodat(geodatFiles, vrtFile, secondary=False):
         with open(geoFile) as fp:
             geodats[frame] = geojson.load(fp)
         lastFrame = frame
+    #
+    # ADDED 2026-09-03.  Pick first/last from the frames the VRT ACTUALLY spans, not from the
+    # order of geodatFiles.  The merged geodat is a copy of firstFrame, so firstFrame sets
+    # CorrectedTime/NominalTime/ImageName -- the azimuth time origin the geocoding hangs off.
+    # Taking the lexically-first path assumes the frame list and the raster agree, and they
+    # drift apart: a virtual frame whose list has since grown (the 40/80 MHz work added earlier
+    # frames) keeps its older, shorter VRT until it is rebuilt, so the list starts 228 s before
+    # the raster does.  Measured on track-96/{3828,4001}_0030, merged 2026-08-31 against a
+    # 2026-07-13 VRT: CorrectedTime 77302 s against a VRT origin of 77530 s.  Re-merging the
+    # other four *_0030 frames on that track would have moved them the same way.
+    # The VRT is what the pixels are, so it decides.
+    firstFrame, lastFrame = _framesSpanningVrt(geodats, gt, na, firstFrame, lastFrame, vrtFile)
     # Create the merged geodat as a copy of the first
     geodatMerged = copy.deepcopy(geodats[f'{firstFrame}'])
     # Merge the state vectors
@@ -1379,7 +1649,69 @@ def mergedGeodat(geodatFiles, vrtFile, secondary=False):
         # primary into the secondary's bounds using MLAzimuthSize, ends up
         # using one frame's size instead of the merged total and finds almost
         # nothing inside those bounds regardless of real data coverage.
-        geodatMerged['properties']['MLAzimuthSize'] = na
+        #
+        # CORRECTED 2026-08-31.  The premise above ("primary and secondary report
+        # identical MLAzimuthSize") holds only for SYMMETRIC pairs.  When the two
+        # acquisitions start at different times the secondary's CorrectedTime stays
+        # native, so llToImageNew builds its azimuth index from the SECONDARY's own
+        # start -- and that index must be bounded by the SECONDARY's own extent, not by
+        # the primary's merged grid height.  Forcing na makes svInitAzParams reject every
+        # candidate ("0 of 2500 ... fell in the overlap"), aborting azparams and leaving
+        # a zero-byte az.est.yaml that later kills mosaic3d.  75 of 4736 Antarctic frames
+        # hit this; Greenland's pairs are symmetric so it never showed there.
+        #
+        # Derive the merged secondary's azimuth extent from ITS OWN per-frame geodats,
+        # mirroring the MLNearRange/MLFarRange treatment below.  For a symmetric merge
+        # this returns na plus at most the primary/secondary slip, which is harmless:
+        # the bound only gates a geometric least-squares fit (no data is read through
+        # it), so erring generous costs nothing while erring small aborts the run.
+        # Measured: track-96/4001_0011 azparams aborts at na=950 and fits at the native
+        # 2755; track-96/4001_0020 (symmetric, 2-frame) is 6555 -> 6650 with its fit
+        # unchanged.
+        def _corrSeconds(t):
+            f = str(t).replace(':', ' ').split()
+            return int(f[0]) * 3600 + int(f[1]) * 60 + float(f[2])
+        # Times are seconds-of-day, so a merge spanning midnight gives per-frame
+        # values on both sides of the wrap (e.g. 23:50 and 00:10).  Taking a raw
+        # max-min there yields ~86400 instead of ~1200 -- which produced a
+        # secondary MLAzimuthSize of 8208190 against a primary of 9405 on
+        # track-112/5055_0001 and segfaulted azparams.  Unwrap every time onto a
+        # continuous axis relative to the first frame before spanning them.
+        def _unwrap(t, ref):
+            while t - ref > 43200.0:
+                t -= 86400.0
+            while t - ref < -43200.0:
+                t += 86400.0
+            return t
+        try:
+            _pf = geodats[f'{firstFrame}']['properties']
+            _ref = _corrSeconds(_pf['CorrectedTime'])
+            _starts, _ends = [], []
+            for _g in geodats.values():
+                _pp = _g['properties']
+                _t0 = _unwrap(_corrSeconds(_pp['CorrectedTime']), _ref)
+                _starts.append(_t0)
+                _ends.append(_t0 + _pp['MLAzimuthSize'] * _pp['NumberAzimuthLooks']
+                             / _pp['PRF'])
+            _span = max(_ends) - min(_starts)
+            _mlAz = int(round(_span * _pf['PRF'] / _pf['NumberAzimuthLooks']))
+            if _mlAz <= 0:
+                raise ValueError(f'non-positive value {_mlAz}')
+            # The bound may only ever grow, and only by a plausible slip.  A
+            # secondary many times the primary is a corrupt time, not a real
+            # asymmetry -- fall back rather than hand azparams a bad extent.
+            if _mlAz > na * 5:
+                raise ValueError(f'implausible value {_mlAz} vs primary {na}')
+            geodatMerged['properties']['MLAzimuthSize'] = max(_mlAz, na)
+            if _mlAz > na * 1.05:
+                u.mywarning(
+                    f'mergedGeodat: ASYMMETRIC primary/secondary pair -- secondary '
+                    f'extent {_mlAz} vs primary merged total {na}; using the '
+                    f'secondary own extent (see the svInitAzParams note above)')
+        except (KeyError, TypeError, ValueError, ZeroDivisionError) as _e:
+            u.mywarning(f'mergedGeodat: could not derive the secondary azimuth extent '
+                        f'({_e}); falling back to the primary merged total {na}')
+            geodatMerged['properties']['MLAzimuthSize'] = na
         # MLNearRange/MLFarRange genuinely are independent physical
         # quantities (slant range to first sample depends on orbit/baseline)
         # -- but, like the primary's own near/far range, they can legitimately
@@ -1410,14 +1742,47 @@ def mergedGeodat(geodatFiles, vrtFile, secondary=False):
         # pixel with whatever size the near/far span rounds to, leaving
         # near/far/size mutually inconsistent for the merged secondary in a
         # way primary's VRT-derived fields never are.
+        #
+        # CORRECTED 2026-09-03.  The union rule above is wrong whenever the merged frames do
+        # NOT all share a swath, because primary and secondary then derive their extent from
+        # different things: primary from the VRT geotransform (the grid the data are actually
+        # on) and secondary from a union of per-frame metadata.  At a 40/80 MHz swath-mode
+        # transition inside one virtual frame those disagree wildly.  track-96/4001_0030 merges
+        # physical frames 137-145 of widths 1856..4069: primary comes out 913337.2 / 1864,
+        # matching its 1864-column phase VRT, while the union gives secondary 908789.6 / 4093 --
+        # a 166 km swath no raster has.
+        #
+        # That is not cosmetic.  mosaic3d/rparams/azparams/simoffsets read this file as
+        # offsets->geo2 (readOffsets.c) and svInitBnBp() (svBase.c) turns it into
+        # offsets->rConst, the bulk range offset between the two acquisitions, which
+        # interpRangeOffsetInMeters() adds straight into zeroOffset.  A near range 4.5 km out
+        # put a ~2.8 km constant error on every range offset from those frames -- range rows of
+        # -1.4e5 m/yr carrying a perfectly normal sigma, so no error-based gate could see them.
+        # Measured on the Antarctic mosaic: 7 of 4799 frames, and the two worst blunder clusters
+        # in the product (upstream Byrd, and Totten) were exactly these.
+        #
+        # Fix: express the merged secondary on the PRIMARY's merged grid.  Per physical frame,
+        # take the secondary-minus-primary near-range offset -- the genuine physical quantity,
+        # since RUNW/ROFF resample the secondary onto the primary's grid -- and apply it to the
+        # primary's VRT-derived near range, keeping the primary's range size.  This reproduces
+        # both cases the 2026-06-23 rule was built for: track-25/3757_0000 (offset 0, so merged
+        # secondary == merged primary) and track-16/3748_0001 (a real ~8969 m different
+        # secondary, preserved).  Needs primaryGeodatFiles; without it the old union rule stands.
         mlPixelSpacing = (geodats[f'{firstFrame}']['properties']['SLCRangePixelSize']
                           * geodats[f'{firstFrame}']['properties']['NumberRangeLooks'])
-        mlNearRangeSecondary = min(geo['properties']['MLNearRange']
-                                   for geo in geodats.values())
-        _maxFarRange = max(geo['properties']['MLFarRange']
-                           for geo in geodats.values())
-        mlRangeSizeSecondary = round(
-            (_maxFarRange - mlNearRangeSecondary) / mlPixelSpacing) + 1
+        onGrid = _secondaryNearRangeOffsets(geodats, primaryGeodatFiles,
+                                            mlNearRange, mlPixelSpacing)
+        if onGrid is None:
+            # No primary geodats supplied -- old behaviour, union of the secondary's own frames.
+            mlNearRangeSecondary = min(geo['properties']['MLNearRange']
+                                       for geo in geodats.values())
+            _maxFarRange = max(geo['properties']['MLFarRange']
+                               for geo in geodats.values())
+            mlRangeSizeSecondary = round(
+                (_maxFarRange - mlNearRangeSecondary) / mlPixelSpacing) + 1
+        else:
+            nearOffset, mlRangeSizeSecondary = onGrid
+            mlNearRangeSecondary = mlNearRange + nearOffset
         mlFarRangeSecondary = (mlNearRangeSecondary
                                + (mlRangeSizeSecondary - 1) * mlPixelSpacing)
         geodatMerged['properties']['MLNearRange'] = mlNearRangeSecondary
@@ -1435,8 +1800,8 @@ def mergedGeodat(geodatFiles, vrtFile, secondary=False):
                     f'({frameNearRange}) differs from frame {firstFrame} '
                     f'({firstNearRange}) by '
                     f'{frameNearRange - firstNearRange:.3f} m -- merged '
-                    f'secondary MLNearRange/MLFarRange/MLRangeSize now span '
-                    f'the union of all frames ({mlNearRangeSecondary:.3f} to '
+                    f'secondary MLNearRange/MLFarRange/MLRangeSize '
+                    f'({mlNearRangeSecondary:.3f} to '
                     f'{mlFarRangeSecondary:.3f}, size={mlRangeSizeSecondary})')
     mergeSquintAnglePolynomial(geodats, geodatMerged)
     # Return result
@@ -1518,7 +1883,8 @@ def createVirtualFrameRUNW(myArgs):
                        f'-- skipping')
             return
         mergedGeodat(myArgs['geodat1'], existingVrts[0])
-        mergedGeodat(myArgs['geodat2'], existingVrts[0], secondary=True)
+        mergedGeodat(myArgs['geodat2'], existingVrts[0], secondary=True,
+                     primaryGeodatFiles=myArgs['geodat1'])
         return
     #
     virtualVRTs = {}
@@ -1668,7 +2034,7 @@ def createVirtualFrameRUNW(myArgs):
         return
     mergedGeodat(myArgs['geodat1'], virtualVRTs['correctedUnwrappedPhase'])
     mergedGeodat(myArgs['geodat2'], virtualVRTs['correctedUnwrappedPhase'],
-                secondary=True)
+                secondary=True, primaryGeodatFiles=myArgs['geodat1'])
 
 
 def createVirtualFrameROFF(myArgs):
@@ -1760,7 +2126,19 @@ def createVirtualFrameROFF(myArgs):
             os.remove(failFile)
         # Force a new final file
         command.append('--overWrite')
-        command.append('--offsets')
+        # --offsets solves an inter-frame DC bias and applies it, which is only
+        # meaningful for quantities that genuinely carry an arbitrary per-frame
+        # offset. The .ll (lat/lon) and .mask products do not: a pixel's
+        # latitude is absolute, so forcing continuity there just propagates the
+        # anchor frame's geolocation onto every other frame. Measured on
+        # track-170/4248: up to 0.00022 deg lat / 0.0012 deg lon of applied
+        # bias = 24.6 m / 32.8 m, i.e. 0.53 / 0.70 of a 46.84 m offsets pixel.
+        # (The .mask bias solved to exactly 0, so masks were never corrupted --
+        # they are excluded here for the same reason, not because of observed
+        # damage.) Same rationale as the offsets.velocity.smr radius map in the
+        # --debugIono block above.
+        if not myFileType.endswith(('.ll.vrt', '.mask.vrt')):
+            command.append('--offsets')
         command.append(vrtFile)
         command += myFiles
         # print(command)
@@ -1782,6 +2160,36 @@ def createVirtualFrameROFF(myArgs):
             u.mywarning(f'createVirtualFrameROFF: {rangeOffsetsVrt} was not '
                         'built; cannot stamp ionosphereRangeOffsetCorrection '
                         'metadata')
+    #
+    # The azimuth ionosphere correction is the along-track derivative of the very
+    # screen just merged, so this is the first point at which it can be built.
+    # It must exist before azparams runs, which is why it lives here rather than
+    # in the tie stage.
+    if myArgs.get('computeAzimuthIonosphereCorrection'):
+        makeAzimuthIonosphereCorrection(frameDir)
+
+
+def makeAzimuthIonosphereCorrection(frameDir):
+    '''
+    Build the azimuth ionosphere correction for one merged frame and name it in
+    azimuth.offsets.vrt.
+
+    Never fatal: the correction is optional, and azparams/mosaic3d both treat a
+    missing one as "no correction". A frame that fails here still processes.
+    '''
+    try:
+        from nisargrimpworkflow import azIonoCorrection as azIono
+        rec = azIono.processFrame(frameDir, azIono.GAIN, azIono.SMOOTH_SCALE,
+                                  overwrite=False, stamp=True)
+        if rec['status'] in ('ok', 'upToDate'):
+            print(f'azimuth ionosphere correction: {rec["status"]} '
+                  f'({rec.get("correctionFile", "existing")})')
+        else:
+            u.mywarning(f'makeAzimuthIonosphereCorrection: {frameDir} '
+                        f'{rec["status"]} {rec.get("note", rec.get("error", ""))}')
+    except Exception as exc:                                    # noqa: BLE001
+        u.mywarning(f'makeAzimuthIonosphereCorrection: {frameDir} failed: '
+                    f'{type(exc).__name__}: {exc}')
 
 
 def _readIonosphereParams(myArgs):
@@ -2545,7 +2953,8 @@ def createVirtualFrameCorr(myArgs):
                        f'existing .cor.vrt found in {frameDir} -- skipping')
             return
         mergedGeodat(myArgs['geodat1'], existingVrts[0])
-        mergedGeodat(myArgs['geodat2'], existingVrts[0], secondary=True)
+        mergedGeodat(myArgs['geodat2'], existingVrts[0], secondary=True,
+                     primaryGeodatFiles=myArgs['geodat1'])
         return
     myFiles = []
     for frame in myArgs['frames']:
@@ -2572,7 +2981,8 @@ def createVirtualFrameCorr(myArgs):
         open(failFile, 'w').close()
         return
     mergedGeodat(myArgs['geodat1'], vrtFile)
-    mergedGeodat(myArgs['geodat2'], vrtFile, secondary=True)
+    mergedGeodat(myArgs['geodat2'], vrtFile, secondary=True,
+                 primaryGeodatFiles=myArgs['geodat1'])
 
 
 def processFramePow(frame, myArgs):
@@ -2682,7 +3092,8 @@ def main():
     # through to ROFFtoGrimp/RUNWtoGrimp (see variableSmoothingArgs()). minTol/percentSpeed/
     # maxTol must be given together; missing all three leaves the feature off (default).
     smoothDefaults = {'minTol': None, 'percentSpeed': None, 'maxTol': None,
-                      'maxSmoothRadius': 50, 'smoothNIter': 3,
+                      'maxSmoothRadius': 50, 'maxSmoothRadiusA': None,
+                      'smoothThreads': 2, 'smoothNIter': 3,
                       'noVariableSmoothing': False}
     myArgs.update(smoothDefaults)
     if os.path.exists(projectYaml):
@@ -2730,6 +3141,12 @@ def main():
             _proj = yaml.safe_load(_fp) or {}
         if _proj.get('sepIceRock'):
             myArgs['sepIceRock'] = True
+        # Azimuth ionosphere correction: whether to GENERATE it. Whether it is
+        # then USED is a separate decision (applyAzimuthIonosphereCorrection ->
+        # azparams/mosaic3d), so a project can build the rasters and evaluate
+        # them before switching them on. Default off.
+        myArgs['computeAzimuthIonosphereCorrection'] = bool(
+            _proj.get('computeAzimuthIonosphereCorrection', False))
     myArgs['globalFillIono'] = (not myArgs['noGlobalFillIono']) and (
         bool(myArgs['debugIono']) or bool(myArgs['sepIceRock']))
     if myArgs['sepIceRock']:
@@ -2807,6 +3224,12 @@ def main():
     # Further split any group containing a frame whose own secondary date
     # disagrees with its neighbors' (real data gap upstream, not safe to merge).
     groups = splitGroupsBySecondaryEpoch(groups, myArgs.get('frameSecondaryInfo', {}))
+    # And any group spanning a 40/80 MHz mode change: the per-group mode vote below is a
+    # majority, so mixing modes silently drops the minority frames from the raster while
+    # leaving them in the frame list.  See splitGroupsByMode().
+    groups = splitGroupsByMode(
+        groups, myArgs.get('frameSecondaryInfo', {}),
+        frameDirOf=lambda f: f'{myArgs["outputDir"]}/{myArgs["orbit1"]}_{f}')
     if len(groups) > 1:
         print(f'Frame break(s) detected — {len(groups)} virtual frames will be created')
     explicitVFOverride = myArgs['virtualFrame'] is not None
@@ -2869,10 +3292,28 @@ def main():
                 builtVrt = glob.glob(f'{frameDir}/*.cor.vrt')
             else:
                 builtVrt = glob.glob(f'{frameDir}/*.correctedUnwrappedPhase.vrt')
-            if builtVrt:
+            #  A built product is NOT on its own a reason to skip. Frames that arrive
+            #  later and sit CONTIGUOUS with an existing group extend that group rather
+            #  than forming a new one, and the extended group keeps the same canonical
+            #  number and directory (see assignVirtualFrameNumbers: a group that
+            #  "matches/extends a reference group" takes N*10). Skipping on the VRT alone
+            #  would leave those frames out permanently, because frames.txt is only
+            #  rewritten below. So skip only when the built frame covers exactly the
+            #  frames this group now has; if membership changed at all, rebuild.
+            builtFrames = None
+            framesFile = f'{frameDir}/frames.txt'
+            if builtVrt and os.path.exists(framesFile):
+                with open(framesFile) as fp:
+                    builtFrames = sorted(fp.read().split(), key=int)
+            wantFrames = sorted((str(f) for f in groupFrames), key=int)
+            if builtVrt and builtFrames == wantFrames:
                 print(f'--new: skipping existing virtual frame '
                       f'{myArgs["orbit1"]}_{virtualFrame}')
                 continue
+            if builtVrt:
+                was = ' '.join(builtFrames) if builtFrames is not None else '(no frames.txt)'
+                print(f'--new: REBUILDING {myArgs["orbit1"]}_{virtualFrame} -- frames '
+                      f'changed [{was}] -> [{" ".join(wantFrames)}]')
         if not os.path.exists(frameDir):
             os.mkdir(frameDir)
         writeFramesList(frameDir, groupFrames)
