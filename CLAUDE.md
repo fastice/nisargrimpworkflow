@@ -27,7 +27,7 @@ Scripts in this package:
 | `estimateIonosphere` | `estimateIonosphere.py:main()` | Offset-based ionosphere estimation + corrected phase (see [doc](Documents/estimateIonosphere.md)) |
 | `custom_buildvrtWithOffsets` | `custom_buildvrtWithOffsets.py:main()` | gdalbuildvrt replacement that solves/applies per-frame DC offsets when merging |
 | `checkFrameInputs` | `checkFrameInputs.py:main()` | Scan virtual frames for missing offsets/phase/iono products (see [doc](Documents/checkFrameInputs.md)) |
-| `makeMaster` | `makeMaster.py:main()` | Assemble master input file lists (see [doc](Documents/makeMaster.md)) |
+| `makeMaster` | **moved to `mosaicworkflow`** | Assemble master input file lists; still called by `autoupdate.py` under the same name (see [doc](Documents/makeMaster.md)) |
 | `autoupdateNISAR` | `autoupdate.py:main()` | Cron driver: search/download + one-day completion buffer + full processing chain (see [doc](Documents/autoupdate.md)) |
 
 ---

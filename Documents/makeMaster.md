@@ -1,108 +1,25 @@
-# makeMaster — Assemble the Master mosaic3d inputFile
+# makeMaster — moved to mosaicworkflow
 
-## Overview
+`makeMaster` now lives in the **mosaicworkflow** package, which owns the
+`makeMaster` console script. See
+[mosaicworkflow/Documents/makeMaster.md](../../mosaicworkflow/Documents/makeMaster.md).
 
-`makeMaster` walks every `track-N/tiepoints/track-N/inputFile-N-all20??`
-file under a project root, extracts their data lines (skipping `;` comments
-and pure-number lines), and assembles them into a single master `inputFile`
-that `mosaic3d` reads for the velocity mosaic.
+Nothing changes for callers here. The command name, its flags
+(`--projectDir`, `--inputPaths`, `--outputPath`, `--verbose`) and its output
+are identical — verified byte-for-byte against the version this replaced, for
+both the Antarctica40 + Antarctica80 invocation and the `newGreenlandProject`
+defaults. `autoupdate.py` invokes it by name and needed no change, so the
+`masterInputPaths` / `masterOutputPath` keys of `autoupdate.yaml` work exactly
+as documented in [autoupdate.md](autoupdate.md).
 
-Before writing the output, it verifies that every file path referenced in
-those data lines actually exists — including, for each `range.offsets`
-token, any ionosphere-correction file embedded in that frame's
-`range.offsets.vrt` `ionosphereRangeOffsetCorrection` metadata (the same
-mechanism `SetupNISAR.globalFillIonosphere()` writes and
-`rparams`/`checkForIonosphereCorrection()` reads). It further verifies that
-each range baseline's recorded `offsetCorrectionFile` **agrees** with that
-same VRT metadata (see [below](#ionosphere-baselinevrt-consistency-check)).
-**Data lines with any missing referenced file — or an ionosphere
-baseline/VRT mismatch — are dropped from the output** — the rest of the
-track still gets assembled. A summary of how many lines were skipped, and
-why, is printed at the end; `--verbose` adds a sorted list of every
-missing file path per category, and any ionosphere mismatches are always
-listed (they name the exact baseline to re-fit).
+The move generalised the tool so one program builds both the NISAR master and
+the Sentinel-1 / TSX masters, the latter from a YAML config listing the source
+regions. It replaced the `createMaster.ipynb` notebook at the same time.
 
-Originally a one-off script hardcoded to `newGreenlandProject`
-(`/Volumes/insar1/ian/NISAR/realNISAR/newGreenlandProject/makeMaster.py`,
-with `main()` called unconditionally at import time — moved into the
-package, generalized via `--projectDir`, and given a proper
-`if __name__ == '__main__':` guard so importing it no longer has side
-effects).
+Two NISAR-relevant notes now live in the new doc:
 
-## Usage
-
-```bash
-cd /path/to/project   # or pass --projectDir
-makeMaster                              # writes <projectDir>/Release/masterInput/inputFile
-makeMaster --outputPath /some/other/dir # writes /some/other/dir/inputFile directly
-```
-
-| Flag | Default | Description |
-|---|---|---|
-| `--projectDir` | `.` | Root for anchoring a relative `--outputPath`; also the track-discovery root unless `--inputPaths` is given |
-| `--inputPaths` | None | One or more directories to search for `track-N` subdirectories (overrides `--projectDir` for input) |
-| `--outputPath` | `Release/masterInput` | Output directory (relative to `--projectDir` unless absolute) |
-| `--verbose` | off | List every missing file path per category in the skip summary |
-
-The end-of-run summary reports the total number of data lines seen, how many
-were skipped (and per-category counts of the missing-file types that caused
-the skips), and any tracks that had no `inputFile-N-all20??` at all.
-
-## Bare-name vs `.vrt` resolution
-
-`inputFile-N-all20??` data lines reference `range.offsets`/`azimuth.offsets`
-by their legacy bare (no-extension) name unconditionally — the
-tie-script template that generates them doesn't check which form actually
-exists on disk. Projects that have moved to VRT-only storage (no flat
-binary file written at all, just `range.offsets.vrt`) still work, because
-`rparams`/`azparams` (`getROffsets.c`) auto-detect and fall back to the
-`.vrt` sidecar when given the bare name. `makeMaster`'s existence check
-matches this: a token is considered present if either the bare path or
-`<path>.vrt` exists.
-
-## Ionosphere baseline/VRT consistency check
-
-Each `range.offsets.vrt` carries an `ionosphereRangeOffsetCorrection`
-metadata key (stamped by `SetupNISAR`), and each range baseline
-(`motion/rBaseline.deltabp.yaml` — the variant `mosaic3d` actually reads)
-records an `offsetCorrectionFile:` naming the correction it was **fit
-against**. At runtime `mosaic3d`/`checkForIonosphereCorrection()`
-(`readOffsets.c`) refuses any frame where those two names disagree, so it
-never silently applies a different ionosphere correction than the baseline
-assumed — the run aborts on the first offending frame.
-
-`makeMaster` now performs the identical comparison per data line and drops
-mismatched lines (rather than letting the whole mosaic abort mid-run),
-listing each one under a `Baseline/VRT ionosphere mismatches (re-fit
-baseline)` summary block. A `nil` (or absent) `offsetCorrectionFile` is
-**not** a mismatch — `readOffsets.c` treats `nil` as "no correction" and
-skips the comparison, so `makeMaster` does too.
-
-**Typical cause:** a baseline gets re-fit while only an older-named
-ionosphere product exists on disk (e.g. `…ionosphereCorrection.`**`globalFill`**`.offset.vrt`),
-then the ionosphere pipeline regenerates/renames the product
-(`…ionosphereCorrection.offset.vrt`) and `SetupNISAR` re-stamps the VRT —
-but the baseline, fit *before* that, still points at the old name. Any
-frame whose ionosphere product is regenerated **after** its baseline was
-fit lands in this state. The fix is to re-fit that frame's baseline (its
-tie step) so it records the current name; the two correction products are
-typically numerically near-identical, so the re-fit reproduces the same
-coefficients.
-
-## A track silently missing from the master inputFile
-
-If a track has zero matches for `inputFile-N-all20??`, it's skipped with no
-warning (same behavior as the original script) — check
-`tiepoints/track-N/inputFile-N-all20??` exists and is non-empty for that
-track if it's unexpectedly absent from the assembled output. A common
-cause: per-year tie-plan segment naming that doesn't match the plain
-`all20??` glob (e.g. `all2026dash0000dash0009`-style names from a segmented
-tie plan) — not yet handled by this script.
-
-## See also
-
-[checkFrameInputs](checkFrameInputs.md) checks a different, earlier stage
-of the pipeline (whether `SetupNISAR` produced the raw upstream
-offsets/phase/ionosphere products per virtual frame at all) — `makeMaster`
-checks whether the *tie-script-assembled* `inputFile` entries that
-reference those products resolve correctly.
+- **Offsets-only (`nophase`) products** are still excluded from the NISAR
+  master, but now through an explicit `nonFileTokens` setting rather than a
+  misparse. What that exclusion costs is quantified there — worth a look.
+- **Bare-name vs `.vrt` resolution** and the **baseline/VRT ionosphere
+  consistency check** are unchanged and are described in full there.
