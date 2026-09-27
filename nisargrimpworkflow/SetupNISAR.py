@@ -126,6 +126,9 @@ def parseCommandLine():
     parser.add_argument('--RUNWOnly', action="store_true",
                         help='Process only RUNW (phase/coherence/ionosphere) '
                         'products; skip ROFF offset conversion and power images')
+    parser.add_argument('--fixLayerRegistration', action='store_true',
+                        help='Pass --fixLayerRegistration to ROFFtoGrimp (ISCE3 ROFF '
+                        'layer-registration correction, CRID <= 05023)')
     parser.add_argument('--noMask', action='store_true', default=False,
                         help='Do not apply the fast-region mask to layer 3 '
                         'during ROFF offset conversion')
@@ -246,6 +249,7 @@ def parseCommandLine():
     for key in ['overWrite', 'overWritePhase', 'firstFrame', 'lastFrame',
                 'firstDate', 'lastDate',
                 'orbit1', 'allowMixedMode', 'virtualFrame', 'noMask',
+                'fixLayerRegistration',
                 'verbose', 'RUNWOnly', 'ompThreads', 'phaseDerivedIonosphere',
                 'outputAll', 'phaseThresh', 'noPhaseThreshPass', 'sepIceRock',
                 'sigmaAz', 'sigmaRg',
@@ -1164,6 +1168,8 @@ def processFrameROFF(frame, myArgs):
         command += variableSmoothingArgs(myArgs, offsetsOnly=True)
         if myArgs['noMask'] is True:
             command += ['--noMask']
+        if myArgs.get('fixLayerRegistration'):
+            command += ['--fixLayerRegistration']
         if myArgs.get('debugIono'):
             command += ['--debugIono']
         if myArgs['verbose'] is True:

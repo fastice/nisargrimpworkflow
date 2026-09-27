@@ -7,6 +7,7 @@ Created on Thu Sep 12 10:34:37 2024
 """
 import argparse
 import os
+import re
 import shutil
 import utilities as u
 from utilities import geodatrxa
@@ -123,6 +124,16 @@ def parseArgs():
                         help='Do not apply mask to layer 3 in fast regions')
     parser.add_argument('--mergeOnly', action='store_true', default=False,
                         help='Do not regenerate data, merge only')
+    parser.add_argument('--fixLayerRegistration', action='store_true',
+                        default=False,
+                        help='Correct the ISCE3 ROFF layer registration (CRID <= 05023): '
+                        'grid on layer-3 centres, layers 1/2 shifted onto it; stamps '
+                        'layerRegistrationFix in the VRT metadata')
+    parser.add_argument('--keepIntermediates', action='store_true',
+                        default=False,
+                        help='Keep the raw and culled offset layers in '
+                        'workingDir/ (by default only the cull.interp layers '
+                        'that --mergeOnly needs are kept)')
     parser.add_argument('--ompThreads', type=int, default=4,
                         help='Number of OpenMP threads passed to simoffsets/'
                         'siminsar [4]')
@@ -197,7 +208,8 @@ def parseArgs():
                   'mergeOnly', 'ompThreads', 'verticalCorrection',
                   'minTol', 'percentSpeed', 'maxTol', 'maxSmoothRadius',
                   'maxSmoothRadiusA', 'smoothThreads', 'smoothNIter',
-                  'noVariableSmoothing', 'debugIono']:
+                  'noVariableSmoothing', 'debugIono', 'keepIntermediates',
+                  'fixLayerRegistration']:
         params[param] = getattr(args, param)
     # Assemble cull params
     params['cullParams'] = {}
@@ -944,6 +956,23 @@ def mergeOffsets(outputDir, baseName='NISARoffsets', layers=[1, 2, 3],
         symlink_file(slowFile, f'{outputDir}/{filename}', relative=True, overwrite=True)
 
 
+def pruneLayerIntermediates(outputDir, baseName='NISARoffsets'):
+    '''
+    Remove the raw and culled offset layers from workingDir once the merged
+    offsets are written. They only feed cullst and intfloat; a --mergeOnly
+    rerun reads just the cull.interp layers, which are kept (~68% of
+    workingDir is freed, ~0.9 GB per frame).
+    '''
+    pattern = re.compile(rf'^{baseName}\.layer[123]\.'
+                         r'(cc|da|dr|mt|sa|sr|cull\.(cc|da|dr|mt))$')
+    workingDir = f'{outputDir}/workingDir'
+    for name in os.listdir(workingDir):
+        path = f'{workingDir}/{name}'
+        if pattern.match(name) and os.path.isfile(path) \
+                and not os.path.islink(path):
+            os.remove(path)
+
+
 def applyVariableSmoothing(outputDir, params, nr, na, geoTransform, simDir='offsetSims',
                            simName='offsets', stderr=DEVNULL, stdout=DEVNULL,
                            debugIono=False):
@@ -1167,7 +1196,12 @@ def main():
     #
     # Setup ROFF object and open HDF file
     myROFF = nisarhdf.nisarROFFHDF()
-    myROFF.openHDF(ROFF)
+    # Load only the fields used below (the variances, snr and DEM roughly double the read)
+    myROFF.openHDF(ROFF, fixLayerRegistration=params['fixLayerRegistration'],
+                   fields=['slantRangeOffset', 'alongTrackOffset',
+                           'correlationSurfacePeak'])
+    # Marker read by reprocessing: 'layer3' only if the fix was actually applied
+    params['layerRegistrationFix'] = 'layer3' if myROFF.layerShifts else 'none'
     resolveRegion(myROFF, params)
     #
     # Discard outliers based on correlation peak
@@ -1249,6 +1283,9 @@ def main():
     writeVRTs(myROFF, params["outputDir"], params,
              interpApplied=not params['mergeOnly'],
              smoothingApplied=smoothingApplied)
+    #
+    if not params['keepIntermediates']:
+        pruneLayerIntermediates(params["outputDir"], 'NISARoffsets')
     #
     # writeVRTsRD(myROFF, ROFFPath, params)
 
