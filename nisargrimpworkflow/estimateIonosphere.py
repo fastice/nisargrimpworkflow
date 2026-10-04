@@ -436,6 +436,165 @@ def fill_and_smooth_iono(raw_iono, valid, sigma, boundary_mode='reflect'):
     return gaussian_filter(filled.astype(np.float64), sigma).astype(np.float32)
 
 
+# Converged-Laplace fill (ionoFillVersion laplace1km-1). Chosen over the pyramid fill from
+# 25 hold-out experiments on five Greenland tracks (Notes/augustJakobshavnIonosphere.md):
+# the pyramid's coarse nearest-neighbour seed is not relaxed across long gaps (100 iterations
+# vs gaps of hundreds of coarse cells), leaving +-0.3 m swings; a converged Laplace solution
+# cannot have an interior extremum. Median RMS 0.19 -> 0.18 m, 95th percentile 0.45 -> 0.39 m,
+# > 50 km into a gap 0.26 -> 0.19 m.
+IONO_FILL_VERSION = {'laplace': 'laplace1km-1', 'pyramid': 'pyramid-1'}
+FILL_CELL_KM = 1.0          # coarse cell for the Laplace solve and the sigma map
+FILL_MIN_FRAC = 0.25        # a cell is known when >= 25% of its pixels are (keeps fragmented land)
+# Fill-error model (ionoSigmaVersion sigma-1), calibrated on the same hold-outs (~70% within 1 sigma):
+#   sigma = max(SIGMA_INF_PX * (1 - exp(-d / SIGMA_L_KM)), SIGMA_PAIR_K * sqrt(gamma_pair(d)))
+# d = distance (km) to the nearest known cell, gamma_pair = the pair's own semivariogram.
+IONO_SIGMA_VERSION = 'sigma-1'
+SIGMA_INF_PX = 0.1496
+SIGMA_L_KM = 14.61
+SIGMA_PAIR_K = 1.95
+
+
+def _fill_blocks(pixelKm):
+    '''Block size (azimuth, range pixels) giving ~FILL_CELL_KM cells.'''
+    return (max(1, int(round(FILL_CELL_KM / pixelKm[0]))), max(1, int(round(FILL_CELL_KM / pixelKm[1]))))
+
+
+def _block_mean(arr, valid, block):
+    '''Block-average arr over valid pixels; cells with < FILL_MIN_FRAC valid are NaN.'''
+    ba, br = block
+    n0, n1 = -(-arr.shape[0] // ba) * ba, -(-arr.shape[1] // br) * br
+    a = np.full((n0, n1), np.nan); a[:arr.shape[0], :arr.shape[1]] = np.where(valid, arr, np.nan)
+    b = a.reshape(n0 // ba, ba, n1 // br, br)
+    cnt = np.isfinite(b).sum(axis=(1, 3))
+    with np.errstate(invalid='ignore'):
+        m = np.nansum(b, axis=(1, 3)) / np.maximum(cnt, 1)
+    m[cnt < FILL_MIN_FRAC * ba * br] = np.nan
+    return m
+
+
+def _laplace_solve(C, cellKm):
+    '''Converged 5-point Laplace fill of the NaN cells of C (known cells fixed, zero-flux frame
+    edges, anisotropic spacing). Unknown regions with no known neighbour get the known mean.'''
+    known = np.isfinite(C)
+    out = C.copy()
+    if not known.any():
+        return np.zeros_like(C)
+    unk = ~known
+    if not unk.any():
+        return out
+    lab, nLab = ndimage.label(unk)
+    touch = np.zeros(nLab + 1, bool)
+    border = ndimage.binary_dilation(known) & unk
+    touch[np.unique(lab[border])] = True
+    isolated = unk & ~touch[lab]
+    out[isolated] = np.nanmean(C)
+    solve = unk & touch[lab]
+    if not solve.any():
+        return out
+    from scipy import sparse
+    from scipy.sparse.linalg import spsolve
+    ny, nx = C.shape
+    idx = -np.ones(C.shape, np.int64)
+    idx[solve] = np.arange(solve.sum())
+    wy, wx = 1. / cellKm[0] ** 2, 1. / cellKm[1] ** 2
+    rows, cols, vals = [], [], []
+    diag = np.zeros(solve.sum())
+    b = np.zeros(solve.sum())
+    I, J = np.nonzero(solve)
+    k = idx[I, J]
+    for di, dj, w in ((-1, 0, wy), (1, 0, wy), (0, -1, wx), (0, 1, wx)):
+        a, c = I + di, J + dj
+        inside = (a >= 0) & (a < ny) & (c >= 0) & (c < nx)
+        diag[inside] += w
+        ki, ai, ci = k[inside], a[inside], c[inside]
+        isKnown = known[ai, ci]
+        np.add.at(b, ki[isKnown], w * C[ai[isKnown], ci[isKnown]])
+        nb = ~isKnown & solve[ai, ci]
+        rows.append(ki[nb]); cols.append(idx[ai[nb], ci[nb]]); vals.append(np.full(nb.sum(), -w))
+        iso = ~isKnown & isolated[ai, ci]          # neighbour fixed at the known mean
+        np.add.at(b, ki[iso], w * out[ai[iso], ci[iso]])
+    rows.append(k); cols.append(k); vals.append(diag)
+    A = sparse.csr_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
+                          shape=(solve.sum(), solve.sum()))
+    out[solve] = spsolve(A, b)
+    return out
+
+
+def _upsample(C, shape, block):
+    '''Bilinear upsample of block means C back to the full grid (cell centres).'''
+    ba, br = block
+    yc = (np.arange(C.shape[0]) + 0.5) * ba - 0.5
+    xc = (np.arange(C.shape[1]) + 0.5) * br - 0.5
+    f = RegularGridInterpolator((yc, xc), C, bounds_error=False, fill_value=None)
+    yy, xx = np.meshgrid(np.arange(shape[0]), np.arange(shape[1]), indexing='ij')
+    return f(np.column_stack([yy.ravel(), xx.ravel()])).reshape(shape)
+
+
+def laplace_fill_iono(raw_iono, valid, sigma, pixelKm, water=None):
+    """Fill gaps with a converged Laplace solve on a ~1 km grid, then Gaussian smooth.
+
+    raw_iono, valid : estimate and its validity (estimated or rock-seeded pixels).
+    sigma           : final Gaussian (azimuth, range pixels), as for the pyramid fill.
+    pixelKm         : (azimuth, ground-range) pixel size in km.
+    water           : optional bool mask; water is kept out of the known cells.
+    Estimated pixels keep their values; only the gaps take the coarse solution.
+    """
+    v = valid & np.isfinite(raw_iono)
+    if water is not None:
+        v &= ~water
+    if not v.any():
+        return np.zeros(raw_iono.shape, np.float32)
+    block = _fill_blocks(pixelKm)
+    C = _laplace_solve(_block_mean(raw_iono, v, block), (block[0] * pixelKm[0], block[1] * pixelKm[1]))
+    up = _upsample(C, raw_iono.shape, block)
+    merged = np.where(v, raw_iono, up)
+    return gaussian_filter(merged.astype(np.float64), sigma).astype(np.float32)
+
+
+def _semivariogram(C, cellKm, maxLagKm=200., stepKm=5., nPairs=300000, seed=0):
+    '''Empirical semivariogram of the known cells of C; returns gamma(d) or None.'''
+    i, j = np.nonzero(np.isfinite(C))
+    if len(i) < 50:
+        return None
+    X = np.column_stack([i * cellKm[0], j * cellKm[1]]); y = C[i, j]
+    rng = np.random.default_rng(seed)
+    a, b = rng.integers(0, len(y), nPairs), rng.integers(0, len(y), nPairs)
+    h = np.hypot(*(X[a] - X[b]).T); g = 0.5 * (y[a] - y[b]) ** 2
+    lags = np.arange(0., maxLagKm + stepKm, stepKm)
+    k = np.digitize(h, lags)
+    gam = np.array([g[k == n].mean() if (k == n).sum() > 50 else np.nan for n in range(1, len(lags))])
+    mid = 0.5 * (lags[1:] + lags[:-1])
+    ok = np.isfinite(gam)
+    if not ok.any():
+        return None
+    mid, gam = np.r_[0., mid[ok]], np.r_[0., gam[ok]]          # gamma(0) = 0: no step at good data
+    return lambda d: np.interp(d, mid, gam)
+
+
+def iono_fill_sigma(raw_iono, valid, pixelKm, water=None):
+    """Fill-error map (sigma-1) on the ~1 km cell grid, in the units of raw_iono.
+
+    Zero on cells with good data, rising smoothly with distance d (km) to the nearest good cell:
+    max(SIGMA_INF_PX * (1 - exp(-d / SIGMA_L_KM)), SIGMA_PAIR_K * sqrt(gamma_pair(d))).
+    Returns (sigma, block): one value per block of (azimuth, range) pixels.
+    """
+    v = valid & np.isfinite(raw_iono)
+    if water is not None:
+        v &= ~water
+    block = _fill_blocks(pixelKm)
+    cellKm = (block[0] * pixelKm[0], block[1] * pixelKm[1])
+    C = _block_mean(raw_iono, v, block)
+    good = np.isfinite(C)
+    if not good.any():
+        return np.full(C.shape, np.nan, np.float32), block
+    d = ndimage.distance_transform_edt(~good, sampling=cellKm)
+    s = SIGMA_INF_PX * (1. - np.exp(-d / SIGMA_L_KM))
+    vg = _semivariogram(C, cellKm)
+    if vg is not None:
+        s = np.maximum(s, SIGMA_PAIR_K * np.sqrt(vg(d)))
+    return s.astype(np.float32), block
+
+
 def local_consistency_mask(values, valid, size=21, n_std=4.0, min_count=20):
     """Boolean mask: True where `values` agrees with its local neighborhood.
 

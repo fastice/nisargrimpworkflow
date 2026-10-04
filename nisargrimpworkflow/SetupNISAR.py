@@ -16,6 +16,7 @@ from nisargrimpworkflow.custom_buildvrtWithOffsets import bakeVrtInPlace
 import geojson
 import copy
 import glob
+import json
 import re
 import numpy as np
 from subprocess import run, DEVNULL
@@ -196,6 +197,10 @@ def parseCommandLine():
                         'per-frame fill only. (Global fill only runs when '
                         '--sepIceRock or --debugIono is set; otherwise this '
                         'flag has no effect.)')
+    parser.add_argument('--ionoFill', choices=['laplace', 'pyramid'], default='laplace',
+                        help='Full-swath ionosphere gap fill: converged Laplace on a ~1 km '
+                        'grid (default; ionoFillVersion laplace1km-1) or the earlier '
+                        'pyramid fill (pyramid-1). See Notes/augustJakobshavnIonosphere.md.')
     parser.add_argument('--retainIntermediateIono', action='store_true',
                         help='Keep per-frame unfilled and per-frame filled '
                         'offset iono files after global fill (useful for '
@@ -254,7 +259,7 @@ def parseCommandLine():
                 'outputAll', 'phaseThresh', 'noPhaseThreshPass', 'sepIceRock',
                 'sigmaAz', 'sigmaRg',
                 'correlationOnly', 'corrOnly', 'geodatsOnly',
-                'noGlobalFillIono', 'retainIntermediateIono', 'debugIono',
+                'noGlobalFillIono', 'ionoFill', 'retainIntermediateIono', 'debugIono',
                 'clean', 'cleanDebug', 'noPrompt', 'bakeOnly', 'new']:
         params[key] = getattr(args, key)
     # Preliminary globalFillIono from CLI only; main() recomputes it after
@@ -1192,12 +1197,19 @@ def processFrameRUNW(frame, myArgs):
     None.
 
     '''
-    orbit1, orbit2 = myArgs['orbit1'],  myArgs['orbit2']
+    orbit1 = myArgs['orbit1']
     RUNWFile = getProductH5('RUNW', frame, myArgs)
     if RUNWFile is None:
         return True
     myRUNW = nisarhdf.nisarRUNWHDF()
     myRUNW.openHDF(RUNWFile)
+    # Name this frame's products after its OWN secondary. myArgs['orbit2'] was set by
+    # getSecondaryOrbit() from the first frame with data, so when an orbit's frames
+    # hold different secondaries (track-141/5430: frame 51 -> 5776, 52-55 -> 5603) the
+    # later frames' phase/ionosphere were written as <orbit1>_<f>.<wrong orbit2>_<f>.
+    # processFrameIonosphere (run next for this frame) reads the same key; main()
+    # resets it per virtual-frame group afterwards.
+    orbit2 = myArgs['orbit2'] = myRUNW.secondaryOrbit
     nLooksR = myRUNW.NumberRangeLooks
     nLooksA = myRUNW.NumberAzimuthLooks
     # Geodats are written by RUNWtoGrimp to the RUNW output dir (frame dir),
@@ -2216,6 +2228,95 @@ def _readIonosphereParams(myArgs):
     return None, None, None
 
 
+def _currentPairStem(frameDir, orbit, virtualFrame):
+    """'<orbit1>_<vf>.<orbit2>_<vf>' for the pair this virtual frame now holds, from its
+    <orbit1>.<orbit2>.pairinfo; None if there is no (unambiguous) pairinfo."""
+    hits = glob.glob(f'{frameDir}/{orbit}.*.pairinfo')
+    if len(hits) != 1:
+        return None
+    orbit2 = os.path.basename(hits[0]).split('.')[1]
+    return f'{orbit}_{virtualFrame}.{orbit2}_{virtualFrame}'
+
+
+def _offsetPixelKm(frameDir):
+    """(azimuth, ground-range) size in km of one offset-grid pixel for a virtual frame:
+    deltaA azimuth lines x SLC azimuth pixel, deltaR range samples x SLC range pixel / sin(40 deg)
+    (the incidence assumed when the fill-error model was calibrated)."""
+    meta = gdal.Open(f'{frameDir}/range.offsets.vrt').GetMetadata()
+    geodats = sorted(glob.glob(f'{frameDir}/geodat*x*.geojson'))
+    geodats = [g for g in geodats if 'secondary' not in g] or geodats
+    with open(geodats[0]) as fp:
+        prop = json.load(fp)['properties']
+    azKm = float(meta['deltaA']) * float(prop['SLCAzimuthPixelSize']) / 1e3
+    rgKm = float(meta['deltaR']) * float(prop['SLCRangePixelSize']) / np.sin(np.radians(40.)) / 1e3
+    return azKm, rgKm
+
+
+def _fullSwathWater(myArgs, fullGt, shape):
+    """Full-swath water mask (offsets.geom.mask == 0) assembled from the sub-frames,
+    on the same grid as the assembled unfilled screen; None if no mask is found."""
+    orbit = myArgs['orbit1']
+    water = np.zeros(shape, bool)
+    found = False
+    for frame in myArgs['frames']:
+        maskPath = os.path.join(f'{orbit}_{frame}', 'offsetSims', 'offsets.geom.mask.vrt')
+        if not os.path.exists(maskPath):
+            continue
+        ds = gdal.Open(maskPath)
+        mask = ds.GetRasterBand(1).ReadAsArray()
+        gt = ds.GetGeoTransform()
+        ds = None
+        r0 = round((gt[3] - fullGt[3]) / fullGt[5])
+        c0 = round((gt[0] - fullGt[0]) / fullGt[1])
+        R0, R1 = max(0, r0), min(shape[0], r0 + mask.shape[0])
+        C0, C1 = max(0, c0), min(shape[1], c0 + mask.shape[1])
+        if R1 <= R0 or C1 <= C0:
+            continue
+        water[R0:R1, C0:C1] |= (mask[R0 - r0:R1 - r0, C0 - c0:C1 - c0] == 0)
+        found = True
+    return water if found else None
+
+
+def _tagIonoFill(vrtPath, fillVersion):
+    """Record the fill version on a correction VRT (and its baked .tif, if any)."""
+    for path in (vrtPath, os.path.splitext(vrtPath)[0] + '.tif'):
+        if os.path.exists(path):
+            ds = gdal.Open(path, gdal.GA_Update)
+            if ds is not None:
+                ds.SetMetadataItem('ionoFillVersion', fillVersion)
+                ds = None
+
+
+def _writeIonoSigma(correctionVrt, frameDir, sigmaMap, fullGt, projWkt, fillVersion):
+    """Write the fill-error map next to the virtual-frame correction:
+    <stem>.ionosphereCorrection.sigma.tif, one ~1 km cell per block of offset pixels, in SLC
+    range pixels (1 sigma). Zero where the screen was estimated. The geotransform follows the
+    offsets' (slant range m, azimuth s) scaled by the block; r0/a0/deltaR/deltaA give the same
+    mapping in SLC pixels for mosaic3d."""
+    from nisargrimpworkflow.estimateIonosphere import (IONO_SIGMA_VERSION, SIGMA_INF_PX,
+                                                       SIGMA_L_KM, SIGMA_PAIR_K)
+    sigma, (ba, br) = sigmaMap
+    meta = gdal.Open(f'{frameDir}/range.offsets.vrt').GetMetadata()
+    out = correctionVrt.replace('.ionosphereCorrection.globalFill.offset.vrt',
+                                '.ionosphereCorrection.sigma.tif')
+    gt = (fullGt[0], fullGt[1] * br, 0., fullGt[3], 0., fullGt[5] * ba)
+    ds = gdal.GetDriverByName('GTiff').Create(out, sigma.shape[1], sigma.shape[0], 1,
+                                              gdal.GDT_Float32, options=['COMPRESS=DEFLATE'])
+    ds.SetGeoTransform(gt)
+    if projWkt:
+        ds.SetProjection(projWkt)
+    ds.GetRasterBand(1).WriteArray(np.nan_to_num(sigma, nan=0.).astype(np.float32))
+    ds.SetMetadata({'ionoSigmaVersion': IONO_SIGMA_VERSION, 'ionoFillVersion': fillVersion,
+                    'units': 'range SLC pixels, 1 sigma',
+                    'model': f'max({SIGMA_INF_PX}*(1-exp(-d/{SIGMA_L_KM} km)), '
+                             f'{SIGMA_PAIR_K}*sqrt(gamma_pair(d)))',
+                    'r0': meta['r0'], 'a0': meta['a0'],
+                    'deltaR': str(int(meta['deltaR']) * br), 'deltaA': str(int(meta['deltaA']) * ba),
+                    'source': os.path.basename(correctionVrt)})
+    ds = None
+    print(f'globalFillIonosphere: fill-error map -> {out}')
+
+
 def globalFillIonosphere(myArgs, sigmaAz=10.0, sigmaRng=30.0):
     """Globally fill both the RUNW-grid (radians) and offset-grid (SLC pixels)
     iono corrections, re-partition back into per-frame tiles, and build
@@ -2226,6 +2327,9 @@ def globalFillIonosphere(myArgs, sigmaAz=10.0, sigmaRng=30.0):
     λ/(4π·slp)) to per-frame debug/ dirs for quality evaluation.
     """
     from nisargrimpworkflow.estimateIonosphere import (fill_and_smooth_iono,
+                                                       laplace_fill_iono,
+                                                       iono_fill_sigma,
+                                                       IONO_FILL_VERSION,
                                                        local_consistency_mask,
                                                        write_geotiff,
                                                        write_output_vrt)
@@ -2234,9 +2338,16 @@ def globalFillIonosphere(myArgs, sigmaAz=10.0, sigmaRng=30.0):
     frameDir = f'{myArgs["outputDir"]}/{orbit}_{virtualFrame}'
 
     # --- locate assembled sparse offset-grid iono VRT ---
-    unfilledVrts = sorted(glob.glob(f'{frameDir}/*.ionosphereCorrectionUnfilled.offset.vrt'))
+    #  The assembled unfilled screen is a VRT when freshly built; frames processed earlier keep
+    #  only the baked .tif (the VRT is not retained), which a refill reads instead.
+    #  Only this pair's screen: a virtual-frame dir can still hold files of an earlier pairing
+    #  (same reference orbit, different secondary), and filling from those is silently wrong.
+    pairStem = _currentPairStem(frameDir, orbit, virtualFrame)
+    unfilledVrts = [f for f in (sorted(glob.glob(f'{frameDir}/*.ionosphereCorrectionUnfilled.offset.vrt')) or
+                                sorted(glob.glob(f'{frameDir}/*.ionosphereCorrectionUnfilled.offset.tif')))
+                    if pairStem is None or os.path.basename(f).startswith(pairStem + '.')]
     if not unfilledVrts:
-        u.mywarning('globalFillIonosphere: no unfilled offset iono VRT found, skipping')
+        u.mywarning(f'globalFillIonosphere: no unfilled offset iono screen for pair {pairStem}, skipping')
         return
     unfilledVrt = unfilledVrts[0]
 
@@ -2604,10 +2715,22 @@ def globalFillIonosphere(myArgs, sigmaAz=10.0, sigmaRng=30.0):
                   'for any frame — ice-free pre-fill skipped\033[0m')
 
     # --- global fill on full-swath offset grid (values already in SLC pixels) ---
-    print('globalFillIonosphere: running pyramid fill on full-swath offset-grid iono...')
-    filled = fill_and_smooth_iono(arr.astype(np.float32), valid,
-                                  sigma=(sigmaAz, sigmaRng),
-                                  boundary_mode='nearest')
+    fillMethod = myArgs.get('ionoFill') or 'laplace'
+    fillVersion = IONO_FILL_VERSION[fillMethod]
+    sigmaMap = None
+    if fillMethod == 'laplace':
+        pixelKm = _offsetPixelKm(frameDir)
+        water = _fullSwathWater(myArgs, fullGt, arr.shape)
+        print(f'globalFillIonosphere: converged-Laplace fill ({fillVersion}) on full-swath '
+              f'offset-grid iono, pixel {pixelKm[0]*1e3:.0f} x {pixelKm[1]*1e3:.0f} m ...')
+        filled = laplace_fill_iono(arr, valid, sigma=(sigmaAz, sigmaRng), pixelKm=pixelKm,
+                                   water=water)
+        sigmaMap = iono_fill_sigma(arr, valid, pixelKm, water=water)
+    else:
+        print('globalFillIonosphere: running pyramid fill on full-swath offset-grid iono...')
+        filled = fill_and_smooth_iono(arr.astype(np.float32), valid,
+                                      sigma=(sigmaAz, sigmaRng),
+                                      boundary_mode='nearest')
 
     # Store in a MEM dataset for per-frame cropping
     nrows, ncols = filled.shape
@@ -2636,13 +2759,21 @@ def globalFillIonosphere(myArgs, sigmaAz=10.0, sigmaRng=30.0):
             roffProj = projWkt
 
         # Derive output name from the per-frame ionosphereCorrection.offset.vrt
-        existingOffVrts = sorted(glob.glob(f'{orbit}_{frame}/*.ionosphereCorrection.offset.vrt'))
-        if not existingOffVrts:
+        frameStem = None if pairStem is None else pairStem.replace(f'_{virtualFrame}', f'_{frame}')
+        _mine = lambda fs: [f for f in fs if frameStem is None or os.path.basename(f).startswith(frameStem + '.')]
+        existingOffVrts = _mine(sorted(glob.glob(f'{orbit}_{frame}/*.ionosphereCorrection.offset.vrt')))
+        #  A refill of an already-processed frame: the per-frame pre-fill VRT is not retained,
+        #  but the earlier global-fill tile is, and carries the same stem.
+        existingFillVrts = _mine(sorted(glob.glob(f'{orbit}_{frame}/*.ionosphereCorrection.globalFill.offset.vrt')))
+        if existingOffVrts:
+            perFrameOffsetTif = existingOffVrts[0].replace(
+                '.ionosphereCorrection.offset.vrt',
+                '.ionosphereCorrection.globalFill.offset.tif')
+        elif existingFillVrts:
+            perFrameOffsetTif = existingFillVrts[0].replace('.vrt', '.tif')
+        else:
             u.mywarning(f'globalFillIonosphere: no offset vrt for {orbit}_{frame}')
             continue
-        perFrameOffsetTif = existingOffVrts[0].replace(
-            '.ionosphereCorrection.offset.vrt',
-            '.ionosphereCorrection.globalFill.offset.tif')
         perFrameOffsetVrt = perFrameOffsetTif.replace('.tif', '.vrt')
 
         # Crop filled iono (SLC pixels, full-swath offset grid) to frame's offset grid
@@ -2666,6 +2797,7 @@ def globalFillIonosphere(myArgs, sigmaAz=10.0, sigmaRng=30.0):
 
         write_output_vrt(perFrameOffsetVrt, [perFrameOffsetTif],
                          ['ionosphereCorrection'], roffGt)
+        _tagIonoFill(perFrameOffsetVrt, fillVersion)
         perFrameOffsetVrts.append(perFrameOffsetVrt)
         print(f'globalFillIonosphere: wrote {perFrameOffsetVrt}')
 
@@ -2716,6 +2848,10 @@ def globalFillIonosphere(myArgs, sigmaAz=10.0, sigmaRng=30.0):
          globalFillOffsetVrt] + perFrameOffsetVrts,
         stdout=myArgs.get('stdout', DEVNULL),
         stderr=myArgs.get('stderr', DEVNULL))
+
+    _tagIonoFill(globalFillOffsetVrt, fillVersion)
+    if sigmaMap is not None:
+        _writeIonoSigma(globalFillOffsetVrt, frameDir, sigmaMap, fullGt, projWkt, fillVersion)
 
     # --- stamp metadata on virtual-frame range.offsets.vrt ---
     roffVrt = f'{frameDir}/range.offsets.vrt'
