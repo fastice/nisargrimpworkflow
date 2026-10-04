@@ -1082,6 +1082,12 @@ def resolveRegion(myROFF, params):
     '''
     if params['region'] is not None:
         return
+    # An explicit regionFile already fully defines the region (defaultRegionDefs takes it
+    # in preference to the bare region code, which is only used to pick one of the bundled
+    # regions/*.yaml).  Without this, any region outside the two hard-coded EPSG codes below
+    # -- e.g. a UTM zone for Alaska -- exited here even though its region file was supplied.
+    if params.get('regionFile') is not None:
+        return
     # Prefer the EPSG declared in the project.yaml region file over the EPSG
     # embedded in the HDF5, which can be wrong for frames with atypical coverage.
     epsg = _epsgFromProjectYaml() or myROFF.epsg
