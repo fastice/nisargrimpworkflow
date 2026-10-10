@@ -450,6 +450,18 @@ be scanned correctly by `--check` — and reports:
 
 ---
 
+## Reviewing Exclude.pending frames
+
+Frames the tie step marks `Exclude.pending` (no usable range baseline) are
+reviewed with [`checkExclude`](../../mosaicworkflow/Documents/checkExclude.md)
+(mosaicworkflow), run from the project root. It compares each frame's
+line-of-sight velocity (`vr/va`) with velocityStats and, on approval, writes
+`checked` (pass) or a hard `Exclude` (fail) with the statistics inside. A
+`checked` frame is not re-flagged while its range fit keeps a solution and at
+least as many tiepoints as when it was checked.
+
+---
+
 ## Check-frames mode
 
 `--checkFrames` walks every entry directly under each `track-*` directory
