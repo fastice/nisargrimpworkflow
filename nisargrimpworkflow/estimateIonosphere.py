@@ -773,6 +773,17 @@ def parse_args():
     p.add_argument('--iceRockMask', default=None, metavar='FILE',
                    help='3-value mask VRT/GeoTIFF for --sepIceRock (0=water, 1=rock, 2=ice). '
                         'Default: auto-detect offsetSims/offsets.geom.mask.vrt in simDir.')
+    p.add_argument('--carrierCorrection', action='store_true', default=False,
+                   help='Add the rubbersheet carrier correction k_dc*(dA_c - S[dA_model]) to the '
+                        'unwrapped phase before the ionosphere is estimated (see carrierCorrection.py). '
+                        'Writes <stem>.carrierCorrection.tif/.vrt. Default off.')
+    p.add_argument('--carrierOffsets', action='store_true', default=False,
+                   help='With --carrierCorrection: also remove the squint-coupled range shift of the ionospheric '
+                        'along-track shift from the range offsets before the screen is estimated (offset phase - C), '
+                        'so the screen stays free of the carrier term. EXPERIMENTAL, default off.')
+    p.add_argument('--simVelocityOffsets', default=None, metavar='VRT',
+                   help='Simulated offsets with the velocity model (AzimuthOffsets band) for '
+                        '--carrierCorrection (default: offsets.velocity.vrt beside --offset-geometry)')
     p.add_argument('--simOffsets', default=None, metavar='VRT',
                    help='VRT of simulated range offsets (same format/units as offset_vrt, '
                         'SLC pixels) for per-CC diagnostic columns in the ambiguity table '
@@ -1060,6 +1071,15 @@ def main():
         print(f"  NaN-coherence fill mask: {n_coh_masked:,} additional pixels masked.")
     phase[coh_fill_mask] = np.nan
     wavelength = float(runw.Wavelength)
+    carrier = None
+    if args.carrierCorrection:
+        from .carrierCorrection import carrierCorrectionPhase
+        velocity_vrt = args.simVelocityOffsets or os.path.join(
+            os.path.dirname(args.offset_geometry), 'offsets.velocity.vrt')
+        carrier, _ = carrierCorrectionPhase(args.runw, velocity_vrt, args.offset_geometry)
+        if carrier.shape != phase.shape:
+            sys.exit(f"Carrier correction grid {carrier.shape} != phase grid {phase.shape}")
+        phase = phase + carrier
 
     print(f"\nWavelength: {wavelength:.6f} m")
     print(f"RUNW grid:  {runw.MLAzimuthSize} az × {runw.MLRangeSize} rg")
@@ -1075,6 +1095,10 @@ def main():
     print("Resampling offsets to RUNW grid...")
     offset_resampled = resample_vrt_to_runw(offset_m, vrt_gt, runw)
     offset_phase = offset_resampled * (-4.0 * np.pi / wavelength)
+    if carrier is not None and args.carrierOffsets:
+        # ionospheric along-track shifts slide the target along its squinted range-migration curve, so the range
+        # offsets carry ~ +C in phase units; remove it so the screen (phase + offset_phase)/2 stays carrier-free
+        offset_phase = offset_phase - carrier
 
     mask_path = args.maskFile or os.path.join(simDir, 'maskVel.vrt')
     user_mask = load_mask_file(mask_path, runw)
@@ -1257,6 +1281,10 @@ def main():
 
     write_geotiff(iono_tif, iono, gt, proj=proj_wkt)
     write_geotiff(phase_tif, phase_out, gt, proj=proj_wkt)
+    if carrier is not None:
+        write_geotiff(stem + '.carrierCorrection.tif', carrier, gt, proj=proj_wkt)
+        write_output_vrt(stem + '.carrierCorrection.vrt', [stem + '.carrierCorrection.tif'],
+                         ['carrierCorrection'], gt)
     if not args.noInterp:
         print("\nHole-filling correctedUnwrappedPhase with intfloat ...")
         # Interpolate to a temp file rather than overwriting phase_tif in place, so the
@@ -1364,6 +1392,18 @@ def main():
     scale_rad_to_pix = wavelength / (4.0 * np.pi * slp_spacing)
     iono_offset_pix = resample_runw_to_vrt(iono, runw, vrt_gt, offset_m.shape)
     iono_offset_pix *= scale_rad_to_pix
+    if carrier is not None and args.carrierOffsets:
+        # Squint-coupled range shift of the ionospheric along-track shift (kappa*s = C*lambda/(4 pi slp) SLC pixels),
+        # carried by the range offsets themselves. Written as its own layer and folded into the range-offset
+        # correction (consumers add it), so range offsets are corrected too; the screen itself stays carrier-free.
+        coupling_pix = resample_runw_to_vrt(np.where(np.isfinite(carrier), carrier, 0.0).astype(np.float32),
+                                            runw, vrt_gt, offset_m.shape) * scale_rad_to_pix
+        coupling_pix = np.where(np.isfinite(coupling_pix), coupling_pix, 0.0).astype(np.float32)
+        coupling_tif = re.sub(r'\.\d+x\d+\.nisar$', '', stem) + '.carrierRangeCoupling.offset.tif'
+        write_geotiff(coupling_tif, coupling_pix, vrt_gt, nodata=-2.0e9, proj=proj_wkt)
+        write_output_vrt(coupling_tif.replace('.tif', '.vrt'), [coupling_tif], ['carrierRangeCoupling'], vrt_gt)
+        iono_offset_pix = np.where(np.isfinite(iono_offset_pix), iono_offset_pix + coupling_pix, iono_offset_pix)
+        print(f"  Carrier range coupling: sd {np.std(coupling_pix):.4f} SLC px added to the range-offset correction")
     write_geotiff(offset_iono_tif, iono_offset_pix, vrt_gt, nodata=-2.0e9,
                   proj=proj_wkt)
 

@@ -289,6 +289,21 @@ def processFrame(frameDir, gain, smoothScale, overwrite, stamp=True):
         ds = gdal.Open(screenPath)
         raw = ds.ReadAsArray().astype(np.float64)
         del ds
+        if screenKind == 'smoothed':
+            # A filled range-offset correction may also carry the carrier correction's squint-coupled range term
+            # (estimateIonosphere --carrierOffsets); it is not ionosphere, so take it out before differentiating.
+            cpl = sorted(glob.glob(os.path.join(frameDir, stem + '.carrierRangeCoupling.offset.vrt')) +
+                         glob.glob(os.path.join(frameDir, stem + '.carrierRangeCoupling.offset.tif')))
+            if cpl:
+                cds = gdal.Open(cpl[0])
+                c = cds.ReadAsArray().astype(np.float64)
+                del cds
+                if c.shape == raw.shape:
+                    c[~np.isfinite(c) | (c < -1e9)] = 0.0
+                    raw = raw - c
+                    rec['carrierCouplingRemoved'] = True
+                else:
+                    rec['note'] = f'carrier coupling grid {c.shape} != screen {raw.shape}; not removed'
         covered = None
         if raw.shape != (meta['na'], meta['nr']):
             raw, covered, note = placeOnOffsetsGrid(screenPath, raw, frameDir,

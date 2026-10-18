@@ -205,6 +205,10 @@ def processFrameIonosphere(frame, myArgs, simDir='simPhase'):
         else:
             print(f'  Warning: --sepIceRock set but no offsets.geom.mask.vrt found '
                   f'under {frameDir}; rock pre-seeding will be skipped.')
+    if myArgs.get('carrierCorrection'):
+        command += ['--carrierCorrection']
+        if myArgs.get('carrierOffsets'):
+            command += ['--carrierOffsets']
     if myArgs.get('outputAll'):
         command += ['--outputAll']
     if myArgs.get('debugIono'):

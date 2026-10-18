@@ -144,6 +144,13 @@ def parseCommandLine():
                         '(passes --phaseDerivedIonosphere to RUNWtoGrimp). '
                         'When omitted, estimateIonosphere is run after ROFF '
                         'to estimate the ionosphere from range offsets.')
+    parser.add_argument('--carrierCorrection', action='store_true', default=False,
+                        help='Pass --carrierCorrection to estimateIonosphere: add the rubbersheet '
+                        'carrier correction to the phase before the ionosphere is estimated '
+                        '(default off)')
+    parser.add_argument('--carrierOffsets', action='store_true', default=False,
+                        help='With --carrierCorrection: also correct the range offsets for the squint-coupled '
+                        'ionospheric range shift before the screen is estimated (EXPERIMENTAL, default off)')
     parser.add_argument('--outputAll', action='store_true',
                         help='Pass --outputAll to estimateIonosphere: write all '
                         'intermediate bands (5-band VRT + stem-named TIFs). '
@@ -260,7 +267,8 @@ def parseCommandLine():
                 'sigmaAz', 'sigmaRg',
                 'correlationOnly', 'corrOnly', 'geodatsOnly',
                 'noGlobalFillIono', 'ionoFill', 'retainIntermediateIono', 'debugIono',
-                'clean', 'cleanDebug', 'noPrompt', 'bakeOnly', 'new']:
+                'clean', 'cleanDebug', 'noPrompt', 'bakeOnly', 'new', 'carrierCorrection',
+                'carrierOffsets']:
         params[key] = getattr(args, key)
     # Preliminary globalFillIono from CLI only; main() recomputes it after
     # merging the project.yaml sepIceRock flag (see below). phaseDerivedIonosphere
@@ -1978,6 +1986,10 @@ def createVirtualFrameRUNW(myArgs):
             ('*.ionosphereCorrection.vrt',        True,  'ionosphereCorrection',        False),
             ('*.ionosphereCorrection.offset.vrt', True,  'ionosphereCorrection.offset', True),
         ]
+        if myArgs.get('carrierOffsets'):
+            # squint-coupled range term already folded into the range-offset correction; mosaicked on its own so
+            # azIonoCorrection can take it back out before differentiating a filled screen
+            products.append(('*.carrierRangeCoupling.offset.vrt', False, 'carrierRangeCoupling.offset', False))
         if myArgs.get('globalFillIono'):
             # Global fill replaces both the per-frame-filled phase and offset VRTs;
             # skip assembling them here and add the sparse unfilled versions so
@@ -2792,6 +2804,22 @@ def globalFillIonosphere(myArgs, sigmaAz=10.0, sigmaRng=30.0):
         _ds = gdal.Open(perFrameOffsetTif, gdal.GA_Update)
         if _ds is not None:
             _ds.GetRasterBand(1).SetNoDataValue(-2.0e9)
+            # Carrier correction (--carrierOffsets): the fill was built from the pure (unfilled) screens, so add the
+            # frame's squint-coupled range term back into its range-offset correction here.
+            _cpl = _mine(sorted(glob.glob(f'{orbit}_{frame}/*.carrierRangeCoupling.offset.tif')))
+            if myArgs.get('carrierOffsets') and _cpl:
+                _cds = gdal.Open(_cpl[0])
+                _c = _cds.GetRasterBand(1).ReadAsArray().astype(np.float32)
+                _cds = None
+                _b = _ds.GetRasterBand(1)
+                _v = _b.ReadAsArray().astype(np.float32)
+                if _c.shape == _v.shape:
+                    _ok = np.isfinite(_v) & (_v > -1.0e9) & np.isfinite(_c) & (_c > -1.0e9)
+                    _b.WriteArray(np.where(_ok, _v + _c, _v).astype(np.float32))
+                    print(f'globalFillIonosphere: added carrier range coupling to {perFrameOffsetTif}')
+                else:
+                    u.mywarning(f'globalFillIonosphere: coupling grid {_c.shape} != {_v.shape} for '
+                                f'{orbit}_{frame}; not added')
             _ds.FlushCache()
             _ds = None
 
@@ -3283,6 +3311,14 @@ def main():
             _proj = yaml.safe_load(_fp) or {}
         if _proj.get('sepIceRock'):
             myArgs['sepIceRock'] = True
+        # Rubbersheet carrier correction (estimateIonosphere --carrierCorrection): applied to the phase
+        # before the ionosphere screen is estimated, so the screen, the range-offset ionosphere correction
+        # and the azimuth ionosphere correction derived from it are all built from the corrected phase.
+        # Default off; the --carrierCorrection CLI flag forces it on.
+        if _proj.get('carrierCorrection'):
+            myArgs['carrierCorrection'] = True
+        if _proj.get('carrierOffsets'):
+            myArgs['carrierOffsets'] = True
         # Azimuth ionosphere correction: whether to GENERATE it. Whether it is
         # then USED is a separate decision (applyAzimuthIonosphereCorrection ->
         # azparams/mosaic3d), so a project can build the rasters and evaluate
