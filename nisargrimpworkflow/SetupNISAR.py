@@ -1041,6 +1041,15 @@ def _preferNeighbourBandwidth(tied, frame, myArgs):
             byBandwidth.setdefault(int(m.group(1)), p)
     if len(byBandwidth) < 2:
         return min(tied, key=_pairBaselineDays)
+    if myArgs.get('ionosphereOnly'):
+        # Keep the bandwidth the frame's existing products were built from: a later download of the other mode can
+        # flip the neighbour vote, and the ionosphere must then still match the existing offsets and geodat
+        # (Antarctica80 frames re-voted 7700 -> 4000 on 2026-10-20 and estimateIonosphere failed).
+        existing = _existingOffsetsBandwidth(f'{myArgs["outputDir"]}/{myArgs["orbit1"]}_{frame}')
+        if existing in byBandwidth:
+            u.mywarning(f'Frame {frame} is acquired at more than one bandwidth {sorted(byBandwidth)}; '
+                        f'--ionosphereOnly keeps {existing}, the bandwidth of its existing range offsets')
+            return byBandwidth[existing]
     votes = Counter()
     for f in myArgs.get('frames', []):
         if f == frame:
@@ -1055,6 +1064,26 @@ def _preferNeighbourBandwidth(tied, frame, myArgs):
         f'{ _pairBaselineDays(tied[0]) }-day pair; neighbour votes {dict(votes)} -> using '
         f'{best}.  (Ties go to the higher bandwidth, matching the existing products.)')
     return byBandwidth[best]
+
+
+def _existingOffsetsBandwidth(frameDir):
+    '''Bandwidth (e.g. 4000, 7700) of the ROFF granule a frame's range.offsets were built from, else None.
+
+    The offsets are raw binary and their VRT does not name the granule, so match the raster size against each
+    granule's H5/*ROFF*layer3.vrt (the two modes' offset grids differ, e.g. 1588x1480 vs 3459x1786).'''
+    size = re.compile(r'rasterXSize="(\d+)" rasterYSize="(\d+)"')
+    try:
+        mine = size.search(open(f'{frameDir}/range.offsets.vrt').read())
+    except OSError:
+        return None
+    if not mine:
+        return None
+    matches = set()
+    for v in glob.glob(f'{frameDir}/H5/NISAR*ROFF*layer3.vrt'):
+        m, bw = size.search(open(v).read()), re.search(r'_(\d{4})_[A-Z]{2}_\d{8}T', os.path.basename(v))
+        if m and bw and m.groups() == mine.groups():
+            matches.add(int(bw.group(1)))
+    return matches.pop() if len(matches) == 1 else None
 
 
 def _secondaryDate(s):
