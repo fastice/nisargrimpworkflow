@@ -100,6 +100,7 @@ def processFrameIonosphere(frame, myArgs, simDir='simPhase'):
     if (os.path.exists(skip_path)
             and not myArgs.get('overWrite')
             and not myArgs.get('overWritePhase')
+            and not myArgs.get('ionosphereOnly')
             and not smrMissing):
         print(f'  estimateIonosphere: {os.path.basename(skip_path)} exists — skipping')
         return
@@ -112,6 +113,14 @@ def processFrameIonosphere(frame, myArgs, simDir='simPhase'):
               f'skipping frame {frame}')
         return
     RUNWFile = os.path.abspath(RUNWFiles[0])
+    if len(RUNWFiles) > 1:
+        # More than one RUNW (e.g. a 40 MHz and a 77 MHz product of the same pair, or two baselines): use the one
+        # processFrameRUNW chose (bandwidth vote, shortest baseline). sorted()[0] picked the 40 MHz product for
+        # Antarctica80 frames whose other products are 77 MHz, and estimateIonosphere then failed (2026-10-19).
+        from nisargrimpworkflow.SetupNISAR import getProductH5
+        chosen = getProductH5('RUNW', frame, myArgs)
+        if chosen is not None:
+            RUNWFile = os.path.abspath(chosen)
 
     # Range offsets VRT — ROFFtoGrimp now writes to the frame dir; fall back
     # to the H5 subdir in case of older/different layouts

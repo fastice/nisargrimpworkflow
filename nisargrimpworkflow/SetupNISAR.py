@@ -151,6 +151,13 @@ def parseCommandLine():
     parser.add_argument('--carrierOffsets', action='store_true', default=False,
                         help='With --carrierCorrection: also correct the range offsets for the squint-coupled '
                         'ionospheric range shift before the screen is estimated (EXPERIMENTAL, default off)')
+    parser.add_argument('--ionosphereOnly', action='store_true', default=False,
+                        help='Rerun only estimateIonosphere on frames that already have their products (e.g. to '
+                        'apply --carrierCorrection --carrierOffsets to an archive), reusing the cached velSim/maskVel '
+                        '(no siminsar), and rebuild only the virtual-frame products it writes (phase, ionosphere, '
+                        'range-offset ionosphere correction, carrier coupling). RUNWtoGrimp/ROFF still run for a frame '
+                        'whose outputs are missing. Geodats, coherence, power and the ROFF offsets VRTs -- with any '
+                        'embedded autoclean mask -- are left untouched. Not with the global-fill (sepIceRock) path')
     parser.add_argument('--outputAll', action='store_true',
                         help='Pass --outputAll to estimateIonosphere: write all '
                         'intermediate bands (5-band VRT + stem-named TIFs). '
@@ -268,7 +275,7 @@ def parseCommandLine():
                 'correlationOnly', 'corrOnly', 'geodatsOnly',
                 'noGlobalFillIono', 'ionoFill', 'retainIntermediateIono', 'debugIono',
                 'clean', 'cleanDebug', 'noPrompt', 'bakeOnly', 'new', 'carrierCorrection',
-                'carrierOffsets']:
+                'carrierOffsets', 'ionosphereOnly']:
         params[key] = getattr(args, key)
     # Preliminary globalFillIono from CLI only; main() recomputes it after
     # merging the project.yaml sepIceRock flag (see below). phaseDerivedIonosphere
@@ -1923,10 +1930,12 @@ def createVirtualFrameRUNW(myArgs):
                     for f in glob.glob(f'{orbit}_{frame}/simPhase/maskVel.vrt')]
     velSimVrt  = f'{frameDir}/velSim.vrt'
     maskVelVrt = f'{frameDir}/maskVel.vrt'
-    if velSimFiles:
+    ionosphereOnly = myArgs.get('ionosphereOnly')
+    # --ionosphereOnly: the per-frame simulations were reused, so the existing references stand
+    if velSimFiles and not (ionosphereOnly and os.path.exists(velSimVrt)):
         print(f'Building {velSimVrt}')
         run(['custom_buildvrtWithOffsets', '--overWrite', velSimVrt] + velSimFiles)
-    if maskVelFiles:
+    if maskVelFiles and not (ionosphereOnly and os.path.exists(maskVelVrt)):
         print(f'Building {maskVelVrt}')
         run(['custom_buildvrtWithOffsets', '--overWrite', maskVelVrt] + maskVelFiles)
 
@@ -2002,6 +2011,9 @@ def createVirtualFrameRUNW(myArgs):
             products.append(
                 ('*.ionosphereCorrectionUnfilled.offset.vrt', True,
                  'ionosphereCorrectionUnfilled.offset', False))
+    if ionosphereOnly:
+        # only the products estimateIonosphere rewrites
+        products = [p for p in products if p[2] != 'cor']
     for globPattern, useOffsets, label, isIonoRangeOffset in products:
         # Find files
         myFiles = []
@@ -2057,7 +2069,9 @@ def createVirtualFrameRUNW(myArgs):
         if os.path.lexists(phase_link):
             os.remove(phase_link)
         os.symlink(target, phase_link)
-    # Now create geodats
+    # Now create geodats (unchanged by --ionosphereOnly, which keeps the existing merged ones)
+    if ionosphereOnly:
+        return
     if 'correctedUnwrappedPhase' not in virtualVRTs:
         u.mywarning('createVirtualFrameRUNW: no phase product assembled for '
                     f'{orbit}_{virtualFrame}; skipping merged geodats')
@@ -3327,6 +3341,10 @@ def main():
             _proj.get('computeAzimuthIonosphereCorrection', False))
     myArgs['globalFillIono'] = (not myArgs['noGlobalFillIono']) and (
         bool(myArgs['debugIono']) or bool(myArgs['sepIceRock']))
+    if myArgs.get('ionosphereOnly') and myArgs['globalFillIono']:
+        # the global fill rebuilds the filled corrections from all frames' unfilled screens after the ROFF
+        # virtual frame, which --ionosphereOnly skips
+        u.myerror('--ionosphereOnly does not support the global-fill (sepIceRock) ionosphere path')
     if myArgs['sepIceRock']:
         print(f'sepIceRock enabled (from {projectYaml} or --sepIceRock)')
     # Get list of frames
@@ -3506,7 +3524,10 @@ def main():
                 copy_sensor_yaml(myArgs, frameDir)
                 createVirtualFrameRUNW(myArgs)
                 writePairInfo(myArgs)
-                if not myArgs['RUNWOnly'] and not myArgs.get('geodatsOnly'):
+                # --ionosphereOnly leaves the ROFF VRTs (and their autoclean mask) alone; the
+                # range-offset ionosphere correction keeps its name, so their metadata still points at it
+                if not myArgs['RUNWOnly'] and not myArgs.get('geodatsOnly') \
+                        and not myArgs.get('ionosphereOnly'):
                     createVirtualFrameROFF(myArgs)
                     if myArgs.get('globalFillIono'):
                         t_step = time.time()
@@ -3517,7 +3538,7 @@ def main():
                         print(f'{time.time()-t_step:.1f}s  (total {time.time()-t0:.1f}s)')
         # Create a virtual frame if .pow images exist
         if not myArgs['RUNWOnly'] and not myArgs.get('correlationOnly') \
-                and not myArgs.get('corrOnly'):
+                and not myArgs.get('corrOnly') and not myArgs.get('ionosphereOnly'):
             createVirtualFramePower(myArgs)
 
     # Drop stale virtual-frame dirs left by an earlier, different grouping (see
@@ -3527,6 +3548,7 @@ def main():
     # which don't recompute the full grouping.
     if (haveData and not explicitVFOverride and not myArgs.get('new')
             and not myArgs.get('geodatsOnly')
+            and not myArgs.get('ionosphereOnly')
             and not myArgs.get('corrOnly')
             and not myArgs.get('correlationOnly')):
         _dropOrphanVirtualFrames(myArgs['orbit1'], groupAssignments)
