@@ -134,6 +134,10 @@ def parseArgs():
                         help='Keep the raw and culled offset layers in '
                         'workingDir/ (by default only the cull.interp layers '
                         'that --mergeOnly needs are kept)')
+    parser.add_argument('--separateSims', action='store_true', default=False,
+                        help='Run the geometry and velocity simulations as two simoffsets '
+                        'calls (the pre-2026-10-28 path). Default: one simoffsets --alsoVelocity '
+                        'call that shares the siminsar -toLL run and lltora pass (same products)')
     parser.add_argument('--ompThreads', type=int, default=4,
                         help='Number of OpenMP threads passed to simoffsets/'
                         'siminsar [4]')
@@ -209,7 +213,7 @@ def parseArgs():
                   'minTol', 'percentSpeed', 'maxTol', 'maxSmoothRadius',
                   'maxSmoothRadiusA', 'smoothThreads', 'smoothNIter',
                   'noVariableSmoothing', 'debugIono', 'keepIntermediates',
-                  'fixLayerRegistration']:
+                  'fixLayerRegistration', 'separateSims']:
         params[param] = getattr(args, param)
     # Assemble cull params
     params['cullParams'] = {}
@@ -278,7 +282,7 @@ def setupGeodats(params, simDir='workingDir'):
 def callSim(outputDir, baseName, params,
             includeVel=True, stderr=DEVNULL, stdout=DEVNULL,
             simDir='workingDir', ompThreads=4, iceRockWaterMask=False, tiff=False,
-            smoothParams=None):
+            smoothParams=None, alsoVelocity=None):
     '''
     Execute a shell command to run the offset simulations.
     includeVel : bool
@@ -293,6 +297,10 @@ def callSim(outputDir, baseName, params,
         passed through to simoffsets to produce a variable smoothing-radius map (.smr.tif).
         Only meaningful (and only ever passed by simulateOffsets) for the velocity-included
         simulation, since the map is speed-based.
+    alsoVelocity : str or None
+        Base name of a velocity simulation simoffsets also writes from the same run
+        (simoffsets --alsoVelocity; needs includeVel=False). smoothParams and
+        verticalCorrection then apply to that velocity product.
     See simulateOffsets for other paremeter definitions.
     '''
     byteOrderFlag = {'MSB': '', 'LSB': '-LSB'}[params['byteOrder']]
@@ -322,6 +330,8 @@ def callSim(outputDir, baseName, params,
             f'--smoothNIter {smoothParams["smoothNIter"]} '
     command += f'-offsetsDat={outputDir}/{simDir}/{baseName}.dat '
     command += f'-azOffsets={outputDir}/{simDir}/{baseName}.da -syncDat '
+    if alsoVelocity is not None:
+        command += f'--alsoVelocity {outputDir}/{simDir}/{alsoVelocity}.dat '
     geodat1 = os.path.basename(params["geo1"])
     command += f'-geodatFile={outputDir}/{simDir}/{geodat1} '
     geodat2 = os.path.basename(params["geo2"])
@@ -416,7 +426,11 @@ def simulateOffsets(outputDir, baseName, params,
 
     '''
     print('Simulating offsets ...')
-    threads = []
+    smoothParamsAll = None
+    if params.get('minTol') is not None and not params.get('noVariableSmoothing'):
+        smoothParamsAll = {k: params[k] for k in
+                           ['minTol', 'percentSpeed', 'maxTol', 'maxSmoothRadius',
+                            'maxSmoothRadiusA', 'smoothThreads', 'smoothNIter']}
     # offsets.geom.mask.vrt (consumed downstream by --sepIceRock) only carries
     # genuine 0=water/1=rock/2=ice classes when the region defines
     # icerockwatermask (currently Greenland only). Request it from simoffsets
@@ -427,6 +441,30 @@ def simulateOffsets(outputDir, baseName, params,
     if not useIceRockMask:
         print('simulateOffsets: icerockwatermask not defined for this region -- '
               '--sepIceRock will not be applicable; using default mask for offsets.geom')
+    if not params.get('separateSims'):
+        # One simoffsets call writes both: siminsar -toLL and the lltora pass are shared
+        # (simoffsets --alsoVelocity). Same products as the two calls below.
+        callSim(outputDir, f'{baseName}.geom', params, includeVel=False,
+                iceRockWaterMask=useIceRockMask, stderr=stderr, stdout=stdout,
+                simDir=simDir, ompThreads=ompThreads, tiff=tiff,
+                smoothParams=smoothParamsAll, alsoVelocity=f'{baseName}.velocity')
+    else:
+        _simulateOffsetsSeparate(outputDir, baseName, params, stderr, stdout, simDir,
+                                 ompThreads, tiff, useIceRockMask)
+    #
+    offsetFiles = glob.glob(f'{outputDir}/{simDir}/offsets.*')
+    # Add links to workingDir/ so downstream steps (applyMask, etc.) can find
+    # the sim outputs.  overwrite=True refreshes stale links on re-runs.
+    for offsetFile in offsetFiles:
+        symlink_file(offsetFile,
+                     f'{outputDir}/workingDir/{os.path.basename(offsetFile)}',
+                     relative=True, overwrite=True)
+
+
+def _simulateOffsetsSeparate(outputDir, baseName, params, stderr, stdout, simDir,
+                             ompThreads, tiff, useIceRockMask):
+    '''The pre-2026-10-28 path (--separateSims): two simoffsets calls in parallel.'''
+    threads = []
     # Geometry
     threads.append(threading.Thread(target=callSim,
                                     args=[outputDir, f'{baseName}.geom',
@@ -461,14 +499,6 @@ def simulateOffsets(outputDir, baseName, params,
     if stdout == DEVNULL:
         quiet = True
     u.runMyThreads(threads, 2, 'simoffsets', quiet=quiet)
-    #
-    offsetFiles = glob.glob(f'{outputDir}/{simDir}/offsets.*')
-    # Add links to workingDir/ so downstream steps (applyMask, etc.) can find
-    # the sim outputs.  overwrite=True refreshes stale links on re-runs.
-    for offsetFile in offsetFiles:
-        symlink_file(offsetFile,
-                     f'{outputDir}/workingDir/{os.path.basename(offsetFile)}',
-                     relative=True, overwrite=True)
 
 
 def updateSimVrtGeotransforms(vrt_glob, myNISAR):
