@@ -24,6 +24,8 @@ _RUNW_FIELDS = ['unwrappedPhase', 'ionospherePhaseScreen',
                 'ionospherePhaseScreenUncertainty', 'coherenceMagnitude',
                 'connectedComponents']
 _RIFG_FIELDS = ['wrappedInterferogram', 'coherenceMagnitude']
+# Slim products (downloadNISARoptimized) lack some of these; each list is filtered
+# through fieldsInFile so a VRT never points at a band the file does not hold.
 _ROFF_FIELDS = ['slantRangeOffset', 'alongTrackOffset',
                 'correlationSurfacePeak', 'snr']
 _ROFF_LAYERS = ['layer1', 'layer2', 'layer3']
@@ -78,7 +80,7 @@ def _wrapRUNW(h5File, outputRoot, verbose=False):
     """Open RUNW with noLoadData=True and write a single multi-band VRT."""
     p = nisarhdf.nisarRUNWHDF()
     p.openHDF(h5File, productType='interferogram', noLoadData=True)
-    writeVrtOnly(p, outputRoot, _RUNW_FIELDS, verbose=verbose)
+    writeVrtOnly(p, outputRoot, p.fieldsInFile(_RUNW_FIELDS), verbose=verbose)
 
 
 def _wrapROFF(h5File, outputRoot, verbose=False):
@@ -87,8 +89,8 @@ def _wrapROFF(h5File, outputRoot, verbose=False):
     p.openHDF(h5File, productType='pixelOffsets', noLoadData=True,
               layers=_ROFF_LAYERS)
     for layer in _ROFF_LAYERS:
-        writeVrtOnly(p, f'{outputRoot}.{layer}', _ROFF_FIELDS, layer=layer,
-                     verbose=verbose)
+        writeVrtOnly(p, f'{outputRoot}.{layer}', p.fieldsInFile(_ROFF_FIELDS, layer=layer),
+                     layer=layer, verbose=verbose)
 
 
 def _wrapRIFG(h5File, outputRoot, verbose=False):
