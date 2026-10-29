@@ -20,6 +20,7 @@ import re
 import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 import traceback
 
@@ -209,11 +210,78 @@ def productDir(archiveDir, name, products):
     return None
 
 
+# Products fetched slim by downloadNISARoptimized: only the bands the GrIMP
+# workflow reads, float32 rounded to 10 mantissa bits (RUNW unwrappedPhase 12),
+# same internal paths, ~4-5x smaller than the archive product and about half the
+# transfer. slimDownload: false in autoupdate.yaml fetches whole products instead.
+SLIM_PRODUCTS = ('RUNW', 'ROFF')
+SLIM_MANIFEST = 'slimManifest.jsonl'
+
+
+def collectSlimManifest(archiveDir, downloadDir):
+    '''
+    Tidy a staging folder after a downloadNISARoptimized pass. Its manifest and
+    (empty) .scratch dir are moved/removed because releaseStaging only moves
+    *.h5 and removes a folder once it is empty; the manifest is appended to
+    archiveDir/slimManifest.jsonl instead (a top-level file, so the searchASF
+    dedup glob archiveDir/*/* never sees it). A granule that failed
+    verification is deleted, so it counts as missing: retried this run and,
+    failing that, re-listed by tomorrow's search.
+    '''
+    manifest = os.path.join(downloadDir, SLIM_MANIFEST)
+    if os.path.exists(manifest):
+        with open(manifest) as fp:
+            lines = fp.readlines()
+        for line in lines:
+            entry = json.loads(line)
+            if entry['problems']:
+                bad = os.path.join(downloadDir, f'{entry["stem"]}.h5')
+                print(f'slim granule failed verification, removed: {entry["stem"]} '
+                      f'({"; ".join(entry["problems"])})')
+                if os.path.exists(bad):
+                    os.remove(bad)
+        with open(os.path.join(archiveDir, SLIM_MANIFEST), 'a') as fp:
+            fp.writelines(lines)
+        os.remove(manifest)
+    scratch = os.path.join(downloadDir, '.scratch')
+    if os.path.isdir(scratch) and not os.listdir(scratch):
+        os.rmdir(scratch)
+
+
+def downloadPass(config, urls, downloadDir):
+    '''
+    One download pass over urls into downloadDir: RUNW/ROFF slim through
+    downloadNISARoptimized (one call per product, since it takes a single
+    --product), anything else whole through ariaDownload.
+    '''
+    slim = config.get('slimDownload', True)
+    groups = {}
+    for url in urls:
+        name = url.split('/')[-1]
+        product = next((p for p in SLIM_PRODUCTS if slim and f'_{p}_' in name), None)
+        groups.setdefault(product, []).append(url)
+    with tempfile.TemporaryDirectory() as tmp:
+        for product, group in groups.items():
+            listFile = os.path.join(tmp, f'urls.{product or "whole"}')
+            with open(listFile, 'w') as fp:
+                fp.write('\n'.join(group) + '\n')
+            if product is None:
+                subprocess.run(['ariaDownload', listFile], cwd=downloadDir,
+                               check=True)
+            else:
+                # No check=True: exit status 69 only means some granule failed
+                # verification, which collectSlimManifest deals with.
+                subprocess.run(['downloadNISARoptimized', '--product', product,
+                                '--urls', listFile, '--outputDir', downloadDir])
+    collectSlimManifest(config['archiveDir'], downloadDir)
+
+
 def downloadGranules(config, urlListFile, today, maxAttempts=3):
     '''
     Download the granules listed in urlListFile into today's dated staging
     folder archiveDir/<MM-DD-YYYY>, retrying incomplete ones (aria2c sometimes
-    times out; re-running resumes/skips as needed).
+    times out; re-running resumes/skips as needed). RUNW/ROFF are fetched slim
+    (see SLIM_PRODUCTS / downloadPass).
 
     `today` (a datetime.date) is fixed once at program start, so the folder is
     named for the run's start date even if the (multi-hour) download crosses
@@ -230,24 +298,27 @@ def downloadGranules(config, urlListFile, today, maxAttempts=3):
     downloadDir = os.path.join(archiveDir, today.strftime(STAGING_DATE_FMT))
     os.makedirs(downloadDir, exist_ok=True)
     names = readUrlList(urlListFile)
+    with open(urlListFile) as fp:
+        urlOf = {line.strip().split('/')[-1]: line.strip() for line in fp if line.strip()}
     print(f'{len(names)} granule(s) to download into {downloadDir}')
-    # ariaDownload writes into its cwd; loop until everything is complete.
+    # Both downloaders skip a granule already on disk; loop until everything is
+    # complete, re-fetching only what is still missing.
     missing = names
     for attempt in range(1, maxAttempts + 1):
         if attempt > 1:
             # ariaDownload skips any file that already exists, so a partial
             # .h5 left by a timed-out aria2c would never be retried (or
-            # resumed). Remove the partial and its .aria2 control file so the
-            # retry re-downloads it from scratch.
+            # resumed). Remove the partial and its .aria2 control file (and a
+            # killed slim repack's .partial) so the retry re-downloads it.
             for name in missing:
                 for stale in (os.path.join(downloadDir, name),
-                              os.path.join(downloadDir, f'{name}.aria2')):
+                              os.path.join(downloadDir, f'{name}.aria2'),
+                              os.path.join(downloadDir, f'{name}.partial')):
                     if os.path.exists(stale):
                         os.remove(stale)
-        print(f'ariaDownload attempt {attempt}/{maxAttempts} '
+        print(f'download attempt {attempt}/{maxAttempts} '
               f'({len(missing)} remaining)')
-        subprocess.run(['ariaDownload', urlListFile], cwd=downloadDir,
-                       check=True)
+        downloadPass(config, [urlOf[n] for n in missing], downloadDir)
         missing = incompleteGranules(downloadDir, names)
         if not missing:
             break
@@ -260,7 +331,8 @@ def downloadGranules(config, urlListFile, today, maxAttempts=3):
         # re-downloaded. With the partial gone, tomorrow's search re-lists it.
         for name in missing:
             for stale in (os.path.join(downloadDir, name),
-                          os.path.join(downloadDir, f'{name}.aria2')):
+                          os.path.join(downloadDir, f'{name}.aria2'),
+                          os.path.join(downloadDir, f'{name}.partial')):
                 if os.path.exists(stale):
                     os.remove(stale)
         print(f'WARNING: {len(missing)} granule(s) did not download after '

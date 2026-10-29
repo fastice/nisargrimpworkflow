@@ -11,12 +11,12 @@ One-time setup to bring a project onto the daily driver. Detail for each item is
 in the sections below; this is the ordered "did I do everything" list.
 
 1. **Conda `base` env has the tools.** `autoupdateNISAR`, `searchASF`,
-   `ariaDownload`, `SetupNISAR` (and GDAL) must all be importable/on `PATH` in the
+   `downloadNISARoptimized`, `ariaDownload`, `SetupNISAR` (and GDAL) must all be importable/on `PATH` in the
    env the wrapper activates (`base`). Install/update `nisargrimpworkflow` into it.
 2. **GrIMP C binaries built and installed** to `~/bin/x86_64` (`simoffsets`,
    `cullst`, `siminsar`, `intfloat`, `mosaic3d`). Override the location with
    `BINDIR` if elsewhere.
-3. **Earthdata credentials in place** for `ariaDownload` (standard `~/.netrc`
+3. **Earthdata credentials in place** for the downloads (standard `~/.netrc`
    machine `urs.earthdata.nasa.gov` login). Without them every download fails.
 4. **`project.yaml` present** in the project dir and carrying the region-dependent
    processing keys `SetupNISAR` reads — in particular `sepIceRock` (`True` for
@@ -63,7 +63,8 @@ mid-track at a UTC-midnight boundary.
 
 ```
 searchGranules          searchASF over [today-lookBack, today] -> URL list
-downloadGranules        ariaDownload into archiveDir/<MM-DD-YYYY>/  (today's staging folder)
+downloadGranules        RUNW/ROFF slim via downloadNISARoptimized, anything else whole via
+                        ariaDownload, into archiveDir/<MM-DD-YYYY>/  (today's staging folder)
 consolidateStaging      move today's frames of any pass also present in the aged
                         (non-today) folders into the most-recent prior folder
                         (matched against the UNION of all prior folders, so a
@@ -296,6 +297,7 @@ frame (a gap) correctly becomes its own virtual frame instead.
 | `region` | `Antarctica` / `Greenland` → searchASF spatial flag |
 | `lookBack` | Search window length in days (today-lookBack … today) |
 | `products` | Product types to search/file (e.g. `RUNW ROFF`) |
+| `slimDownload` | (optional, default `true`) fetch RUNW/ROFF slim with `downloadNISARoptimized` -- only the bands the GrIMP workflow reads, float32 rounded to 10 mantissa bits (RUNW `unwrappedPhase` 12), same internal paths, ~4-5x smaller and about half the transfer. `false` fetches whole products with `ariaDownload`, e.g. if ASF range requests misbehave |
 | `bandwidths` | searchASF `--bandwidth` tokens (GrIMP `80` → 77 MHz) |
 | `projectDir` | (optional) project root for the processing steps; default = the config file's directory |
 | `setupFlags` | (optional) extra flags forwarded to `SetupNISAR` per orbit; default empty. Region-dependent processing choices are NOT put here — see `sepIceRock` below |
@@ -359,6 +361,14 @@ when `--inputPath` is omitted).
   a leftover partial would otherwise be dedup-indexed and never fetched again), and
   `consolidateStaging`/`releaseStaging` both refuse to count or release any `.h5`
   with a sibling `.aria2`.
+- **Slim downloads:** `downloadNISARoptimized` writes each granule atomically
+  (`.h5.partial`, renamed when complete), so a present `.h5` is complete; a killed
+  repack's `.partial` is removed with the aria partials. After each pass
+  `collectSlimManifest` deletes any granule that failed verification (so it is
+  retried, then re-listed tomorrow), appends the staging folder's
+  `slimManifest.jsonl` to `archiveDir/slimManifest.jsonl` and removes an empty
+  `.scratch/` -- `releaseStaging` only moves `*.h5` and removes a folder once it is
+  empty, so either would otherwise strand the folder.
 - **Crash recovery (pending granules):** the released work list is persisted to
   `dailyDownloadLogs/pendingGranules.txt` before processing and cleared once the
   per-orbit SetupNISAR stage has run. If a run dies between release and
