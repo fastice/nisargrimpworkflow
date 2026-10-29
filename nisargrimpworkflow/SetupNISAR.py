@@ -1050,20 +1050,47 @@ def _preferNeighbourBandwidth(tied, frame, myArgs):
             u.mywarning(f'Frame {frame} is acquired at more than one bandwidth {sorted(byBandwidth)}; '
                         f'--ionosphereOnly keeps {existing}, the bandwidth of its existing range offsets')
             return byBandwidth[existing]
-    votes = Counter()
-    for f in myArgs.get('frames', []):
-        if f == frame:
-            continue
-        bw = frameAvailableBandwidths(f'{myArgs["outputDir"]}/{myArgs["orbit1"]}_{f}')
-        if len(bw) == 1:                      # only unambiguous neighbours get a vote
-            votes[next(iter(bw))] += 1
     candidates = sorted(byBandwidth)
-    best = max(candidates, key=lambda bw: (votes.get(bw, 0), bw))
+    best, left, right = _runBandwidth(frame, myArgs, candidates)
     u.mywarning(
         f'Frame {frame} is acquired at more than one bandwidth {candidates} on the same '
-        f'{ _pairBaselineDays(tied[0]) }-day pair; neighbour votes {dict(votes)} -> using '
-        f'{best}.  (Ties go to the higher bandwidth, matching the existing products.)')
+        f'{ _pairBaselineDays(tied[0]) }-day pair; nearest single-bandwidth neighbours '
+        f'{left} (before) / {right} (after) -> using {best}, the mode of the virtual frame '
+        f'splitGroupsByMode() puts it in.')
     return byBandwidth[best]
+
+
+def _runBandwidth(frame, myArgs, candidates):
+    '''
+    Bandwidth of the run a dual-bandwidth frame joins, by the same rule as splitGroupsByMode():
+    look for the nearest frame on each side that is available at ONE bandwidth only, without
+    crossing a gap in frame numbers (a gap starts a new virtual frame); if both sides agree use
+    that mode, at a boundary between modes use the higher bandwidth, at an edge use the one side,
+    and with no single-bandwidth neighbour use the higher bandwidth.  Choosing the product this
+    way keeps every frame of a virtual frame on one grid -- an orbit-wide vote did not when the
+    higher-bandwidth side was the orbit's minority (Antarctica80 track-63/3795: frame 124 built
+    at 4000 inside the 7700 virtual frame 3795_0000, so its offsets and ionosphere grids differed).
+    Returns (bandwidth, leftMode, rightMode).
+    '''
+    frames = sorted(set(myArgs.get('frames', [])) | {frame})
+    k = frames.index(frame)
+
+    def nearest(step):
+        i, prev = k + step, frame
+        while 0 <= i < len(frames):
+            f = frames[i]
+            if abs(f - prev) > 1:                 # gap: another virtual frame
+                return None
+            bw = frameAvailableBandwidths(f'{myArgs["outputDir"]}/{myArgs["orbit1"]}_{f}')
+            if len(bw) == 1:
+                return next(iter(bw))
+            prev, i = f, i + step
+        return None
+
+    left, right = nearest(-1), nearest(1)
+    sides = [m for m in (left, right) if m is not None and m in candidates]
+    best = max(sides) if sides else max(candidates)
+    return best, left, right
 
 
 def _existingOffsetsBandwidth(frameDir):
