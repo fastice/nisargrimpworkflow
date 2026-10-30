@@ -134,6 +134,12 @@ def parseArgs():
                         help='Keep the raw and culled offset layers in '
                         'workingDir/ (by default only the cull.interp layers '
                         'that --mergeOnly needs are kept)')
+    parser.add_argument('--resimulate', action='store_true', default=False,
+                        help='Regenerate the simulations and re-merge, reusing the culled + '
+                        'interpolated layers already in workingDir/ (the ROFF offsets carry no '
+                        'geometry; offsets.geom is only added at the merge).  For a geometry-only '
+                        'reprocess, e.g. the 2026-10-05 siminsar fix.  Falls back to the full path '
+                        'when any layer is missing')
     parser.add_argument('--separateSims', action='store_true', default=False,
                         help='Run the geometry and velocity simulations as two simoffsets '
                         'calls (the pre-2026-10-28 path). Default: one simoffsets --alsoVelocity '
@@ -213,7 +219,7 @@ def parseArgs():
                   'minTol', 'percentSpeed', 'maxTol', 'maxSmoothRadius',
                   'maxSmoothRadiusA', 'smoothThreads', 'smoothNIter',
                   'noVariableSmoothing', 'debugIono', 'keepIntermediates',
-                  'fixLayerRegistration', 'separateSims']:
+                  'fixLayerRegistration', 'separateSims', 'resimulate']:
         params[param] = getattr(args, param)
     # Assemble cull params
     params['cullParams'] = {}
@@ -1270,13 +1276,19 @@ def main():
                         tiff=True)
         updateSimVrtGeotransforms(
             f'{params["outputDir"]}/offsetSims/*.vrt', myROFF)
-        #
+    #
+    # --resimulate: the culled/interpolated layers from an earlier run are reused as they are
+    reuseLayers = params.get('resimulate') and all(
+        os.path.exists(f'{params["outputDir"]}/workingDir/NISARoffsets.layer{k}.cull.interp.vrt')
+        for k in (1, 2, 3))
+    if params.get('resimulate') and not reuseLayers:
+        print('--resimulate: culled layers missing in workingDir/ -- full layer processing')
+    if not params['mergeOnly'] and not reuseLayers:
         # Apply any mask files
         if not params['noMask']:
             myROFF.applyMask(f'{params["outputDir"]}/workingDir/offsets.velocity.mask.vrt')
-    #
-    # Save the offsets to layer files
-
+        #
+        # Save the offsets to layer files
         myROFF.writeData(f'{params["outputDir"]}/workingDir/NISARoffsets',
                          bands=['slantRangeOffset',
                                 'alongTrackOffset',

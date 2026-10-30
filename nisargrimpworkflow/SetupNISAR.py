@@ -136,6 +136,10 @@ def parseCommandLine():
     parser.add_argument('--verbose', action='store_true',
                         help='Print all subprocess output to the terminal '
                         '(default: suppressed to keep output readable)')
+    parser.add_argument('--resimulate', action='store_true', default=False,
+                        help='Pass --resimulate to ROFFtoGrimp: regenerate the offset simulations '
+                        'and re-merge, reusing the culled layers in workingDir/ (geometry-only '
+                        'reprocess, e.g. the 2026-10-05 siminsar fix)')
     parser.add_argument('--ompThreads', type=int, default=6,
                         help='Number of OpenMP threads passed to siminsar '
                         'via ROFFtoGrimp/RUNWtoGrimp [6]')
@@ -275,7 +279,7 @@ def parseCommandLine():
                 'correlationOnly', 'corrOnly', 'geodatsOnly',
                 'noGlobalFillIono', 'ionoFill', 'retainIntermediateIono', 'debugIono',
                 'clean', 'cleanDebug', 'noPrompt', 'bakeOnly', 'new', 'carrierCorrection',
-                'carrierOffsets', 'ionosphereOnly']:
+                'carrierOffsets', 'ionosphereOnly', 'resimulate']:
         params[key] = getattr(args, key)
     # Preliminary globalFillIono from CLI only; main() recomputes it after
     # merging the project.yaml sepIceRock flag (see below). phaseDerivedIonosphere
@@ -1237,6 +1241,8 @@ def processFrameROFF(frame, myArgs):
                    '--geodat2', myArgs['geodat2'][-1],
                    '--ompThreads', str(myArgs['ompThreads']),
                    ROFFFile]
+        if myArgs.get('resimulate'):
+            command += ['--resimulate']
         if myArgs.get('regionFile'):
             command += ['--regionFile', myArgs['regionFile']]
         if myArgs.get('verticalCorrection'):
