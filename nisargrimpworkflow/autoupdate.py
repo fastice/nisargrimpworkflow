@@ -211,10 +211,10 @@ def productDir(archiveDir, name, products):
 
 
 # Products fetched slim by downloadNISARoptimized: only the bands the GrIMP
-# workflow reads, float32 rounded to 10 mantissa bits (RUNW unwrappedPhase 12),
+# workflow reads, float32 rounded to 10 mantissa bits (unwrappedPhase 12),
 # same internal paths, ~4-5x smaller than the archive product and about half the
 # transfer. slimDownload: false in autoupdate.yaml fetches whole products instead.
-SLIM_PRODUCTS = ('RUNW', 'ROFF')
+SLIM_PRODUCTS = ('RUNW', 'ROFF', 'GUNW', 'GOFF')
 SLIM_MANIFEST = 'slimManifest.jsonl'
 
 

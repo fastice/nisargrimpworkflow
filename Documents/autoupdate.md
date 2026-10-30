@@ -63,7 +63,7 @@ mid-track at a UTC-midnight boundary.
 
 ```
 searchGranules          searchASF over [today-lookBack, today] -> URL list
-downloadGranules        RUNW/ROFF slim via downloadNISARoptimized, anything else whole via
+downloadGranules        RUNW/ROFF/GUNW/GOFF slim via downloadNISARoptimized, anything else via
                         ariaDownload, into archiveDir/<MM-DD-YYYY>/  (today's staging folder)
 consolidateStaging      move today's frames of any pass also present in the aged
                         (non-today) folders into the most-recent prior folder
@@ -297,7 +297,7 @@ frame (a gap) correctly becomes its own virtual frame instead.
 | `region` | `Antarctica` / `Greenland` → searchASF spatial flag |
 | `lookBack` | Search window length in days (today-lookBack … today) |
 | `products` | Product types to search/file (e.g. `RUNW ROFF`) |
-| `slimDownload` | (optional, default `true`) fetch RUNW/ROFF slim with `downloadNISARoptimized` -- only the bands the GrIMP workflow reads, float32 rounded to 10 mantissa bits (RUNW `unwrappedPhase` 12), same internal paths, ~4-5x smaller and about half the transfer. `false` fetches whole products with `ariaDownload`, e.g. if ASF range requests misbehave |
+| `slimDownload` | (optional, default `true`) fetch RUNW/ROFF (and GUNW/GOFF, if listed in `products`) slim with `downloadNISARoptimized` -- only the bands the GrIMP workflow reads, float32 rounded to 10 mantissa bits (RUNW `unwrappedPhase` 12), same internal paths, ~4-5x smaller and about half the transfer. `false` fetches whole products with `ariaDownload`, e.g. if ASF range requests misbehave |
 | `bandwidths` | searchASF `--bandwidth` tokens (GrIMP `80` → 77 MHz) |
 | `projectDir` | (optional) project root for the processing steps; default = the config file's directory |
 | `setupFlags` | (optional) extra flags forwarded to `SetupNISAR` per orbit; default empty. Region-dependent processing choices are NOT put here — see `sepIceRock` below |
