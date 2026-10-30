@@ -17,8 +17,10 @@ Intended to be called from SetupNISAR.main() after processFrameROFF completes:
 import glob
 import os
 import re
+import shutil
 import sys
 import sarfunc
+from osgeo import gdal
 from subprocess import run, DEVNULL
 
 # Use the running interpreter explicitly so we don't accidentally pick up a
@@ -72,8 +74,12 @@ def processFrameIonosphere(frame, myArgs, simDir='simPhase'):
     # Using the wrong global value here bakes a mismatched looks suffix into the
     # correctedUnwrappedPhase/ionosphereCorrection filenames, which then breaks
     # downstream geodat lookups (e.g. insarworkflow.tieScript.process_phase_yaml).
-    ownGeodats = [f for f in glob.glob(f'{frameDir}/geodat*x*.geojson')
-                  if '.secondary.' not in os.path.basename(f)]
+    # A frame acquired at both 40 and 80 MHz can hold both geodat13x16 and geodat26x16; the one
+    # this run's RUNW step wrote (the chosen mode) is the newest -- glob order picked the stale one
+    # (Antarctica80 track-20/3752 frame 124, 2026-10-30).
+    ownGeodats = sorted((f for f in glob.glob(f'{frameDir}/geodat*x*.geojson')
+                         if '.secondary.' not in os.path.basename(f)),
+                        key=os.path.getmtime, reverse=True)
     m = (re.match(r'geodat(\d+)x(\d+)\.geojson$', os.path.basename(ownGeodats[0]))
          if ownGeodats else None)
     if m:
@@ -104,6 +110,22 @@ def processFrameIonosphere(frame, myArgs, simDir='simPhase'):
             and not smrMissing):
         print(f'  estimateIonosphere: {os.path.basename(skip_path)} exists — skipping')
         return
+
+    # A simPhase built for the frame's other mode (a dual-bandwidth frame whose chosen bandwidth
+    # changed) is on a different grid from this mode's products; estimateIonosphere then fails
+    # silently.  velSim must match this stem's correlation grid -- if not, rebuild it.
+    velSimVRT = os.path.join(frameDir, simDir, 'velSim.vrt')
+    corVRT = os.path.join(frameDir, f'{stem}.cor.vrt')
+    if os.path.exists(velSimVRT) and os.path.exists(corVRT):
+        def _size(path):
+            ds = gdal.Open(path)
+            size = (ds.RasterXSize, ds.RasterYSize) if ds is not None else None
+            ds = None
+            return size
+        if _size(velSimVRT) != _size(corVRT):
+            print(f'  estimateIonosphere: {simDir}/velSim {_size(velSimVRT)} is not on this mode\'s '
+                  f'grid {_size(corVRT)} -- removing {simDir}/ so it is rebuilt')
+            shutil.rmtree(os.path.join(frameDir, simDir), ignore_errors=True)
 
     # Locate the RUNW HDF5 (H5/ subdir or directly in frameDir)
     RUNWFiles = (sorted(glob.glob(f'{frameDir}/H5/NISAR*RUNW*.h5')) or
