@@ -215,6 +215,10 @@ def productDir(archiveDir, name, products):
 # same internal paths, ~4-5x smaller than the archive product and about half the
 # transfer. slimDownload: false in autoupdate.yaml fetches whole products instead.
 SLIM_PRODUCTS = ('RUNW', 'ROFF', 'GUNW', 'GOFF')
+# Granules downloaded per run (maxDownloads in autoupdate.yaml). Above the busiest normal
+# night (638 on 2026-10-19; median ~280), so it only bites when ASF releases a backlog, which
+# is then cleared over several nights, oldest acquisitions first.
+DEFAULT_MAX_DOWNLOADS = 800
 SLIM_MANIFEST = 'slimManifest.jsonl'
 
 
@@ -276,6 +280,31 @@ def downloadPass(config, urls, downloadDir):
     collectSlimManifest(config['archiveDir'], downloadDir)
 
 
+def capDownloads(names, maxDownloads):
+    '''
+    The first maxDownloads of names, oldest acquisition first, never splitting the
+    products of one pair (a RUNW and its ROFF share every field but the product).
+    Returns (kept, deferred). Deferred granules are simply not downloaded, so the next
+    night's search lists them again.
+    '''
+    if maxDownloads is None or len(names) <= maxDownloads:
+        return list(names), []
+    groups = {}
+    for name in names:
+        f = name.split('_')
+        key = '_'.join(f[:3] + f[4:]) if len(f) > 4 else name
+        groups.setdefault(key, []).append(name)
+    # field 11 of a pair-product name is the reference start time (YYYYMMDDTHHMMSS)
+    order = sorted(groups, key=lambda k: (k.split('_')[10] if len(k.split('_')) > 10 else k, k))
+    kept, deferred = [], []
+    for key in order:
+        if not deferred and len(kept) + len(groups[key]) <= maxDownloads:
+            kept += groups[key]
+        else:
+            deferred += groups[key]
+    return kept, deferred
+
+
 def downloadGranules(config, urlListFile, today, maxAttempts=3):
     '''
     Download the granules listed in urlListFile into today's dated staging
@@ -300,6 +329,10 @@ def downloadGranules(config, urlListFile, today, maxAttempts=3):
     names = readUrlList(urlListFile)
     with open(urlListFile) as fp:
         urlOf = {line.strip().split('/')[-1]: line.strip() for line in fp if line.strip()}
+    names, deferred = capDownloads(names, config.get('maxDownloads', DEFAULT_MAX_DOWNLOADS))
+    if deferred:
+        print(f'maxDownloads: {len(names)} granule(s) this run, {len(deferred)} deferred '
+              'to later runs (oldest acquisitions first)')
     print(f'{len(names)} granule(s) to download into {downloadDir}')
     # Both downloaders skip a granule already on disk; loop until everything is
     # complete, re-fetching only what is still missing.
