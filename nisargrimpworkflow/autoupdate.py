@@ -219,6 +219,10 @@ SLIM_PRODUCTS = ('RUNW', 'ROFF', 'GUNW', 'GOFF')
 # night (638 on 2026-10-19; median ~280), so it only bites when ASF releases a backlog, which
 # is then cleared over several nights, oldest acquisitions first.
 DEFAULT_MAX_DOWNLOADS = 800
+# Slim-download rate cap in MB/s (downloadLimit in autoupdate.yaml; 0 for none). The tool's own
+# default is 19; the nightly job runs overnight, when the whole-file aria2c downloads it replaced
+# ran uncapped (~49 MB/s), so it allows more (Ian, 2026-11-06).
+DEFAULT_DOWNLOAD_LIMIT = 30
 SLIM_MANIFEST = 'slimManifest.jsonl'
 
 
@@ -276,7 +280,9 @@ def downloadPass(config, urls, downloadDir):
                 # No check=True: exit status 69 only means some granule failed
                 # verification, which collectSlimManifest deals with.
                 subprocess.run(['downloadNISARoptimized', '--product', product,
-                                '--urls', listFile, '--outputDir', downloadDir])
+                                '--urls', listFile, '--outputDir', downloadDir,
+                                '--limit', str(config.get('downloadLimit',
+                                                          DEFAULT_DOWNLOAD_LIMIT))])
     collectSlimManifest(config['archiveDir'], downloadDir)
 
 

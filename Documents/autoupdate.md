@@ -297,6 +297,7 @@ frame (a gap) correctly becomes its own virtual frame instead.
 | `region` | `Antarctica` / `Greenland` → searchASF spatial flag |
 | `lookBack` | Search window length in days (today-lookBack … today) |
 | `products` | Product types to search/file (e.g. `RUNW ROFF`) |
+| `downloadLimit` | (optional, default 30) download rate cap in MB/s for the slim downloads, 0 for none. The downloader's own default is 19; the nightly job allows more because it runs overnight |
 | `maxDownloads` | (optional, default 800) most granules downloaded per run. Oldest acquisitions go first and a RUNW and its ROFF are never split; the rest are not downloaded, so the next night's search lists them again. 800 is above the busiest normal night (638; median about 280), so it only matters when ASF releases a backlog, which then clears over several nights |
 | `slimDownload` | (optional, default `true`) fetch RUNW/ROFF (and GUNW/GOFF, if listed in `products`) slim with `downloadNISARoptimized` -- only the bands the GrIMP workflow reads, float32 rounded to 10 mantissa bits (RUNW `unwrappedPhase` 12), same internal paths, ~4-5x smaller and about half the transfer. `false` fetches whole products with `ariaDownload`, e.g. if ASF range requests misbehave |
 | `bandwidths` | searchASF `--bandwidth` tokens (GrIMP `80` → 77 MHz) |
